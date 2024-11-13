@@ -8,7 +8,7 @@ from typing import List, Dict
 import time
 
 FOLDER_PATH = r'\\regsj.intern\appl\Deep_Visual_Proteomics'
-CACHE_FILE = 'mrxs_cache.pkl'  # Changed from .parquet to .pkl
+CACHE_FILE = r'D:\DATA\mrxs_cache.pkl'  # Changed from .parquet to .pkl
 
 def get_file_info(file_path: str) -> Dict:
     """
@@ -174,21 +174,24 @@ def print_monthly_statistics(mrxs_df: pd.DataFrame, log_print):
         mrxs_df (pd.DataFrame): DataFrame containing .mrxs file information.
         log_print (callable): Function to handle logging and printing.
     """
-    # Convert to datetime if not already
     mrxs_df["Modification Date"] = pd.to_datetime(mrxs_df["Modification Date"])
-    
-    # Group by month and calculate statistics
-    monthly_stats = mrxs_df.groupby(mrxs_df["Modification Date"].dt.strftime("%b")).agg({
-        "File Path": "count",
-        "Modification Date": lambda x: x.sort_values().diff().dt.total_seconds()
+
+    # Group by year-month and calculate statistics
+    monthly_stats = mrxs_df.groupby(mrxs_df["Modification Date"].dt.strftime("%Y-%b")).agg({
+        "File Path": "count"
     }).rename(columns={"File Path": "count"})
-    
-    log_print('Month - Number of Images created : Average time to acquire one image')
-    
-    for month, row in monthly_stats.iterrows():
-        if len(row["Modification Date"]) > 2:
-            deltas = row["Modification Date"].dropna()
-            log_print(f"{month} - {row['count']:<10,} : Median {deltas.median():.0f} s, Mean {deltas.mean():.2f} s")
+
+    # Calculate time differences for each year-month separately
+    for year_month in monthly_stats.index:
+        month_data = mrxs_df[mrxs_df["Modification Date"].dt.strftime("%Y-%b") == year_month]
+        time_diffs = month_data["Modification Date"].sort_values().diff().dt.total_seconds()
+        monthly_stats.loc[year_month, "median_time"] = time_diffs.median()
+        monthly_stats.loc[year_month, "mean_time"] = time_diffs.mean()
+
+    log_print('Year-Month - Number of Images created : Average time to acquire one image')
+
+    for year_month, row in monthly_stats.iterrows():
+        log_print(f"{year_month} - {row['count']:<10,} : Median {row['median_time']:.0f} s, Mean {row['mean_time']:.2f} s")
 
 def main():
     """
@@ -206,6 +209,7 @@ def main():
 
         log_print(f"Script started at: {current_date}")
         log_print(f"Analyzing folder: {FOLDER_PATH}")
+        log_print(f"Using cache from: {CACHE_FILE}")
 
         mrxs_df = collect_mrxs_info(FOLDER_PATH, log_print)
         stats = calculate_statistics(mrxs_df)
