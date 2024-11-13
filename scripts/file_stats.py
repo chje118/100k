@@ -199,7 +199,7 @@ def main():
     """
     start_time = time.time()
     current_date = datetime.datetime.now()
-    log_filename = f"mrxs_analysis_{current_date.strftime('%Y-%m-%d_%H-%M-%S')}.log"
+    log_filename = f"D:/DATA/log/mrxs_analysis_{current_date.strftime('%Y-%m-%d_%H-%M-%S')}.log"
 
     with open(log_filename, 'w') as log_file:
         def log_print(*args, **kwargs):
