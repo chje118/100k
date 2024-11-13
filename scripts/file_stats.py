@@ -2,12 +2,13 @@ import os
 import datetime
 import statistics
 import pandas as pd
+import pickle
 from tqdm import tqdm
 from typing import List, Dict
 import time
 
 FOLDER_PATH = r'\\regsj.intern\appl\Deep_Visual_Proteomics'
-CACHE_FILE = 'mrxs_cache.parquet'
+CACHE_FILE = 'mrxs_cache.pkl'  # Changed from .parquet to .pkl
 
 def get_file_info(file_path: str) -> Dict:
     """
@@ -53,7 +54,8 @@ def load_cache() -> pd.DataFrame:
         pd.DataFrame: Cached file information
     """
     if os.path.exists(CACHE_FILE):
-        return pd.read_parquet(CACHE_FILE)
+        with open(CACHE_FILE, 'rb') as f:
+            return pickle.load(f)
     return pd.DataFrame(columns=["File Path", "Creation Date", "Modification Date", "MRXS Size", "Associated Data Size", "Last Checked"])
 
 def collect_mrxs_info(folder_path: str, log_print) -> pd.DataFrame:
@@ -119,7 +121,8 @@ def collect_mrxs_info(folder_path: str, log_print) -> pd.DataFrame:
             # Combine old and new data
             cache_df = pd.concat([cache_df, new_df], ignore_index=True)
             # Save updated cache
-            cache_df.to_parquet(CACHE_FILE)
+            with open(CACHE_FILE, 'wb') as f:
+                pickle.dump(cache_df, f)
             log_print(f"Updated {updated_count} files in cache")
             # Clear new records after saving
             new_records = []
@@ -132,7 +135,8 @@ def collect_mrxs_info(folder_path: str, log_print) -> pd.DataFrame:
         # Combine old and new data
         cache_df = pd.concat([cache_df, new_df], ignore_index=True)
         # Save updated cache
-        cache_df.to_parquet(CACHE_FILE)
+        with open(CACHE_FILE, 'wb') as f:
+            pickle.dump(cache_df, f)
         log_print(f"Updated final {len(new_records)} files in cache")
     
     return cache_df
@@ -212,9 +216,6 @@ def main():
         print_monthly_statistics(mrxs_df, log_print)
         
         log_print(f'Number of files {stats["count"]:,}, total size: {stats["total_size_gb"]/1024:.2f} TB, average file size: {stats["avg_file_size_gb"]:.2f} GB')
-        
-        if stats["mean_delta"] > 0:
-            estimate_completion_dates(stats["count"], stats["mean_delta"], log_print)
 
         end_time = time.time()
         execution_time = (end_time - start_time)/60
