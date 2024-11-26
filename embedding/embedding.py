@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-import timm #this is the ctranspath timm...
+import timm #this is the unpatched timm
 
 
 import os
@@ -124,6 +124,8 @@ class ModelManager:
     
     def _load_models(self, configs: List[ModelConfig]):
         for config in configs:
+            print(f"Loading {config.name}")
+
             # Create transform for this model
             transform = transforms.Compose([
                 transforms.Resize(224),
@@ -137,18 +139,30 @@ class ModelManager:
                 model.head = torch.nn.Identity()
                 state_dict = torch.load(config.path)
                 model.load_state_dict(state_dict['model'], strict=True)
-
                 
             elif config.model_type == 'timm':
                 if not config.model_arch:
                     raise ValueError(f"Model architecture must be specified for timm models")
-                    
-                model = timm.create_model(
-                    config.model_arch,
-                    img_size=224,
-                    num_classes=0,
-                    pretrained=False
-                )
+                
+                if config.name == "uni":
+                    # Special initialization for UNI model
+                    model = timm.create_model(
+                        config.model_arch,
+                        img_size=224,
+                        patch_size=16,
+                        init_values=1e-5,
+                        num_classes=0,
+                        dynamic_img_size=True
+                    )
+                else:
+                    # Default initialization for other timm models
+                    model = timm.create_model(
+                        config.model_arch,
+                        img_size=224,
+                        num_classes=0,
+                        pretrained=False
+                    )
+                
                 state_dict = torch.load(config.path)
                 model.load_state_dict(state_dict, strict=True)
             
@@ -161,6 +175,7 @@ class ModelManager:
             print(f"Model at device: {self.device}")
             
             self.models[config.name] = (model, transform, config.output_dim)
+
     def get_embeddings(self, dataloader: DataLoader) -> Dict[str, np.ndarray]:
         embeddings = {}
         
@@ -306,6 +321,15 @@ def main():
             std=(0.229, 0.224, 0.225)
         ),
         ModelConfig(
+            name="uni",
+            path="D:/DATA/models/uni_mass100k.bin",
+            model_type="timm",
+            model_arch="vit_large_patch16_224",
+            output_dim=1024,
+            mean=(0.485, 0.456, 0.406),
+            std=(0.229, 0.224, 0.225)
+        ),
+        ModelConfig(
             name="hoptimus",
             path="D:/DATA/models/hoptimus0.bin",
             model_type="timm",
@@ -314,19 +338,10 @@ def main():
             mean=(0.707223, 0.578729, 0.703617),
             std=(0.211883, 0.230117, 0.177517)
         ),
-        ModelConfig(
-            name="uni",
-            path="D:/DATA/models/uni_mass100k.bin",
-            model_type="timm",
-            model_arch="vit_large_patch16_224",
-            output_dim=1024,
-            mean=(0.485, 0.456, 0.406),
-            std=(0.229, 0.224, 0.225)
-        )
     ]
 
 
-    MODEL_CONFIGS  = [MODEL_CONFIGS[0]]
+    MODEL_CONFIGS  = [MODEL_CONFIGS[0], MODEL_CONFIGS[1]]
     
     OUTPUT_DIR = "D:/DATA/embeddings"
     TRACKER_FILE = "D:/DATA/processing_tracker.pkl"
