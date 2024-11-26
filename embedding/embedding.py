@@ -377,7 +377,6 @@ def main():
             tracker.mark_completed(filepath)
             
         except Exception as e:
-            raise
             print(f"Error processing {filepath}: {str(e)}")
             tracker.mark_failed(filepath, str(e))
 
