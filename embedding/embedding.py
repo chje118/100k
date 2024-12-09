@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-import timm #this is the unpatched timm
+import timm #this is the unpatched timm, note that there is a patched timm for Ctranspath
 
 
 import os
@@ -154,6 +154,17 @@ class ModelManager:
                         num_classes=0,
                         dynamic_img_size=True
                     )
+
+                elif config.name == 'hoptimus':
+                    model = timm.create_model(
+                        config.model_arch,
+                        img_size=224,
+                        patch_size=14,  # Explicitly set patch size
+                        num_classes=0,
+                        global_pool='token',
+                        pretrained=False
+                    )
+
                 else:
                     # Default initialization for other timm models
                     model = timm.create_model(
@@ -333,15 +344,15 @@ def main():
             name="hoptimus",
             path="D:/DATA/models/hoptimus0.bin",
             model_type="timm",
-            model_arch="vit_base_patch16_224",  # or whatever the correct architecture is
+            model_arch="vit_giant_patch14_reg4_dinov2",  # The correct architecture
             output_dim=1536,
             mean=(0.707223, 0.578729, 0.703617),
             std=(0.211883, 0.230117, 0.177517)
-        ),
+        )
     ]
 
 
-    MODEL_CONFIGS  = [MODEL_CONFIGS[0], MODEL_CONFIGS[1]]
+    MODEL_CONFIGS  = [MODEL_CONFIGS[0], MODEL_CONFIGS[1], MODEL_CONFIGS[2]]
     
     OUTPUT_DIR = "D:/DATA/embeddings"
     TRACKER_FILE = "D:/DATA/processing_tracker.pkl"
