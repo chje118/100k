@@ -1,4 +1,6 @@
 import sys
+import logging
+from datetime import datetime
 sys.path.append(r'D:\TransPath-main')
 OPENSLIDE_PATH = r'D:\openslide-bin-4.0.0.2-windows-x64\bin'
 CACHE_FILE = r'D:\DATA\mrxs_cache.pkl'  # Changed from .parquet to .pkl
@@ -15,8 +17,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-import timm #this is the unpatched timm, note that there is a patched timm for Ctranspath
-
+import timm  # this is the unpatched timm, note that there is a patched timm for Ctranspath
 
 import os
 if hasattr(os, 'add_dll_directory'):
@@ -33,6 +34,62 @@ sys.path.append(r'D:\TransPath-main')
 
 from ctran import ctranspath
 
+def setup_logging():
+    """Set up logging to both file and console"""
+    # Create the logs directory if it doesn't exist
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    
+    # Create log filename with current date
+    current_date = datetime.now().strftime('%Y-%m-%d')
+    log_filename = log_dir / f"{current_date}-EMBEDDING.log"
+    
+    # Set up logging configuration
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_filename, mode='a'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    
+    return logging.getLogger(__name__)
+
+def get_file_hash(filepath: str) -> str:
+    """Calculate SHA-256 hash of a file"""
+    import hashlib
+    sha256_hash = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        # Read the file in chunks to handle large files efficiently
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
+
+def print_versions(logger):
+    """Print version information using logger"""
+    logger.info(f"Python version: {sys.version}")
+    logger.info(f"Torch version: {torch.__version__}")
+    logger.info(f"Pandas version: {pd.__version__}")
+    logger.info(f"NumPy version: {np.__version__}")
+    logger.info(f"PIL version: {Image.__version__}")
+    logger.info(f"OpenSlide version: {openslide.__version__}")
+    logger.info(f"Timm version: {timm.__version__}")
+    
+    # Print model file hashes
+    model_files = [
+        "D:/DATA/models/ctranspath.pth",
+        "D:/DATA/models/uni_mass100k.bin",
+        "D:/DATA/models/hoptimus0.bin"
+    ]
+    
+    logger.info("\nModel File Hashes:")
+    for model_path in model_files:
+        try:
+            file_hash = get_file_hash(model_path)
+            logger.info(f"{Path(model_path).name}: {file_hash}")
+        except Exception as e:
+            logger.error(f"Error computing hash for {Path(model_path).name}: {str(e)}")
 
 def load_cache() -> pd.DataFrame:
     """
@@ -124,7 +181,8 @@ class ModelManager:
     
     def _load_models(self, configs: List[ModelConfig]):
         for config in configs:
-            print(f"Loading {config.name}")
+            logger = logging.getLogger(__name__)
+            logger.info(f"Loading {config.name}")
 
             # Create transform for this model
             transform = transforms.Compose([
@@ -183,12 +241,13 @@ class ModelManager:
             model.eval()
             model.to(self.device)
 
-            print(f"Model at device: {self.device}")
+            logger.info(f"Model {config.name} loaded to device: {self.device}")
             
             self.models[config.name] = (model, transform, config.output_dim)
 
     def get_embeddings(self, dataloader: DataLoader) -> Dict[str, np.ndarray]:
         embeddings = {}
+        logger = logging.getLogger(__name__)
         
         for model_name, (model, _, output_dim) in self.models.items():
             model_embeddings = np.zeros(
@@ -197,7 +256,6 @@ class ModelManager:
             )
             
             batch_idx = 0
-            #with torch.autocast(device_type="cuda", dtype=torch.float16):
             with torch.no_grad():
                 for batch in tqdm(dataloader, desc=f'Embedding with {model_name}'):
                     batch = batch.to(self.device)
@@ -208,6 +266,7 @@ class ModelManager:
                     batch_idx += len(features)
             
             embeddings[model_name] = model_embeddings
+            logger.info(f"Completed embeddings for model {model_name}")
         
         return embeddings
 
@@ -218,21 +277,12 @@ def extract_tiles(tiles: DeepZoomGenerator,
                  tile_size: int = 224) -> Tuple[List[Image.Image], List[Tuple[int, int]]]:
     """
     Extract tiles from a whole slide image using DeepZoomGenerator.
-    
-    Args:
-        tiles: DeepZoomGenerator instance
-        level: Level at which to extract tiles (default: -1)
-        limit: Maximum number of tiles to extract (0 for no limit)
-        int_filter: Intensity filter threshold for tissue detection
-        tile_size: Size of tiles to extract
-    
-    Returns:
-        Tuple containing:
-        - List of extracted tile images
-        - List of (row, col) coordinates for each tile
     """
+    logger = logging.getLogger(__name__)
+    
     # Get dimensions for the specified level
     cols, rows = tiles.level_tiles[level]
+    logger.info(f"Processing slide with dimensions: {cols}x{rows}")
     
     # Get thumbnail for tissue detection
     thumb = tiles._osr.get_thumbnail((cols, rows))
@@ -265,14 +315,14 @@ def extract_tiles(tiles: DeepZoomGenerator,
                 extracted_tiles.append(temp_tile_RGB)
                 
         except Exception as e:
-            print(f"Error extracting tile at ({row}, {col}): {str(e)}")
+            logger.error(f"Error extracting tile at ({row}, {col}): {str(e)}")
             continue
         
         # Check if we've reached the limit
         if limit > 0 and len(extracted_tiles) >= limit:
             break
     
-    print(f"Extracted {len(extracted_tiles)} tiles")
+    logger.info(f"Extracted {len(extracted_tiles)} tiles")
     return extracted_tiles, final_coordinates
 
 def create_model_dataloaders(
@@ -284,20 +334,12 @@ def create_model_dataloaders(
 ) -> Dict[str, DataLoader]:
     """
     Create separate dataloaders for each model with its specific transform.
-    
-    Args:
-        images: List of PIL Images to process
-        model_manager: ModelManager instance containing models and their transforms
-        batch_size: Batch size for DataLoader
-        num_workers: Number of worker processes for data loading
-        pin_memory: Whether to pin memory in dataloader (recommended for GPU)
-    
-    Returns:
-        Dictionary mapping model names to their respective DataLoaders
     """
+    logger = logging.getLogger(__name__)
     dataloaders = {}
     
     for model_name, (_, transform, _) in model_manager.models.items():
+        logger.info(f"Creating dataloader for model {model_name}")
         # Create dataset with model-specific transform
         dataset = TileDataset(
             images=images,
@@ -316,11 +358,18 @@ def create_model_dataloaders(
         )
         
         dataloaders[model_name] = dataloader
+        logger.info(f"Created dataloader for {model_name} with {len(dataset)} samples")
         
     return dataloaders
 
 
 def main():
+    # Set up logging
+    logger = setup_logging()
+    
+    # Print versions
+    print_versions(logger)
+    
     # Define model configurations for offline use
     MODEL_CONFIGS = [
         ModelConfig(
@@ -344,41 +393,45 @@ def main():
             name="hoptimus",
             path="D:/DATA/models/hoptimus0.bin",
             model_type="timm",
-            model_arch="vit_giant_patch14_reg4_dinov2",  # The correct architecture
+            model_arch="vit_giant_patch14_reg4_dinov2",
             output_dim=1536,
             mean=(0.707223, 0.578729, 0.703617),
             std=(0.211883, 0.230117, 0.177517)
         )
     ]
 
-
-    MODEL_CONFIGS  = [MODEL_CONFIGS[0], MODEL_CONFIGS[1], MODEL_CONFIGS[2]]
+    MODEL_CONFIGS = [MODEL_CONFIGS[0], MODEL_CONFIGS[1], MODEL_CONFIGS[2]]
     
     OUTPUT_DIR = "D:/DATA/embeddings"
     TRACKER_FILE = "D:/DATA/processing_tracker.pkl"
-    BATCH_SIZE = 256  # Reduced batch size to handle larger models
+    BATCH_SIZE = 256
 
     mrxs_df = load_cache()
+    logger.info(f"Loaded cache with {len(mrxs_df)} entries")
     
     all_mrxs = list(mrxs_df['File Path'].values)
-    
+    logger.info(f"Found {len(all_mrxs)} MRXS files to process")
     
     # Initialize components
     tracker = ProcessingTracker(TRACKER_FILE)
+    logger.info("Initializing model manager...")
     model_manager = ModelManager(MODEL_CONFIGS)
     
     # Process slides
     for filepath in tqdm(all_mrxs, desc='Processing slides'):
         if tracker.is_processed(filepath):
+            logger.info(f"Skipping already processed file: {filepath}")
             continue
             
         try:
             tracker.mark_in_progress(filepath)
+            logger.info(f"Processing slide: {filepath}")
             
             # Extract tiles
             slide = open_slide(filepath)
             tiles_generator = DeepZoomGenerator(slide, 224, overlap=0, limit_bounds=True)
             tiles_data, coordinates = extract_tiles(tiles_generator, level=-1, limit=0)
+            logger.info(f"Extracted {len(tiles_data)} tiles from slide")
             
             # Create dataloaders for each model
             dataloaders = create_model_dataloaders(tiles_data, model_manager, BATCH_SIZE)
@@ -386,25 +439,42 @@ def main():
             # Process with each model
             all_embeddings = {}
             for model_name, dataloader in dataloaders.items():
+                logger.info(f"Processing with model: {model_name}")
                 embeddings = model_manager.get_embeddings(dataloader)
                 all_embeddings[model_name] = embeddings[model_name]
             
             # Save results
             slide_name = Path(filepath).stem
             coords_df = pd.DataFrame(coordinates, columns=['row', 'col'])
-            coords_df.to_pickle(f"{OUTPUT_DIR}/{slide_name}_coordinates.pkl")
+            coords_path = f"{OUTPUT_DIR}/{slide_name}_coordinates.pkl"
+            coords_df.to_pickle(coords_path)
+            logger.info(f"Saved coordinates to {coords_path}")
             
             for model_name, embedding in all_embeddings.items():
-                np.save(
-                    f"{OUTPUT_DIR}/{slide_name}_{model_name}_embeddings.npy",
-                    embedding
-                )
+                output_path = f"{OUTPUT_DIR}/{slide_name}_{model_name}_embeddings.npy"
+                np.save(output_path, embedding)
+                logger.info(f"Saved embeddings for {model_name} to {output_path}")
             
             tracker.mark_completed(filepath)
+            logger.info(f"Successfully processed slide: {filepath}")
             
         except Exception as e:
-            print(f"Error processing {filepath}: {str(e)}")
+            logger.error(f"Error processing {filepath}: {str(e)}", exc_info=True)
             tracker.mark_failed(filepath, str(e))
+            
+        finally:
+            # Clean up slide object
+            try:
+                slide.close()
+            except:
+                pass
 
 if __name__ == "__main__":
-    main()
+    try:
+        logger = setup_logging()
+        logger.info("Starting embedding process...")
+        main()
+        logger.info("Embedding process completed successfully")
+    except Exception as e:
+        logger.error("Fatal error in main process", exc_info=True)
+        raise
