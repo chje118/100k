@@ -273,7 +273,7 @@ class ModelManager:
 def extract_tiles(tiles: DeepZoomGenerator,
                  level: int = -1,
                  limit: int = 0,
-                 int_filter: int = 250,
+                 int_filter: int = 231,
                  tile_size: int = 224) -> Tuple[List[Image.Image], List[Tuple[int, int]]]:
     """
     Extract tiles from a whole slide image using DeepZoomGenerator.
