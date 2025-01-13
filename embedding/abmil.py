@@ -64,7 +64,7 @@ def collate_batch(batch):
     
     return embeddings_batch, labels_batch
 
-def load_cache() -> pd.DataFrame:
+def load_cache(CACHE_FILE) -> pd.DataFrame:
     """Load the cache file if it exists, otherwise return an empty DataFrame."""
     if os.path.exists(CACHE_FILE):
         with open(CACHE_FILE, 'rb') as f:
@@ -74,13 +74,63 @@ def load_cache() -> pd.DataFrame:
         "MRXS Size", "Associated Data Size", "Last Checked"
     ])
 
-def load_excel_data(file_path: str) -> pd.DataFrame:
-    """Load and combine data from all Excel sheets."""
+def load_excel_data_2012(file_path: str) -> pd.DataFrame:
+    """Load and combine data from 2012 Excel file."""
+    print(f"Loading {file_path}")
     excel_file = pd.ExcelFile(file_path)
     dfs = [excel_file.parse(sheet, skiprows=4) for sheet in excel_file.sheet_names]
     combined_df = pd.concat(dfs)
     combined_df['modtdato'] = pd.to_datetime(combined_df['modtdato'], format='%Y-%m-%d')
     return combined_df.reset_index(drop=True)
+
+def load_excel_data_2013(file_path: str) -> pd.DataFrame:
+    """Load and combine data from 2013 Excel file."""
+    print(f"Loading {file_path}")
+    excel_file = pd.ExcelFile(file_path)
+    dfs = excel_file.parse('datafile')
+    dfs['modtdato'] = pd.to_datetime(dfs['modtdato'], format='%Y-%m-%d')
+    return dfs.reset_index(drop=True)
+
+def load_and_combine_data(file_paths: Dict[str, str]) -> pd.DataFrame:
+    """Load and combine data from multiple Excel files."""
+    print('Loading individual files')
+    all_df = []
+    load_fctn = {
+        '2013': load_excel_data_2013,
+        '2012': load_excel_data_2012
+    }
+    
+    for year, file_path in file_paths.items():
+        print(f'\n=== Processing {year} data ===')
+        combined_df = load_fctn[year](file_path)
+        all_df.append(combined_df)
+        print(f"Loaded {len(combined_df)} records from {year}")
+    
+    print('\nCombining all data...')
+    final_df = pd.concat(all_df, ignore_index=True)
+    print(f"Total records after combination: {len(final_df)}")
+    return final_df
+
+def match_and_process_data(combined_df: pd.DataFrame, cache_file: str) -> pd.DataFrame:
+    """Match and process the combined data with MRXS files."""
+    # Load cache and create file dictionary
+    mrxs_df = load_cache(cache_file)
+    all_mrxs = mrxs_df['File Path'].tolist()
+    file_dict = create_file_dict(all_mrxs)
+    
+    # Match records
+    result_df = match_records(combined_df, file_dict)
+    
+    # Print statistics
+    matched_count = result_df['match'].notna().sum()
+    print(f"\nMatching Statistics:")
+    print(f"Matched {matched_count} out of {len(result_df)} records")
+    print(f"Used {len(file_dict)} out of {len(all_mrxs)} files")
+    pct = matched_count/len(result_df)*100
+    print(f"Matching rate: {pct:.2f}%")
+    
+    return result_df
+
 
 def create_file_dict(mrxs_paths: list) -> dict:
     """Create dictionary for file path lookups."""
@@ -578,28 +628,25 @@ def train_model(embeddings_dir: str,
 
 if __name__ == "__main__":
     # Constants
-    FILE_PATH = "D:/DATA/glasdata 2024.xlsx"
+    FILE_PATHS = {
+        '2012': "D:/DATA/glasdata 2012.xlsx",
+        '2013': "D:/DATA/glasdata 2013.xlsx"
+    }
     CACHE_FILE = "D:/DATA/mrxs_cache.pkl"
     EMBEDDINGS_DIR = "D:/DATA/embeddings"
     OUTPUT_DIR = "D:/DATA/abmil_results"
-    MODEL_NAME = "hoptimus"  # or "uni" or "hoptimus"
+    MODEL_NAME = "hoptimus"
     TARGET_COLUMN = "sex"  # Replace with actual column name
     
     # Create output directory
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-    # Load matched data
-    combined_df = load_excel_data(FILE_PATH)
-    mrxs_df = load_cache()
-    all_mrxs = mrxs_df['File Path'].tolist()
+    # Load and combine data from multiple files
+    combined_df = load_and_combine_data(FILE_PATHS)
     
-    # Process and match records
-    file_dict = create_file_dict(all_mrxs)
-    result_df = match_records(combined_df, file_dict)
+    # Match and process the combined data
+    result_df = match_and_process_data(combined_df, CACHE_FILE)
     
-    matched_count = result_df['match'].notna().sum()
-    print(f"Matched {matched_count} out of {len(result_df)} records")
-    print(f"Used {len(file_dict)} out of {len(all_mrxs)} files")
     
     # Train model
     avg_metrics, std_metrics, results = train_model(
