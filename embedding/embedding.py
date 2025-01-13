@@ -14,7 +14,7 @@ import pickle
 from tqdm import tqdm
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import timm  # this is the unpatched timm, note that there is a patched timm for Ctranspath
@@ -35,6 +35,21 @@ from openslide.deepzoom import DeepZoomGenerator
 sys.path.append(r'D:\TransPath-main')
 
 from ctran import ctranspath
+
+
+def load_cache() -> pd.DataFrame:
+    """
+    Load the cache file if it exists, otherwise return an empty DataFrame.
+
+    Returns:
+        pd.DataFrame: Cached file information
+    """
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, 'rb') as f:
+            return pickle.load(f)
+    return pd.DataFrame(columns=["File Path", "Creation Date", "Modification Date", "MRXS Size", "Associated Data Size", "Last Checked"])
+
+
 
 def setup_logging():
     """Set up logging to both file and console"""
@@ -93,18 +108,6 @@ def print_versions(logger):
         except Exception as e:
             logger.error(f"Error computing hash for {Path(model_path).name}: {str(e)}")
 
-def load_cache() -> pd.DataFrame:
-    """
-    Load the cache file if it exists, otherwise return an empty DataFrame.
-
-    Returns:
-        pd.DataFrame: Cached file information
-    """
-    if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, 'rb') as f:
-            return pickle.load(f)
-    return pd.DataFrame(columns=["File Path", "Creation Date", "Modification Date", "MRXS Size", "Associated Data Size", "Last Checked"])
-
 
 @dataclass
 class ModelConfig:
@@ -117,41 +120,106 @@ class ModelConfig:
     std: tuple = (0.229, 0.224, 0.225)
 
 class ProcessingTracker:
-    def __init__(self, tracker_path: str):
+    def __init__(self, tracker_path: str, output_dir: str = "D:/DATA/embeddings"):
         self.tracker_path = tracker_path
+        self.output_dir = output_dir
         self.processed_files = self._load_tracker()
     
-    def _load_tracker(self) -> Dict:
-        if os.path.exists(self.tracker_path):
-            with open(self.tracker_path, 'rb') as f:
-                return pickle.load(f)
+    def _scan_output_directory(self) -> Dict[str, Set]:
+        """
+        Scan the output directory to identify completed files based on existing embeddings.
+        
+        Returns:
+            Dict containing sets of completed and failed files
+        """
+        logger = logging.getLogger(__name__)
+        logger.info(f"Scanning output directory: {self.output_dir}")
+        
+        completed = set()
+        embedding_files = {}
+        
+        # Scan output directory for existing files
+        for file in os.listdir(self.output_dir):
+            if file.endswith('_embeddings.npy'):
+                # Extract original MRXS filename from embedding filename
+                # Format: slidename_modelname_embeddings.npy
+                slide_name = file.split('_')[0]
+                if slide_name not in embedding_files:
+                    embedding_files[slide_name] = set()
+                embedding_files[slide_name].add(file)
+        
+        # Check which slides have embeddings from all models
+        expected_models = {'ctranspath', 'uni', 'hoptimus'}
+        for slide_name, files in embedding_files.items():
+            model_names = {f.split('_')[1] for f in files}
+            if model_names >= expected_models:  # Using >= to handle case where there might be extra files
+                # Reconstruct original MRXS path
+                # Note: This assumes MRXS files are in the cache DataFrame
+                # You might need to adjust this based on your file naming convention
+                mrxs_path = None
+                try:
+                    cache_df = load_cache()
+                    matching_files = cache_df[cache_df['File Path'].str.contains(slide_name, case=False)]
+                    if not matching_files.empty:
+                        mrxs_path = matching_files.iloc[0]['File Path']
+                        completed.add(mrxs_path)
+                        logger.info(f"Found completed slide: {mrxs_path}")
+                except Exception as e:
+                    logger.warning(f"Error matching slide {slide_name} to MRXS path: {str(e)}")
+        
+        logger.info(f"Found {len(completed)} completed files from output directory")
+        
         return {
-            'completed': set(),
-            'failed': {},
+            'completed': completed,
+            'failed': {},  # We can't determine failed files from output directory
             'in_progress': set()
         }
     
+    def _load_tracker(self) -> Dict:
+        """
+        Load the tracker file if it exists, otherwise reconstruct from output directory.
+        """
+        logger = logging.getLogger(__name__)
+        
+        if os.path.exists(self.tracker_path):
+            logger.info(f"Loading existing tracker from {self.tracker_path}")
+            try:
+                with open(self.tracker_path, 'rb') as f:
+                    return pickle.load(f)
+            except Exception as e:
+                logger.error(f"Error loading tracker file: {str(e)}")
+                logger.info("Falling back to output directory scan")
+                return self._scan_output_directory()
+        else:
+            logger.info("No tracker file found, scanning output directory")
+            return self._scan_output_directory()
+    
     def save_tracker(self):
+        """Save the current state to the tracker file"""
         with open(self.tracker_path, 'wb') as f:
             pickle.dump(self.processed_files, f)
     
     def mark_completed(self, filepath: str):
+        """Mark a file as completed and save the tracker"""
         self.processed_files['completed'].add(filepath)
         if filepath in self.processed_files['in_progress']:
             self.processed_files['in_progress'].remove(filepath)
         self.save_tracker()
     
     def mark_failed(self, filepath: str, error: str):
+        """Mark a file as failed with error message and save the tracker"""
         self.processed_files['failed'][filepath] = error
         if filepath in self.processed_files['in_progress']:
             self.processed_files['in_progress'].remove(filepath)
         self.save_tracker()
     
     def mark_in_progress(self, filepath: str):
+        """Mark a file as in progress and save the tracker"""
         self.processed_files['in_progress'].add(filepath)
         self.save_tracker()
     
     def is_processed(self, filepath: str) -> bool:
+        """Check if a file has been processed (either completed or failed)"""
         return (filepath in self.processed_files['completed'] or 
                 filepath in self.processed_files['failed'])
 
