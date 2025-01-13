@@ -18,6 +18,8 @@ from typing import List, Dict, Optional, Tuple
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import timm  # this is the unpatched timm, note that there is a patched timm for Ctranspath
+from skimage.filters import threshold_otsu
+
 
 import os
 if hasattr(os, 'add_dll_directory'):
@@ -289,8 +291,14 @@ def extract_tiles(tiles: DeepZoomGenerator,
     temp_tile_RGB = thumb.convert('RGB')
     
     # Find tissue regions using intensity filtering
-    tile_array = np.array(temp_tile_RGB)
-    r, c = np.where(tile_array.mean(axis=2) < int_filter)
+    #tile_array = np.array(temp_tile_RGB)
+
+    thumb_gray = np.array(temp_tile_RGB.convert("L"))
+    threshold_val = threshold_otsu(thumb_gray)
+
+    print(f"t-val is {threshold_val}")
+
+    r, c = np.where(thumb_gray < threshold_val)
     tile_coordinates = list(zip(r, c))
     
     # Shuffle and limit if specified
