@@ -476,7 +476,9 @@ def main():
         )
     ]
 
-    MODEL_CONFIGS = [MODEL_CONFIGS[0], MODEL_CONFIGS[1], MODEL_CONFIGS[2]]
+    MODEL_CONFIGS = [MODEL_CONFIGS[0], MODEL_CONFIGS[1]]
+
+    
     
     OUTPUT_DIR = "D:/DATA/embeddings"
     TRACKER_FILE = "D:/DATA/processing_tracker.pkl"
@@ -494,6 +496,9 @@ def main():
     model_manager = ModelManager(MODEL_CONFIGS)
     
     # Process slides
+    # Replace the main processing loop with this corrected version:
+
+    # In main():
     for filepath in tqdm(all_mrxs, desc='Processing slides'):
         if tracker.is_processed(filepath):
             logger.info(f"Skipping already processed file: {filepath}")
@@ -509,15 +514,19 @@ def main():
             tiles_data, coordinates = extract_tiles(tiles_generator, level=-1, limit=0)
             logger.info(f"Extracted {len(tiles_data)} tiles from slide")
             
-            # Create dataloaders for each model
-            dataloaders = create_model_dataloaders(tiles_data, model_manager, BATCH_SIZE)
+            # Create single dataloader for all models
+            dataloader = DataLoader(
+                TileDataset(tiles_data),
+                batch_size=BATCH_SIZE,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=False,
+                drop_last=False
+            )
             
-            # Process with each model
-            all_embeddings = {}
-            for model_name, dataloader in dataloaders.items():
-                logger.info(f"Processing with model: {model_name}")
-                embeddings = model_manager.get_embeddings(dataloader)
-                all_embeddings[model_name] = embeddings[model_name]
+            # Get embeddings once
+            logger.info("Processing embeddings for all models")
+            all_embeddings = model_manager.get_embeddings(dataloader)
             
             # Save results
             slide_name = Path(filepath).stem
