@@ -91,6 +91,55 @@ def load_excel_data_2013(file_path: str) -> pd.DataFrame:
     dfs['modtdato'] = pd.to_datetime(dfs['modtdato'], format='%Y-%m-%d')
     return dfs.reset_index(drop=True)
 
+import re
+from collections import Counter
+
+def create_boolean_category_columns(df, col='snomed kode', min_count=100):
+    """
+    Given a DataFrame with a column containing codes (e.g. 'T77100 M09450 P30990; T77100 M09450 P30990; ...'),
+    this function creates one boolean column per code that appears at least `min_count` times in the DataFrame.
+    
+    A token is considered a valid code if it has exactly 6 characters.
+    
+    Parameters:
+        df (pd.DataFrame): The DataFrame with the codes.
+        col (str): The name of the column with the code strings.
+        min_count (int): The minimum number of times a code must appear before a boolean column is created.
+        
+    Returns:
+        pd.DataFrame: The original DataFrame with new boolean columns added.
+    """
+    
+    # Step 1: Count frequencies of valid codes (tokens with 6 characters)
+    token_counter = Counter()
+    
+    for s in df[col].dropna():
+        # Replace semicolons with spaces, then split on whitespace.
+        tokens = s.replace(';', ' ').split()
+        for token in tokens:
+            token = token.strip()
+            if len(token) == 6:
+                token_counter[token] += 1
+
+    # Only keep tokens meeting the minimum frequency threshold.
+    valid_tokens = sorted([(token, count) for token, count in token_counter.items() if count >= min_count])
+
+    valid_tokens_ = []
+    for token, count in valid_tokens:
+        print(token, count)
+        valid_tokens_.append(token)
+    
+    # Step 2: Create a boolean column for each valid code.
+    # Each new column indicates whether the code appears in the string.
+    for token in valid_tokens_:
+        df[token] = df[col].apply(
+            lambda s: any(t == token for t in re.split(r'[; ]+', s.strip()) if t)
+            if isinstance(s, str) else False
+        )
+    
+    return df
+
+
 def load_and_combine_data(file_paths: Dict[str, str]) -> pd.DataFrame:
     """Load and combine data from multiple Excel files."""
     print('Loading individual files')
@@ -109,6 +158,8 @@ def load_and_combine_data(file_paths: Dict[str, str]) -> pd.DataFrame:
     print('\nCombining all data...')
     final_df = pd.concat(all_df, ignore_index=True)
     print(f"Total records after combination: {len(final_df)}")
+
+    final_df = create_boolean_category_columns(final_df, 'snomed kode', 100)
     return final_df
 
 def match_and_process_data(combined_df: pd.DataFrame, cache_file: str) -> pd.DataFrame:
@@ -141,6 +192,7 @@ def match_records(df: pd.DataFrame, file_dict: dict) -> pd.DataFrame:
     df = df.copy()
     df['rekvnr_short'] = df['rekvnr'].astype(str).str[:8]
     df['match'] = df['rekvnr_short'].map(file_dict)
+    
     return df
 
 class AttentionMIL(nn.Module):
@@ -332,6 +384,11 @@ def print_dataset_statistics(matched_df: pd.DataFrame,
     logger.info(f"Total samples in dataset: {total_samples}")
     logger.info(f"Samples with matched slides: {matched_samples}")
     logger.info(f"Matching rate: {(matched_samples/total_samples)*100:.2f}%")
+
+    if target_column == 'sex':
+        print('Setting column to lowercase for sex.')
+        matched_df[target_column] = matched_df[target_column].str.lower()
+
     
     # Target variable statistics
     matched_data = matched_df[matched_df['match'].notna()]
@@ -432,198 +489,202 @@ def train_model(embeddings_dir: str,
                 target_column: str,
                 model_name: str = "ctranspath",
                 n_splits: int = 5,
-                epochs: int = 10,  # Changed to 10 epochs
+                epochs: int = 5,  # Changed to 10 epochs
                 batch_size: int = 32,
                 learning_rate: float = 0.001,
                 hidden_dim: int = 256,
                 output_dir: str = "D:/DATA/abmil_results",
                 device: str = "cuda"):
-    
-    logger = setup_logging(output_dir)
-    logger.info(f"Starting ABMIL training for target: {target_column}")
-    
-    # Load embeddings
-    embeddings_dict = load_embeddings(embeddings_dir, model_name, matched_df)
-    logger.info(f"Loaded embeddings for {len(embeddings_dict)} slides")
-    
-    # Print dataset statistics
-    print_dataset_statistics(matched_df, target_column, embeddings_dict, logger)
-    
-    # Plot class distribution
-    plot_class_distribution(matched_df, target_column, output_dir)
-    
-    # Prepare labels
-    labels_dict = {
-        Path(row['match']).stem: row[target_column] 
-        for _, row in matched_df.iterrows() 
-        if pd.notna(row['match'])
-    }
-    
-    # Keep only slides with both embeddings and labels
-    common_slides = set(embeddings_dict.keys()) & set(labels_dict.keys())
-    embeddings_dict = {k: embeddings_dict[k] for k in common_slides}
-    labels_dict = {k: labels_dict[k] for k in common_slides}
-    
-    # Convert to arrays for stratification
-    slide_ids = np.array(list(common_slides))
-    labels = pd.Series(labels_dict)
-    
-    # Calculate baseline metrics
-    matched_labels = matched_df[matched_df['match'].notna()][target_column]
-    baseline_acc, baseline_prec = calculate_baseline_metrics(matched_labels)
-    logger.info(f"\nBaseline Metrics:")
-    logger.info(f"Baseline Accuracy: {baseline_acc:.4f}")
-    logger.info(f"Baseline Precision: {baseline_prec:.4f}")
-    
-    # Create label encoder if needed
-    if isinstance(labels.iloc[0], str):
-        label_encoder = LabelEncoder()
-        stratification_labels = label_encoder.fit_transform(labels)
-    else:
-        label_encoder = None
-        stratification_labels = labels.values
-    
-    # Initialize cross-validation
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-    cv_metrics = []
-    
-    # Initialize results dictionary
-    results = {
-        'fold_metrics': [],
-        'training_curves': [],
-        'model_paths': [],
-        'predictions': [],
-        'label_encoder': label_encoder  # Save for later use
-    }
-    
-    # Training loop
-    for fold, (train_idx, val_idx) in enumerate(skf.split(slide_ids, stratification_labels)):
-        logger.info(f"\nStarting fold {fold + 1}/{n_splits}")
+
+    try:
+        logger = setup_logging(output_dir)
+        logger.info(f"Starting ABMIL training for target: {target_column}")
         
-        # Prepare datasets
-        train_slides = slide_ids[train_idx]
-        val_slides = slide_ids[val_idx]
+        # Load embeddings
+        embeddings_dict = load_embeddings(embeddings_dir, model_name, matched_df)
+        logger.info(f"Loaded embeddings for {len(embeddings_dict)} slides")
         
-        train_embeddings = {k: embeddings_dict[k] for k in train_slides}
-        val_embeddings = {k: embeddings_dict[k] for k in val_slides}
+        # Print dataset statistics
+        print_dataset_statistics(matched_df, target_column, embeddings_dict, logger)
         
-        train_labels = pd.Series({k: labels_dict[k] for k in train_slides})
-        val_labels = pd.Series({k: labels_dict[k] for k in val_slides})
+        # Plot class distribution
+        plot_class_distribution(matched_df, target_column, output_dir)
         
-        # Print fold-specific class distribution
-        logger.info("\nFold class distribution:")
-        logger.info("Training set:")
-        for label, count in train_labels.value_counts().items():
-            logger.info(f"Class {label}: {count} samples")
-        logger.info("\nValidation set:")
-        for label, count in val_labels.value_counts().items():
-            logger.info(f"Class {label}: {count} samples")
+        # Prepare labels
+        labels_dict = {
+            Path(row['match']).stem: row[target_column] 
+            for _, row in matched_df.iterrows() 
+            if pd.notna(row['match'])
+        }
         
-        # Create datasets with shared label encoder
-        train_dataset = SlideDataset(train_embeddings, train_labels, label_encoder)
-        val_dataset = SlideDataset(val_embeddings, val_labels, label_encoder)
+        # Keep only slides with both embeddings and labels
+        common_slides = set(embeddings_dict.keys()) & set(labels_dict.keys())
+        embeddings_dict = {k: embeddings_dict[k] for k in common_slides}
+        labels_dict = {k: labels_dict[k] for k in common_slides}
         
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=batch_size, 
-            shuffle=True,
-            num_workers=4,
-            collate_fn=collate_batch
-        )
-        val_loader = DataLoader(
-            val_dataset, 
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=4,
-            collate_fn=collate_batch
-        )
+        # Convert to arrays for stratification
+        slide_ids = np.array(list(common_slides))
+        labels = pd.Series(labels_dict)
         
-        # Initialize model
-        input_dim = next(iter(embeddings_dict.values())).shape[1]
-        model = AttentionMIL(input_dim, hidden_dim).to(device)
+        # Calculate baseline metrics
+        matched_labels = matched_df[matched_df['match'].notna()][target_column]
+        baseline_acc, baseline_prec = calculate_baseline_metrics(matched_labels)
+        logger.info(f"\nBaseline Metrics:")
+        logger.info(f"Baseline Accuracy: {baseline_acc:.4f}")
+        logger.info(f"Baseline Precision: {baseline_prec:.4f}")
         
-        criterion = nn.BCELoss()
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+        # Create label encoder if needed
+        if isinstance(labels.iloc[0], str):
+            label_encoder = LabelEncoder()
+            stratification_labels = label_encoder.fit_transform(labels)
+        else:
+            label_encoder = None
+            stratification_labels = labels.values
         
-        # Training
-        best_auc = 0
-        best_metrics = None
-        train_losses = []
-        val_losses = []
-        val_metrics_history = []
+        # Initialize cross-validation
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        cv_metrics = []
         
-        for epoch in range(epochs):
-            train_loss = train_epoch(
-                model, train_loader, criterion, optimizer, device
+        # Initialize results dictionary
+        results = {
+            'fold_metrics': [],
+            'training_curves': [],
+            'model_paths': [],
+            'predictions': [],
+            'label_encoder': label_encoder  # Save for later use
+        }
+        
+        # Training loop
+        for fold, (train_idx, val_idx) in enumerate(skf.split(slide_ids, stratification_labels)):
+            logger.info(f"\nStarting fold {fold + 1}/{n_splits}")
+            
+            # Prepare datasets
+            train_slides = slide_ids[train_idx]
+            val_slides = slide_ids[val_idx]
+            
+            train_embeddings = {k: embeddings_dict[k] for k in train_slides}
+            val_embeddings = {k: embeddings_dict[k] for k in val_slides}
+            
+            train_labels = pd.Series({k: labels_dict[k] for k in train_slides})
+            val_labels = pd.Series({k: labels_dict[k] for k in val_slides})
+            
+            # Print fold-specific class distribution
+            logger.info("\nFold class distribution:")
+            logger.info("Training set:")
+            for label, count in train_labels.value_counts().items():
+                logger.info(f"Class {label}: {count} samples")
+            logger.info("\nValidation set:")
+            for label, count in val_labels.value_counts().items():
+                logger.info(f"Class {label}: {count} samples")
+
+            
+            # Create datasets with shared label encoder
+            train_dataset = SlideDataset(train_embeddings, train_labels, label_encoder)
+            val_dataset = SlideDataset(val_embeddings, val_labels, label_encoder)
+            
+            train_loader = DataLoader(
+                train_dataset, 
+                batch_size=batch_size, 
+                shuffle=True,
+                num_workers=4,
+                collate_fn=collate_batch
             )
-            train_losses.append(train_loss)
+            val_loader = DataLoader(
+                val_dataset, 
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=4,
+                collate_fn=collate_batch
+            )
             
-            # Evaluation
-            val_metrics = evaluate(model, val_loader, criterion, device)
-            val_metrics_history.append(val_metrics[:-1])  # Exclude loss from metrics history
-            val_losses.append(val_metrics[-1])  # Add validation loss
-            current_auc = val_metrics[4]
+            # Initialize model
+            input_dim = next(iter(embeddings_dict.values())).shape[1]
+            model = AttentionMIL(input_dim, hidden_dim).to(device)
             
-            if current_auc > best_auc:
-                best_auc = current_auc
-                best_metrics = val_metrics[:-1]  # Exclude loss from best metrics
+            criterion = nn.BCELoss()
+            optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+            
+            # Training
+            best_auc = 0
+            best_metrics = None
+            train_losses = []
+            val_losses = []
+            val_metrics_history = []
+            
+            for epoch in range(epochs):
+                train_loss = train_epoch(
+                    model, train_loader, criterion, optimizer, device
+                )
+                train_losses.append(train_loss)
                 
-                model_path = os.path.join(
-                    output_dir, 
-                    f"{target_column}_fold{fold}_best_model.pth"
-                )
-                torch.save(model.state_dict(), model_path)
-                results['model_paths'].append(model_path)
+                # Evaluation
+                val_metrics = evaluate(model, val_loader, criterion, device)
+                val_metrics_history.append(val_metrics[:-1])  # Exclude loss from metrics history
+                val_losses.append(val_metrics[-1])  # Add validation loss
+                current_auc = val_metrics[4]
+                
+                if current_auc > best_auc:
+                    best_auc = current_auc
+                    best_metrics = val_metrics[:-1]  # Exclude loss from best metrics
+                    
+                    model_path = os.path.join(
+                        output_dir, 
+                        f"{target_column}_fold{fold}_best_model.pth"
+                    )
+                    torch.save(model.state_dict(), model_path)
+                    results['model_paths'].append(model_path)
+                
+                if (epoch + 1) % 2 == 0:  # Log every 2 epochs
+                    logger.info(
+                        f"Epoch {epoch + 1}/{epochs} - "
+                        f"Train Loss: {train_loss:.4f} - "
+                        f"Val Loss: {val_metrics[-1]:.4f} - "
+                        f"Val AUC: {current_auc:.4f}"
+                    )
             
-            if (epoch + 1) % 2 == 0:  # Log every 2 epochs
-                logger.info(
-                    f"Epoch {epoch + 1}/{epochs} - "
-                    f"Train Loss: {train_loss:.4f} - "
-                    f"Val Loss: {val_metrics[-1]:.4f} - "
-                    f"Val AUC: {current_auc:.4f}"
-                )
+            # Plot training curves with validation loss and baselines
+            plot_training_curves(
+                train_losses, 
+                val_metrics_history, 
+                val_losses,
+                fold, 
+                target_column, 
+                output_dir,
+                baseline_acc,
+                baseline_prec
+            )
+            
+            cv_metrics.append(best_metrics)
+            logger.info(
+                f"Fold {fold + 1} best metrics - "
+                f"Accuracy: {best_metrics[0]:.4f} - "
+                f"Precision: {best_metrics[1]:.4f} - "
+                f"Recall: {best_metrics[2]:.4f} - "
+                f"F1: {best_metrics[3]:.4f} - "
+                f"AUC: {best_metrics[4]:.4f}"
+            )
+            
+            results['fold_metrics'].append(best_metrics)
+            results['training_curves'].append((train_losses, val_metrics_history))
         
-        # Plot training curves with validation loss and baselines
-        plot_training_curves(
-            train_losses, 
-            val_metrics_history, 
-            val_losses,
-            fold, 
-            target_column, 
-            output_dir,
-            baseline_acc,
-            baseline_prec
-        )
+        # Calculate and log average metrics
+        avg_metrics = np.mean(cv_metrics, axis=0)
+        std_metrics = np.std(cv_metrics, axis=0)
         
-        cv_metrics.append(best_metrics)
-        logger.info(
-            f"Fold {fold + 1} best metrics - "
-            f"Accuracy: {best_metrics[0]:.4f} - "
-            f"Precision: {best_metrics[1]:.4f} - "
-            f"Recall: {best_metrics[2]:.4f} - "
-            f"F1: {best_metrics[3]:.4f} - "
-            f"AUC: {best_metrics[4]:.4f}"
-        )
+        logger.info("\nFinal cross-validation metrics:")
+        logger.info(f"Accuracy: {avg_metrics[0]:.4f} (±{std_metrics[0]:.4f})")
+        logger.info(f"Precision: {avg_metrics[1]:.4f} (±{std_metrics[1]:.4f})")
+        logger.info(f"Recall: {avg_metrics[2]:.4f} (±{std_metrics[2]:.4f})")
+        logger.info(f"F1 Score: {avg_metrics[3]:.4f} (±{std_metrics[3]:.4f})")
+        logger.info(f"AUC-ROC: {avg_metrics[4]:.4f} (±{std_metrics[4]:.4f})")
         
-        results['fold_metrics'].append(best_metrics)
-        results['training_curves'].append((train_losses, val_metrics_history))
-    
-    # Calculate and log average metrics
-    avg_metrics = np.mean(cv_metrics, axis=0)
-    std_metrics = np.std(cv_metrics, axis=0)
-    
-    logger.info("\nFinal cross-validation metrics:")
-    logger.info(f"Accuracy: {avg_metrics[0]:.4f} (±{std_metrics[0]:.4f})")
-    logger.info(f"Precision: {avg_metrics[1]:.4f} (±{std_metrics[1]:.4f})")
-    logger.info(f"Recall: {avg_metrics[2]:.4f} (±{std_metrics[2]:.4f})")
-    logger.info(f"F1 Score: {avg_metrics[3]:.4f} (±{std_metrics[3]:.4f})")
-    logger.info(f"AUC-ROC: {avg_metrics[4]:.4f} (±{std_metrics[4]:.4f})")
-    
-    # Save results
-    results_path = os.path.join(output_dir, f"{target_column}_training_results.pkl")
-    with open(results_path, 'wb') as f:
-        pickle.dump(results, f)
-    
+        # Save results
+        results_path = os.path.join(output_dir, f"{target_column}_training_results.pkl")
+        with open(results_path, 'wb') as f:
+            pickle.dump(results, f)
+    except Exception as e:
+        logger.info(f"Exception {e}")
+        
     return avg_metrics, std_metrics, results
 
 if __name__ == "__main__":
@@ -648,11 +709,54 @@ if __name__ == "__main__":
     result_df = match_and_process_data(combined_df, CACHE_FILE)
     
     
-    # Train model
-    avg_metrics, std_metrics, results = train_model(
+    inflammation = {
+    'M40000': 'Inflammation',
+    'M41000': 'Acute inflammation',
+    'M42100': 'Acute and chronic inflammation',
+    'M43000': 'Chronic inflammation',
+    'M44200': 'Non-necrotizing, granulomatous inflammation',
+    'M45000': 'Inflammation with fibrosis',
+    'M45020': 'Granulation tissue',›
+    'M48000': 'Dermatitis (eczema)',
+    }
+
+    necrosis_fibrosis = {
+    'M49000': 'Fibrosis',
+    'M54000': 'Necrosis',
+    }
+
+
+  
+    for TARGET_COLUMN in inflammation.keys():
+        print(f"=== {TARGET_COLUMN} {inflammation[TARGET_COLUMN]} ===")
+        # Train model
+        avg_metrics, std_metrics, results = train_model(
         embeddings_dir=EMBEDDINGS_DIR,
         matched_df=result_df,
         target_column=TARGET_COLUMN,
         model_name=MODEL_NAME,
         output_dir=OUTPUT_DIR
-    )
+        )
+
+    for TARGET_COLUMN in ['sex']:
+        print(f"=== {TARGET_COLUMN} ===")
+        # Train model
+        avg_metrics, std_metrics, results = train_model(
+        embeddings_dir=EMBEDDINGS_DIR,
+        matched_df=result_df,
+        target_column=TARGET_COLUMN,
+        model_name=MODEL_NAME,
+        output_dir=OUTPUT_DIR
+        )
+
+
+    for TARGET_COLUMN in necrosis_fibrosis.keys():
+        print(f"=== {TARGET_COLUMN} {necrosis_fibrosis[TARGET_COLUMN]} ===")
+        # Train model
+        avg_metrics, std_metrics, results = train_model(
+        embeddings_dir=EMBEDDINGS_DIR,
+        matched_df=result_df,
+        target_column=TARGET_COLUMN,
+        model_name=MODEL_NAME,
+        output_dir=OUTPUT_DIR
+        )
