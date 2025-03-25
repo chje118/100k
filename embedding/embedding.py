@@ -19,6 +19,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import timm  # this is the unpatched timm, note that there is a patched timm for Ctranspath
 from skimage.filters import threshold_otsu
+import random
 
 
 import os
@@ -364,13 +365,14 @@ def extract_tiles(tiles: DeepZoomGenerator,
     thumb_gray = np.array(temp_tile_RGB.convert("L"))
     threshold_val = threshold_otsu(thumb_gray)
 
-    print(f"t-val is {threshold_val}")
+    print(f"=== t-val is {threshold_val} ===")
 
     r, c = np.where(thumb_gray < threshold_val)
     tile_coordinates = list(zip(r, c))
     
     # Shuffle and limit if specified
     if limit > 0:
+        print('Capping slides')
         import random
         random.shuffle(tile_coordinates)
         tile_coordinates = tile_coordinates[:limit]
@@ -404,7 +406,7 @@ def extract_tiles(tiles: DeepZoomGenerator,
 def create_model_dataloaders(
     images: List[Image.Image],
     model_manager: ModelManager,
-    batch_size: int = 256,
+    batch_size: int = 256*2,
     num_workers: int = 0,
     pin_memory: bool = False
 ) -> Dict[str, DataLoader]:
@@ -476,19 +478,43 @@ def main():
         )
     ]
 
-    MODEL_CONFIGS = [MODEL_CONFIGS[0], MODEL_CONFIGS[1]]
+    MODEL_CONFIGS = [MODEL_CONFIGS[0], MODEL_CONFIGS[1], MODEL_CONFIGS[2]]
 
     
     
     OUTPUT_DIR = "D:/DATA/embeddings"
     TRACKER_FILE = "D:/DATA/processing_tracker.pkl"
-    BATCH_SIZE = 256
+    BATCH_SIZE = 256*2
 
     mrxs_df = load_cache()
     logger.info(f"Loaded cache with {len(mrxs_df)} entries")
     
     all_mrxs = list(mrxs_df['File Path'].values)
+    random.shuffle(all_mrxs)
     logger.info(f"Found {len(all_mrxs)} MRXS files to process")
+
+    short_list = pd.read_csv(r'D:\match_list.csv', index_col=0)
+
+    short_list_ = []
+
+    for _ in short_list['rekvnr_short'].to_list():
+        try:
+            short_list_.append(str(int(_)))
+        except ValueError:
+            pass
+
+
+    logger.info(f"ShortList has a length of {len(short_list_)}.")
+
+    all_mrxs_ = []
+    for _ in tqdm(all_mrxs):
+        for s in short_list_:
+            if s in _:
+                all_mrxs_.append(_)
+                continue
+    all_mrxs = all_mrxs_
+
+    logger.info(f"Found {len(all_mrxs)} MRXS files to process after matching and filtering")
     
     # Initialize components
     tracker = ProcessingTracker(TRACKER_FILE)
@@ -511,7 +537,7 @@ def main():
             # Extract tiles
             slide = open_slide(filepath)
             tiles_generator = DeepZoomGenerator(slide, 224, overlap=0, limit_bounds=True)
-            tiles_data, coordinates = extract_tiles(tiles_generator, level=-1, limit=0)
+            tiles_data, coordinates = extract_tiles(tiles_generator, level=-1, limit=50000)
             logger.info(f"Extracted {len(tiles_data)} tiles from slide")
             
             # Create single dataloader for all models
