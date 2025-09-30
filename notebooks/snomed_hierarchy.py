@@ -91,8 +91,21 @@ class SNOMEDHierarchy:
         self.edited_hierarchy = copy.deepcopy(self.hierarchy)
         self._rebuild_code_to_region()
 
+    def _check_codes_preserved(self, codes_to_check):
+        """Check if all codes in codes_to_check are still present in the edited hierarchy."""
+        edited_codes = set()
+        for region in self.edited_hierarchy:
+            for sub in self.edited_hierarchy[region]["subregions"].values():
+                for code_info in sub["codes"]:
+                    edited_codes.add(code_info["code"])
+        missing = set(codes_to_check) - edited_codes
+        if missing:
+            print(f"Missing codes in edited hierarchy: {missing}")
+        return missing    
+
     def merge_main_regions(self, new_region, regions_to_merge, new_name=None):
         merged_subregions = {}
+        affected_codes = []
         for region in regions_to_merge:
             if region not in self.edited_hierarchy:
                 print(f"Region {region} not found, skipping.")
@@ -104,6 +117,7 @@ class SNOMEDHierarchy:
                         "codes": []
                     }
                 merged_subregions[subregion]["codes"].extend(sub_dict["codes"])
+                affected_codes.extend([c["code"] for c in sub_dict["codes"]])
         if not new_name:
             new_name = self.edited_hierarchy[regions_to_merge[0]]["name"] if regions_to_merge else "Merged Region"
         self.edited_hierarchy[new_region] = {
@@ -114,19 +128,30 @@ class SNOMEDHierarchy:
             if region in self.edited_hierarchy:
                 del self.edited_hierarchy[region]
         self._rebuild_code_to_region()
+        self._check_codes_preserved(affected_codes)
 
     def update_region(self, region, new_name):
+        affected_codes = []
         if region in self.edited_hierarchy:
+            for sub_dict in self.edited_hierarchy[region]["subregions"].values():
+                affected_codes.extend([c["code"] for c in sub_dict["codes"]])
             self.edited_hierarchy[region]["name"] = new_name
         else:
             print(f"Region {region} not found.")
         self._rebuild_code_to_region()
+        self._check_codes_preserved(affected_codes)
 
     def split_main_region(self, original_region, subregion_map):
         if original_region not in self.edited_hierarchy:
             print(f"Region {original_region} not found.")
             return
         original_subregions = self.edited_hierarchy[original_region]["subregions"]
+        # Collect codes that will be affected
+        affected_codes = []
+        for subregion_list in subregion_map.values():
+            for subregion in subregion_list:
+                if subregion in original_subregions:
+                    affected_codes.extend([c["code"] for c in original_subregions[subregion]["codes"]])
         for new_region, subregion_list in subregion_map.items():
             new_subregions = {}
             for subregion in subregion_list:
@@ -147,6 +172,7 @@ class SNOMEDHierarchy:
         if not original_subregions:
             del self.edited_hierarchy[original_region]
         self._rebuild_code_to_region()
+        self._check_codes_preserved(affected_codes)
 
     def list_main_regions(self, edited=False):
         """List only main regions with total number of codes in parentheses."""
