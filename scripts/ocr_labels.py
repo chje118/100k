@@ -9,6 +9,7 @@ class SlideLabelOCR:
     def __init__(self, slide_path):
         self.slide = openslide.OpenSlide(slide_path)
         self.label_images = self.slide.associated_images
+        self.results = self.extract_text_from_label()
 
     def get_label_image(self, label_key='label'):
         if label_key in self.label_images:
@@ -27,15 +28,14 @@ class SlideLabelOCR:
         # Use easyOCR to read text from the image
         result = reader.readtext(label_array)
         return result
-
+    
+    def print_results(self):
+        for (_, text, conf) in self.results:
+            print(f"Detected text: {text} with confidence: {conf}")
+    
 # Example usage:
 if __name__ == "__main__":
     slide_path = 'C:/Users/chris/OneDrive/Dokumenter/SDU/Master\'s Thesis Project/Sample MRXS/Mirax2.2-3.mrxs'
     ocr = SlideLabelOCR(slide_path)
     ocr.show_label_image('label')
-    try:
-        text_results = ocr.extract_text_from_label('label')
-        for bbox, text, conf in text_results:
-            print(f"Detected text: {text} with confidence: {conf}")
-    except ValueError as e:
-        print(e)
+    ocr.print_results()
