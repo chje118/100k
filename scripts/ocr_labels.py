@@ -35,7 +35,7 @@ class SlideLabelOCR:
     
 # Example usage:
 if __name__ == "__main__":
-    slide_path = 'C:/Users/chris/OneDrive/Dokumenter/SDU/Master\'s Thesis Project/Sample MRXS/Mirax2.2-3.mrxs'
+    slide_path = 'path/to/slide'
     ocr = SlideLabelOCR(slide_path)
     ocr.show_label_image('label')
     ocr.print_results()
