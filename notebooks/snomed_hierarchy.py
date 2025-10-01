@@ -65,14 +65,14 @@ class SNOMEDHierarchy:
     def code_to_main_region_name(self, code):
         main_region = self.code_to_region.get(code)
         if main_region is None:
+            print("-"*40)
             print(f"Code {code} not found in code_to_region mapping.")
             self.debug_check_code(code)
-            print("-"*40)
             return None
         if main_region not in self.edited_hierarchy:
+            print("-"*40)
             print(f"Main region {main_region} for code {code} not found in hierarchy.")
             self.debug_check_code(code)
-            print("-"*40)
             return None
         return self.edited_hierarchy[main_region]["name"]
 
