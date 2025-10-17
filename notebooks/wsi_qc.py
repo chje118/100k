@@ -18,23 +18,25 @@ class SingleQC:
         self.seg_tissue()
         self.tile_tissue()
         self.seg_artifacts()
-        self.wsi.write()
         self.gdf = self.artifact_gdf()
         self.adf = self.artifact_dataframe()
         
     def seg_tissue(self):
         if self.TISSUE_KEY not in self.wsi.shapes:
             zs.seg._tissue.tissue(self.wsi, model='grandqc', key_added=self.TISSUE_KEY)
+            self.wsi.write()
         return self.wsi
     
     def tile_tissue(self, tile_px=512, mpp=1.5):
         if self.TILE_KEY not in self.wsi.shapes:
             zs.pp.tile_tissues(self.wsi, tile_px=tile_px, mpp=mpp, key_added=self.TILE_KEY, tissue_key=self.TISSUE_KEY)
+            self.wsi.write()
         return self.wsi
     
     def seg_artifacts(self):
         if self.ARTIFACT_KEY not in self.wsi.shapes:
             zs.seg._artifact.artifact(self.wsi, tile_key=self.TILE_KEY, key_added=self.ARTIFACT_KEY)
+            self.wsi.write()
         return self.wsi
 
     def artifact_gdf(self):
