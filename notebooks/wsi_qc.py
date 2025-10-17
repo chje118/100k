@@ -62,8 +62,8 @@ class SingleQC:
     def view_artifacts(self):
         viewer = zs.pl.WSIViewer(self.wsi)
         viewer.add_image('thumbnail')
-        viewer.add_contours(self.TISSUE_KEY)
         viewer.add_polygons(self.ARTIFACT_KEY, color_by='class', alpha=0.5)
+        viewer.add_contours(self.TISSUE_KEY)
         viewer.show()
 
 class MultipleQC:
