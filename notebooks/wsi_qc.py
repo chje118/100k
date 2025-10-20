@@ -28,6 +28,7 @@ class SingleQC:
         return self.wsi
     
     def tile_tissue(self, tile_px=512, mpp=1.5):
+        """ GrandQC trained on px=512, and mpp = 1 / 1.5 / 2 """
         if self.TILE_KEY not in self.wsi.shapes:
             zs.pp.tile_tissues(self.wsi, tile_px=tile_px, mpp=mpp, key_added=self.TILE_KEY, tissue_key=self.TISSUE_KEY)
             self.wsi.write()
