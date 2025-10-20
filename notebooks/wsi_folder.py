@@ -2,6 +2,7 @@ import os
 import shutil
 import re
 import pandas as pd
+from tqdm import tqdm 
 
 class FindWSIData:
     def __init__(self, base_dir, df, col):
@@ -10,10 +11,11 @@ class FindWSIData:
         self.col = col
         self._index_folders()
         self.df_results = self.get_df_results()
+        # TODO cache files
 
     def _index_folders(self):
         folder_index = {}
-        for root, dirs, files in os.walk(self.base_dir):
+        for root, dirs, files in tqdm(os.walk(self.base_dir), desc = "Indexing folders..."):
             for d in dirs:
                 folder_index.setdefault(d, []).append(os.path.join(root, d))
         self.folder_index = folder_index
@@ -22,8 +24,8 @@ class FindWSIData:
         """ Extract the filename from a WSI path. """
         return os.path.basename(wsi_path)
 
-    def _get_base_name(self, filename):
-        """ Get base name (folder) without extension. """
+    def _get_name_wo_extension(self, filename):
+        """ Get folder name without extension. """
         return os.path.splitext(filename)[0]
 
     def _find_matching_folders(self, wsi_path):
@@ -32,7 +34,7 @@ class FindWSIData:
         including numbered variants like 'slide1', 'slide1 (2)', etc.
         """
         filename = self._get_filename(wsi_path)
-        base_name = self._get_base_name(filename)
+        base_name = self._get_name_wo_extension(filename)
         search_base = re.sub(r" \(\d+\)$", "", base_name)
         pattern = re.compile(rf"^{re.escape(search_base)}( \(\d+\))?$")
         matches = []
