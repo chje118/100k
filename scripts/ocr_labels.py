@@ -11,6 +11,7 @@ reader = easyocr.Reader(['en', 'da']) # load the model into memory (english and 
 
 class SlideLabelOCR:
     def __init__(self, slide_path):
+        # TODO: Rely on wsireader (works natively with LazySlide) instead of openslide
         self.slide = openslide.OpenSlide(slide_path)
         self.label_images = self.slide.associated_images
         self.results = self.extract_text_from_label()
