@@ -22,6 +22,10 @@ class SNOMEDCodes:
     def get_codes_by_letter(self, letter: str) -> pd.DataFrame:
         """ Get SNOMED codes starting with a specific letter. """
         return self.dataframe[self.dataframe['SKSkode'].str.startswith(letter)].copy()
+    
+    def code_to_text(self) -> dict: 
+        return dict(zip(self.dataframe['SKSkode'], self.dataframe['Kodetekst']))
+
 
 class SNOMEDHierarchy:
     """ Class to manage hierarchical structure of SNOMED codes. """
