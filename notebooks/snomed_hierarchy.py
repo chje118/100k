@@ -3,6 +3,7 @@ import copy
 
 class SNOMEDCodes: 
     """ Class to handle SNOMED codes. """
+    # TODO: Add validation checks, e.g. if df has required columns etc.
     def __init__(self, dataframe: pd.DataFrame):
         self.dataframe = dataframe
         self.first_letters = self._first_letters()
