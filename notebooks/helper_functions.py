@@ -96,7 +96,7 @@ class MetadataExplorer:
         plt.tight_layout()
         plt.show()    
 
-    def plot_many(self, subset_col: str, letter: str, n: int = 10, by_category: bool = False, exclude_text: list[str] = None):
+    def plot_many(self, subset_col: str, letter: str, n: int = 10, by_category: bool = False, exclude_text: Optional[list[str]] = None):
         subset_dict = self.get_subset_dict(subset_col)
         n_groups = len(subset_dict)
 
