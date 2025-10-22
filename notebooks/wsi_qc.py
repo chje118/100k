@@ -1,7 +1,6 @@
 from wsidata import open_wsi
 import lazyslide as zs
 import geopandas as gpd
-from wsi_metadata import WSIMetadata
 import os
 import pandas as pd
 from tqdm import tqdm
