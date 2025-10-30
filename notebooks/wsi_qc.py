@@ -6,6 +6,7 @@ import pandas as pd
 from tqdm import tqdm
 import gc
 from datetime import datetime
+import json
 
 class SegmentTissue:
     def __init__(self, wsi_path, local_zarr_dir, try_grandqc = False):
@@ -263,7 +264,7 @@ class SegmentMany:
                 "tissue_size": tissue_size,
                 "elapsed_time": elapsed_time,
                 "artifact_percentage": artifact_percentage,
-                "artifact_df": artifact_df,
+                "artifact_df": artifact_df.to_json() if artifact_df is not None else None,
                 "status": status
             }])
 
