@@ -264,7 +264,7 @@ class SegmentMany:
                 "tissue_size": tissue_size,
                 "elapsed_time": elapsed_time,
                 "artifact_percentage": artifact_percentage,
-                "artifact_df": artifact_df.to_json() if artifact_df is not None else None,
+                "artifact_df": artifact_df.reset_index().to_json(orient='records') if artifact_df is not None else None,
                 "status": status
             }])
 
