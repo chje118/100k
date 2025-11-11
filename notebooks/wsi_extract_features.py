@@ -3,11 +3,12 @@ from wsidata import open_wsi
 import lazyslide as zs
 from datetime import datetime
 import pandas as pd
+import geopandas as gpd
 from tqdm import tqdm
 import gc
 
 class ExtractFeatures:
-    def __init__(self, wsi_path, local_zarr_dir, model):
+    def __init__(self, wsi_path, local_zarr_dir, model, remove_artifacts = False):
         self.wsi_path = wsi_path
         self.zarr_path = os.path.join(local_zarr_dir, os.path.basename(wsi_path).replace(".mrxs", ".zarr"))
         if os.path.exists(self.zarr_path):
@@ -16,8 +17,13 @@ class ExtractFeatures:
             self.wsi = open_wsi(self.wsi_path)
             os.makedirs(local_zarr_dir, exist_ok=True)
         self.model_name = model
-        self.TILE_KEY = "tiles_224"
-        self.FEATURE_KEY = f'features_{self.model_name}'
+        self.remove_artifacts = remove_artifacts
+        if remove_artifacts: 
+            self.TILE_KEY = "clean_tiles_224"
+            self.FEATURE_KEY = f'clean_features_{self.model_name}'
+        else:
+            self.TILE_KEY = "tiles_224"
+            self.FEATURE_KEY = f'features_{self.model_name}'
         self.process_slide()
     
     def is_empty_array(self, arr):
@@ -63,10 +69,18 @@ class ExtractFeatures:
     def tile_tissue(self, tile_px=224):
         """ TODO: look up px, mpp and overlap for models. """
         try:
-            
             if self.TILE_KEY not in self.wsi.shapes:
                 zs.pp.tile_tissues(self.wsi, tile_px=tile_px, key_added=self.TILE_KEY, tissue_key=self.TISSUE_KEY)
-                self.wsi.write(self.zarr_path)
+                
+            if self.remove_artifacts:
+                tiles = self.wsi.shapes[self.TILE_KEY]
+                artifacts = self.wsi.shapes.get("artifacts_grandqc")
+                if tiles is not None and artifacts is not None:
+                    overlapping = gpd.sjoin(tiles, artifacts, predicate="intersects")
+                    clean_tiles = tiles.drop(index=overlapping.index.unique())
+                    self.wsi.shapes[self.TILE_KEY] = clean_tiles
+            
+            self.wsi.write(self.zarr_path)
             return self.wsi
         except Exception as e:
             print(f"Error while extracting tiles: {e}")
@@ -96,7 +110,6 @@ class ExtractFeatures:
     def get_features(self):
         return self.wsi.fetch.features_anndata(feature_key=self.FEATURE_KEY, tile_key=self.TILE_KEY)
 
-    
 
 class ExtractMany:
     def __init__(self, wsi_paths, output_dir, local_zarr_dir, segmentation_type, model, remove_artifacts=False):
@@ -106,8 +119,9 @@ class ExtractMany:
         self.local_zarr_dir = local_zarr_dir
         self.segmentation_type = segmentation_type # TODO MUST BE FEATURES
         self.model = model
+        self.remove_artifacts = remove_artifacts
         self.csv_path = os.path.join(self.output_dir, f"{self.segmentation_type}_summary.csv")
-        self.extract_features()         
+        self.extract_features()
 
     def already_processed(self):
         if not os.path.exists(self.csv_path):
@@ -130,7 +144,7 @@ class ExtractMany:
             print(f"\nProcessing {slide_name}...")
             try:
                 if self.segmentation_type == "feature":
-                    wsiobj = ExtractFeatures(path, self.local_zarr_dir, model = self.model)
+                    wsiobj = ExtractFeatures(path, self.local_zarr_dir, model = self.model, remove_artifacts = self.remove_artifacts)
                     features = wsiobj.get_features()
                     elapsed_time = wsiobj.elapsed_time
                     status = "feature extraction complete"
