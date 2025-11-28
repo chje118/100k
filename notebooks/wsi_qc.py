@@ -9,7 +9,7 @@ from datetime import datetime
 import json
 
 class SegmentTissue:
-    def __init__(self, wsi_path: str, local_zarr_dir:str, version = "default":str):
+    def __init__(self, wsi_path: str, local_zarr_dir:str, version: str = "default"):
         if not isinstance(wsi_path, str):
             raise ValueError("wsi_path must be a string")
         self.wsi_path = wsi_path
@@ -106,7 +106,7 @@ class SegmentTissue:
         self.wsi.write(self.zarr_path)
         return self.wsi
     
-    def seg_threshold(self, threshold:float=75):
+    def seg_threshold(self, threshold:int=75):
         self.elapsed_time = None
         if self.TISSUE_KEY in self.wsi.shapes:
             print(f"Tissue already segmented using: {self.TISSUE_KEY}")
@@ -272,7 +272,7 @@ class SegmentArtifacts:
 
 class SegmentMany:
     def __init__(self, wsi_paths:list[str], output_dir:str, local_zarr_dir:str, segmentation_type:str, version:str="default"):
-        if wsi_paths not isinstance(wsi_paths, list) or not all(isinstance(p, str) for p in wsi_paths):
+        if not isinstance(wsi_paths, list) or not all(isinstance(p, str) for p in wsi_paths):
             raise ValueError("wsi_paths must be a list of strings")
         self.wsi_paths = wsi_paths
         if not isinstance(output_dir, str):
@@ -317,7 +317,7 @@ class SegmentMany:
                     artifact_percentage = wsiobj.get_artifact_percentage()
                     artifact_df = wsiobj.get_artifact_dataframe()
                 elif self.segmentation_type == "tissue":
-                    wsiobj = SegmentTissue(path, self.local_zarr_dir, try_grandqc=self.try_grandqc)
+                    wsiobj = SegmentTissue(path, self.local_zarr_dir, version=self.version)
                     artifact_percentage = None
                     artifact_df = None
                 tissue_size = wsiobj.get_full_tissue_area()
