@@ -23,7 +23,7 @@ class SegmentTissue:
             os.makedirs(local_zarr_dir, exist_ok=True)
         if version not in ["default", "grandqc", "threshold"]:
             raise ValueError("version must be one of ['default', 'grandqc', 'threshold']")
-        self.version = version
+        self.version = f"tissue_{version}"
         self.TILE_KEY = "tiles_px512_mpp1.5_overlap0.1"
         self.process_slide()
 
@@ -57,13 +57,13 @@ class SegmentTissue:
             raise RuntimeError(str(e))
     
     def seg_tissue(self):
-        if self.version == "default":
+        if self.version == "tissue_default":
             self.TISSUE_KEY = 'tissue_default'
             self.seg_default()
-        elif self.version == "grandqc":
+        elif self.version == "tissue_grandqc":
             self.TISSUE_KEY = 'tissue_grandqc'
             self.seg_grandqc()
-        elif self.version == "threshold":
+        elif self.version == "tissue_threshold":
             self.TISSUE_KEY = 'tissue_threshold'
             self.seg_threshold()
         
@@ -285,10 +285,10 @@ class SegmentMany:
         if segmentation_type not in ["tissue", "artifact"]:
             raise ValueError("segmentation_type must be one of ['tissue', 'artifact']")
         self.segmentation_type = segmentation_type
-        # MAKE VERSION OPTIONAL, ONLY IF segmentation_type IS TISSUE
-        if version not in ["default", "grandqc", "threshold"]:
-            raise ValueError("version must be one of ['default', 'grandqc', 'threshold']")
-        self.version = version
+        if segmentation_type == "tissue":
+            if version not in ["default", "grandqc", "threshold"]:
+                raise ValueError("version must be one of ['default', 'grandqc', 'threshold']")
+            self.version = version
         self.csv_path = os.path.join(self.output_dir, f"{self.segmentation_type}_summary.csv")
         self.run_segmentation()
 
@@ -311,13 +311,16 @@ class SegmentMany:
         for path in tqdm(remaining_paths, desc=f"{self.segmentation_type} segmentation progress"):
             slide_name = os.path.basename(path)
             print(f"\nProcessing {slide_name}...")
+            
             try:
                 if self.segmentation_type == "artifact":
                     wsiobj = SegmentArtifacts(path, self.local_zarr_dir)
+                    version = "artifact_grandqc"
                     artifact_percentage = wsiobj.get_artifact_percentage()
                     artifact_df = wsiobj.get_artifact_dataframe()
                 elif self.segmentation_type == "tissue":
                     wsiobj = SegmentTissue(path, self.local_zarr_dir, version=self.version)
+                    version = f"tissue_{self.version}"
                     artifact_percentage = None
                     artifact_df = None
                 tissue_size = wsiobj.get_full_tissue_area()
@@ -328,6 +331,7 @@ class SegmentMany:
                 print(f"Error processing {slide_name}: {e}")
                 tissue_size = None
                 elapsed_time = None
+                version = None
                 artifact_percentage = None
                 artifact_df = None
                 status = f"error: {str(e)}"
@@ -335,6 +339,7 @@ class SegmentMany:
             new_row = pd.DataFrame([{
                 "slide": slide_name,
                 "wsi_path": path,
+                "version": version,
                 "tissue_size": tissue_size,
                 "elapsed_time": elapsed_time,
                 "artifact_percentage": artifact_percentage,
