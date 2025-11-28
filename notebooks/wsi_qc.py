@@ -9,15 +9,21 @@ from datetime import datetime
 import json
 
 class SegmentTissue:
-    def __init__(self, wsi_path, local_zarr_dir, try_grandqc = False):
+    def __init__(self, wsi_path: str, local_zarr_dir:str, version = "default":str):
+        if not isinstance(wsi_path, str):
+            raise ValueError("wsi_path must be a string")
         self.wsi_path = wsi_path
+        if not isinstance(local_zarr_dir, str):
+            raise ValueError("local_zarr_dir must be a string")        
         self.zarr_path = os.path.join(local_zarr_dir, os.path.basename(wsi_path).replace(".mrxs", ".zarr"))
         if os.path.exists(self.zarr_path):
             self.wsi = open_wsi(wsi_path, self.zarr_path)
         else:
             self.wsi = open_wsi(wsi_path)
             os.makedirs(local_zarr_dir, exist_ok=True)
-        self.try_grandqc = try_grandqc
+        if version not in ["default", "grandqc", "threshold"]:
+            raise ValueError("version must be one of ['default', 'grandqc', 'threshold']")
+        self.version = version
         self.TILE_KEY = "tiles_px512_mpp1.5_overlap0.1"
         self.process_slide()
 
@@ -50,43 +56,77 @@ class SegmentTissue:
         except Exception as e:
             raise RuntimeError(str(e))
     
-    def seg_tissue(self):      
-        default_key = 'tissue_default'
-        grandqc_key = 'tissue_grandqc'
+    def seg_tissue(self):
+        if self.version == "default":
+            self.TISSUE_KEY = 'tissue_default'
+            self.seg_default()
+        elif self.version == "grandqc":
+            self.TISSUE_KEY = 'tissue_grandqc'
+            self.seg_grandqc()
+        elif self.version == "threshold":
+            self.TISSUE_KEY = 'tissue_threshold'
+            self.seg_threshold()
+        
+    def seg_default(self):
         self.elapsed_time = None
-
-        if default_key in self.wsi.shapes:
-            self.TISSUE_KEY = default_key
-        elif grandqc_key in self.wsi.shapes:
-            self.TISSUE_KEY = grandqc_key
+        if self.TISSUE_KEY in self.wsi.shapes:
+            print(f"Tissue already segmented using: {self.TISSUE_KEY}")
+            return self.wsi
         else:
             start_time = datetime.now()
-            zs.pp.find_tissues(self.wsi, key_added=default_key)
+            zs.pp.find_tissues(self.wsi, key_added=self.TISSUE_KEY)
             end_time = datetime.now()
             self.elapsed_time = end_time - start_time
-            self.TISSUE_KEY = default_key
-
-            tissue = self.wsi.get(default_key)
+            
+            tissue = self.wsi.get(self.TISSUE_KEY)
             if self.is_empty_array(tissue):
                 print("Default tissue detection produced empty tissue.")
-                if self.try_grandqc:
-                    print("Trying GrandQC...")
-            
-                    start_time = datetime.now()
-                    zs.seg._tissue.tissue(self.wsi, model='grandqc', key_added=grandqc_key, device="cpu") # TODO START GPU FALL BACK TO CPU (ISSUES RUNNING ON GPU)
-                    end_time = datetime.now()
-                    self.elapsed_time = end_time - start_time
-                    self.TISSUE_KEY = grandqc_key
-
-                    tissue = self.wsi.get(grandqc_key)
-                    if self.is_empty_array(tissue):
-                        print("GrandQC tissue detection also produced empty tissue")
-                        raise RuntimeError("No tissue detected")
-
+                raise RuntimeError("No tissue detected using default method.")
+        
         print(f"Tissue detection successful using: {self.TISSUE_KEY}")
         self.wsi.write(self.zarr_path)
         return self.wsi
-   
+    
+    def seg_grandqc(self):
+        if self.TISSUE_KEY in self.wsi.shapes:
+            print(f"Tissue already segmented using: {self.TISSUE_KEY}")
+            return self.wsi
+        else:
+            start_time = datetime.now()
+            zs.seg._tissue.tissue(self.wsi, model='grandqc', key_added=self.TISSUE_KEY, device="cpu") # TODO START GPU FALL BACK TO CPU (ISSUES RUNNING ON GPU)
+            end_time = datetime.now()
+            self.elapsed_time = end_time - start_time
+            
+            tissue = self.wsi.get(self.TISSUE_KEY)
+            if self.is_empty_array(tissue):
+                print("GrandQC tissue detection produced empty tissue.")
+                raise RuntimeError("No tissue detected using GrandQC.")
+        
+        print(f"Tissue detection successful using: {self.TISSUE_KEY}")
+        self.wsi.write(self.zarr_path)
+        return self.wsi
+    
+    def seg_threshold(self, threshold:float=75):
+        self.elapsed_time = None
+        if self.TISSUE_KEY in self.wsi.shapes:
+            print(f"Tissue already segmented using: {self.TISSUE_KEY}")
+            return self.wsi
+        else:
+            start_time = datetime.now()
+            zs.pp.find_tissues(self.wsi, threshold=threshold, to_hsv=True, filter_artifacts=False, key_added=self.TISSUE_KEY)
+            end_time = datetime.now()
+            self.elapsed_time = end_time - start_time
+            
+            tissue = self.wsi.get(self.TISSUE_KEY)
+            if self.is_empty_array(tissue):
+                print(f"Tissue detection with threshold {threshold} produced empty tissue.")
+                raise RuntimeError(f"No tissue detected using threshold ({threshold}).")
+        
+        print(f"Tissue detection successful using: {self.TISSUE_KEY}")
+        self.wsi.write(self.zarr_path)
+        return self.wsi
+    
+ 
     def tile_tissue(self, tile_px=512, mpp=1.5, overlap=0.1):
         """ GrandQC trained on px=512, and mpp = 1 / 1.5 / 2 """
         try:
@@ -126,37 +166,60 @@ class SegmentArtifacts:
         except Exception:
             return len(arr) == 0
     
+    def find_tissue_key(self) -> list[str]:
+        default_key = 'tissue_default'
+        grandqc_key = 'tissue_grandqc'
+        threshold_key = 'tissue_threshold'
+        
+        tissue_keys = []
+
+        if default_key in self.wsi.shapes:
+            tissue_keys.append(default_key)
+        if grandqc_key in self.wsi.shapes:
+            tissue_keys.append(grandqc_key)
+        if threshold_key in self.wsi.shapes:
+            tissue_keys.append(threshold_key)
+        
+        if not tissue_keys:
+            raise KeyError(f"No tissue key found")
+
+        return tissue_keys
+
     def process_slide(self):
         try:
             slide_name = os.path.basename(self.wsi_path)
+            tissue_keys = self.find_tissue_key()
 
-            default_key = 'tissue_default'
-            grandqc_key = 'tissue_grandqc'
-            
-            if default_key in self.wsi.shapes:
-                self.TISSUE_KEY = default_key
-            elif grandqc_key in self.wsi.shapes:
-                self.TISSUE_KEY = grandqc_key
-            else:
-                raise RuntimeError(f"No tissue key found")
-            
-            tissue = self.wsi.get(self.TISSUE_KEY)
-            if self.is_empty_array(tissue):
-                tissue = self.wsi.get(grandqc_key)
-                if self.is_empty_array(tissue):
-                    raise RuntimeError(f"No tissue detected")
+            success = False
+            for key in tissue_keys:
+                try: 
+                    tissue = self.wsi.get(key)
+                    if self.is_empty_array(tissue):
+                        print(f"Tissue key {key} is empty.")
+                        continue
+                
+                    self.TISSUE_KEY = key
+                    success = True
+                    break
 
+                except Exception as e:
+                    print(f"Error with key {key}: {e}")
+                    continue
+
+            if not success:
+                raise KeyError("No valid tissue keys found.")
+    
             if self.TILE_KEY not in self.wsi.shapes:
-                raise RuntimeError(f"No tile key found")
+                raise KeyError(f"No tile key found")
             
             tiles = self.wsi.get(self.TILE_KEY)
             if self.is_empty_array(tiles):
-                raise RuntimeError(f"No tiles generated")
+                raise KeyError(f"No tiles generated")
 
             self.seg_artifacts()
             artifacts = self.wsi.get(self.ARTIFACT_KEY)
             if self.is_empty_array(artifacts):
-                raise RuntimeError(f"No artifacts detected")
+                raise KeyError(f"No artifacts detected")
 
             print(f"Processing complete for {self.wsi.path}")
             return True
@@ -208,13 +271,24 @@ class SegmentArtifacts:
         viewer.show()
 
 class SegmentMany:
-    def __init__(self, wsi_paths, output_dir, local_zarr_dir, segmentation_type, try_grandqc=False):
+    def __init__(self, wsi_paths:list[str], output_dir:str, local_zarr_dir:str, segmentation_type:str, version:str="default"):
+        if wsi_paths not isinstance(wsi_paths, list) or not all(isinstance(p, str) for p in wsi_paths):
+            raise ValueError("wsi_paths must be a list of strings")
         self.wsi_paths = wsi_paths
+        if not isinstance(output_dir, str):
+            raise ValueError("output_dir must be a string")
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
+        if not isinstance(local_zarr_dir, str):
+            raise ValueError("local_zarr_dir must be a string")
         self.local_zarr_dir = local_zarr_dir
-        self.segmentation_type = segmentation_type # TODO MUST BE EITHER TISSUE OR ARTIFACT
-        self.try_grandqc = try_grandqc
+        if segmentation_type not in ["tissue", "artifact"]:
+            raise ValueError("segmentation_type must be one of ['tissue', 'artifact']")
+        self.segmentation_type = segmentation_type
+        # MAKE VERSION OPTIONAL, ONLY IF segmentation_type IS TISSUE
+        if version not in ["default", "grandqc", "threshold"]:
+            raise ValueError("version must be one of ['default', 'grandqc', 'threshold']")
+        self.version = version
         self.csv_path = os.path.join(self.output_dir, f"{self.segmentation_type}_summary.csv")
         self.run_segmentation()
 
@@ -275,22 +349,12 @@ class SegmentMany:
             gc.collect()
 
 
-# TODO Implement
-# SEGMENT_CLASSES = {
-#    "tissue": SegmentTissue,
-#    "artifact": SegmentArtifacts
-# }
-# segmenter_class = SEGMENT_CLASSES[self.segmentation_type]
-# wsiobj = segmenter_class(path, self.local_zarr_dir, try_grandqc=self.try_grandqc)
-
 # Example usage
 if __name__ == "__main__":
-    # Single slide QC
     slide_paths = [
         "path/to/wsi",
         "path/to/another/wsi"
     ]
     output_dir = "path/to/output"
     local_dir = "path/to/local_zarr_storage"
-    wsi_tissue = SegmentMany(slide_paths, output_dir, local_dir, "tissue", try_grandqc=False)
-    
+    wsi_tissue = SegmentMany(slide_paths, output_dir, local_dir, "tissue", version="threshold")
