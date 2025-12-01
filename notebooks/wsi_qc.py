@@ -289,6 +289,9 @@ class SegmentMany:
             if version not in ["default", "grandqc", "threshold"]:
                 raise ValueError("version must be one of ['default', 'grandqc', 'threshold']")
             self.version = version
+            self.full_version = f"tissue_{version}"
+        elif self.segmentation_type == "artifact":
+            self.full_version = "artifact_grandqc"
         self.csv_path = os.path.join(self.output_dir, f"{self.segmentation_type}_summary.csv")
         self.run_segmentation()
 
@@ -296,7 +299,8 @@ class SegmentMany:
         if not os.path.exists(self.csv_path):
             return set()
         try:
-            df_existing = pd.read_csv(self.csv_path, usecols=["wsi_path"])
+            df_existing = pd.read_csv(self.csv_path, usecols=["wsi_path", "version"])
+            df_existing = df_existing[df_existing["version"] == self.full_version]
             return set(os.path.abspath(p) for p in df_existing["wsi_path"].astype(str))
         except Exception:
             return set()
@@ -315,16 +319,15 @@ class SegmentMany:
             try:
                 if self.segmentation_type == "artifact":
                     wsiobj = SegmentArtifacts(path, self.local_zarr_dir)
-                    version = "artifact_grandqc"
                     artifact_percentage = wsiobj.get_artifact_percentage()
                     artifact_df = wsiobj.get_artifact_dataframe()
                 elif self.segmentation_type == "tissue":
                     wsiobj = SegmentTissue(path, self.local_zarr_dir, version=self.version)
-                    version = f"tissue_{self.version}"
                     artifact_percentage = None
                     artifact_df = None
                 tissue_size = wsiobj.get_full_tissue_area()
                 elapsed_time = wsiobj.elapsed_time
+                version = self.full_version
                 status = f"{self.segmentation_type} segmentation complete"
                 del wsiobj
             except Exception as e:
