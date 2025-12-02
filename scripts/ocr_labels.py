@@ -49,7 +49,17 @@ class SlideLabelOCR:
         else:
             print("Rekvnr pattern not found.")
             return None
-     
+        
+    def get_stain(self):
+        all_text = " ".join([text for (_, text, _) in self.results])
+        match = re.search(r'he', all_text) #    WHERE IS STAIN WRITTEN ON THE LABEL
+        if match:
+            return match
+        else:
+            print("Stain not found.")
+            return None
+
+
 # Example usage:
 if __name__ == "__main__":
     slide_dir = r"\\regsj.intern\appl\Deep_Visual_Proteomics\Slides 15.01.2024"
