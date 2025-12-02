@@ -153,6 +153,8 @@ class SegmentArtifacts:
             self.wsi = open_wsi(wsi_path)
             os.makedirs(local_zarr_dir, exist_ok=True)
         self.version = version
+        if version not in ["default", "10x"]:
+            raise ValueError("version must be one of ['default', '10x']")                
         if version == "default":
             self.TILE_KEY = "tiles_px512_mpp1.5_overlap0.1"
             self.ARTIFACT_KEY = 'artifacts_grandqc'
