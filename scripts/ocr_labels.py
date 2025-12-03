@@ -12,6 +12,7 @@ from PIL import Image
 import re
 from tqdm import tqdm
 import pickle
+import pandas as pd
 
 reader = easyocr.Reader(['en']) # load the model into memory (english ('en') and danish ('da'))
 
@@ -146,7 +147,7 @@ if __name__ == "__main__":
     print(f"Trying to open slide: {slide_path}")
     
     ocr = SlideLabelOCR(slide_path)
-    ocr.show_label_image('label')
+    ocr.show_label_image()
     ocr.print_results()
     print(f"Extracted rekvnr: {ocr.get_rekvnr()}")   
 
