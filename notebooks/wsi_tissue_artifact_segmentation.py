@@ -239,11 +239,18 @@ class SegmentMany:
             slide_name = os.path.basename(path)
             category = self.segmentation_type
             version = self.version
+            key = (slide_name, category, version)
 
-            if (slide_name, category, version) in self.processed:
-                print(f"Skipping {slide_name} ({category} {version}) — already processed")
-                continue
+            if key in self.processed:
+                status = self.processed[key]
+                if status == "complete":
+                    print(f"Skipping {slide_name} ({category} {version}) — already successfully processed")
+                    continue
+                elif status.startswith("error:"):
+                    print(f"Skipping {slide_name} ({category} {version}) — previously failed: {status}")
+                    continue
 
+            # If not processed at all, attempt processing
             try:
                 if category == "tissue":
                     wsiobj = SegmentTissue(path, self.local_zarr_dir, version=self.version)
@@ -271,8 +278,6 @@ class SegmentMany:
                 slide_data = {"status": f"error: {str(e)}"}
                 self.big_cache.setdefault(slide_name, {}).setdefault(category, {})[version] = slide_data
                 save_big_cache(self.big_cache, self.cache_file)
-                del wsiobj
-
 
 
 
