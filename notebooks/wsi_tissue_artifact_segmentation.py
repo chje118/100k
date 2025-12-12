@@ -21,12 +21,13 @@ def save_big_cache(big_cache, cache_file):
     os.replace(tmp_file, cache_file)
 
 def already_processed(big_cache):
-    """Return a set of tuples (slide_name, category, version)"""
-    processed = set()
+    """Return a dict of {(slide_name, category, version): status} for all processed entries."""
+    processed = {}
     for slide, categories in big_cache.items():
         for category, versions in categories.items():
-            for version in versions.keys():
-                processed.add((slide, category, version))
+            for version, data in versions.items():
+                status = data.get("status", "unknown")
+                processed[(slide, category, version)] = status
     return processed
 
 
