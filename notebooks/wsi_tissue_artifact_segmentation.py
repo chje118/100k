@@ -7,7 +7,6 @@ import gc
 from datetime import datetime
 import pickle
 
-
 def load_big_cache(cache_file):
     if os.path.exists(cache_file):
         with open(cache_file, "rb") as f:
@@ -30,6 +29,15 @@ def already_processed(big_cache):
                 processed[(slide, category, version)] = status
     return processed
 
+def is_empty_array(arr):
+        if arr is None:
+            return True
+        if hasattr(arr, "is_empty"):
+            return arr.is_empty.all()
+        try:
+            return arr.sum() == 0
+        except Exception:
+            return len(arr) == 0
 
 class SegmentTissue:
     def __init__(self, wsi_path, local_zarr_dir, version="default"):
@@ -44,24 +52,14 @@ class SegmentTissue:
         self.elapsed_time = None
         self.process_slide()
 
-    def is_empty_array(self, arr):
-        if arr is None:
-            return True
-        if hasattr(arr, "is_empty"):
-            return arr.is_empty.all()
-        try:
-            return arr.sum() == 0
-        except Exception:
-            return len(arr) == 0
-
     def process_slide(self):
         self.seg_tissue()
         tissue = self.wsi.get(self.TISSUE_KEY)
-        if self.is_empty_array(tissue):
+        if is_empty_array(tissue):
             raise RuntimeError("No tissue detected")
         self.tile_tissue()
         tiles = self.wsi.get(self.TILE_KEY)
-        if self.is_empty_array(tiles):
+        if is_empty_array(tiles):
             raise RuntimeError("No tiles generated")
         print(f"Tissue processing complete for {self.wsi.path}")
 
@@ -90,25 +88,25 @@ class SegmentTissue:
 
     def _seg_grandqc(self):
         try: 
-             if self.TISSUE_KEY in self.wsi.shapes:
+            if self.TISSUE_KEY in self.wsi.shapes:
                 print(f"Tissue already segmented: {self.TISSUE_KEY}")
                 return
-             start = datetime.now()
-             zs.seg._tissue.tissue(self.wsi, model='grandqc', key_added=self.TISSUE_KEY, device="cpu")
-             self.elapsed_time = datetime.now() - start
-             self.wsi.write(self.zarr_path)
+            start = datetime.now()
+            zs.seg._tissue.tissue(self.wsi, model='grandqc', key_added=self.TISSUE_KEY, device="cpu")
+            self.elapsed_time = datetime.now() - start
+            self.wsi.write(self.zarr_path)
         except Exception as e:
             raise RuntimeError(f"Error during grandqc tissue segmentation: {e}")
 
     def _seg_threshold(self):
         try: 
-             if self.TISSUE_KEY in self.wsi.shapes:
+            if self.TISSUE_KEY in self.wsi.shapes:
                 print(f"Tissue already segmented: {self.TISSUE_KEY}")
                 return
-             start = datetime.now()
-             zs.pp.find_tissues(self.wsi, threshold=5, to_hsv=True, filter_artifacts=False, key_added=self.TISSUE_KEY)
-             self.elapsed_time = datetime.now() - start
-             self.wsi.write(self.zarr_path)
+            start = datetime.now()
+            zs.pp.find_tissues(self.wsi, threshold=5, to_hsv=True, filter_artifacts=False, key_added=self.TISSUE_KEY)
+            self.elapsed_time = datetime.now() - start
+            self.wsi.write(self.zarr_path)
         except Exception as e:
             raise RuntimeError(f"Error during threshold tissue segmentation: {e}")
 
@@ -138,16 +136,6 @@ class SegmentArtifacts:
         self.elapsed_time = None
         self.process_slide()
 
-    def is_empty_array(self, arr):
-        if arr is None:
-            return True
-        if hasattr(arr, "is_empty"):
-            return arr.is_empty.all()
-        try:
-            return arr.sum() == 0
-        except Exception:
-            return len(arr) == 0
-
     def find_tissue_key(self):
         keys = [k for k in ['tissue_default','tissue_grandqc','tissue_threshold'] if k in self.wsi.shapes]
         if not keys:
@@ -162,16 +150,16 @@ class SegmentArtifacts:
             tissue_keys = self.find_tissue_key()
             for key in tissue_keys:
                 tissue = self.wsi.get(key)
-                if not self.is_empty_array(tissue):
+                if not is_empty_array(tissue):
                     self.TISSUE_KEY = key
                     break
             
-            if self.TILE_KEY not in self.wsi.shapes:
+            if self.TILE_KEY not in self.wsi.shapes and self.version == "artifact_10x":
                 self.tile_tissue_10x()
             
             self._seg_artifacts()
             artifacts = self.wsi.get(self.ARTIFACT_KEY)
-            if self.is_empty_array(artifacts):
+            if is_empty_array(artifacts):
                 raise RuntimeError("No artifacts detected")
             print(f"Artifact processing complete for {self.wsi.path}")
         except Exception as e:
@@ -181,10 +169,10 @@ class SegmentArtifacts:
         try:
             if self.ARTIFACT_KEY not in self.wsi.shapes:
                 start = datetime.now()
-                if self.version == "default":
-                    zs.seg._artifact.artifact(self.wsi, tile_key=self.TILE_KEY, key_added=self.ARTIFACT_KEY)
+                if self.version == "artifact_default":
+                    zs.seg._artifact.artifact(self.wsi, tissue_key=self.TISSUE_KEY, tile_key=self.TILE_KEY, key_added=self.ARTIFACT_KEY)
                 else:
-                    zs.seg._artifact.artifact(self.wsi, tile_key=self.TILE_KEY, variant="10x", key_added=self.ARTIFACT_KEY)
+                    zs.seg._artifact.artifact(self.wsi, tissue_key=self.TISSUE_KEY, tile_key=self.TILE_KEY, variant="10x", key_added=self.ARTIFACT_KEY)
                 self.elapsed_time = datetime.now() - start
                 self.wsi.write(self.zarr_path)
         except Exception as e:
@@ -221,16 +209,92 @@ class SegmentArtifacts:
         viewer.show()
 
 
+class ExtractFeatures:
+    def __init__(self, wsi_path, local_zarr_dir, model):
+        self.wsi_path = wsi_path
+        self.zarr_path = os.path.join(local_zarr_dir, os.path.basename(wsi_path).replace(".mrxs", ".zarr"))
+        if os.path.exists(self.zarr_path):
+            self.wsi = open_wsi(self.wsi_path, self.zarr_path)
+        else:
+            self.wsi = open_wsi(self.wsi_path)
+            os.makedirs(local_zarr_dir, exist_ok=True)
+        self.model_name = model
+        self.TILE_KEY = "tiles_224"
+        self.FEATURE_KEY = f'features_{self.model_name}'
+        self.elapsed_time = None
+        self.process_slide()
+    
+    def process_slide(self):
+        try:
+            default_key = 'tissue_default'
+            if default_key in self.wsi.shapes:
+                self.TISSUE_KEY = default_key
+            else:
+                raise RuntimeError(f"No tissue key found")
+
+            tissue = self.wsi.get(self.TISSUE_KEY)
+            if is_empty_array(tissue):
+                raise RuntimeError(f"No tissue detected")
+
+            if self.TILE_KEY not in self.wsi.shapes:
+                self.tile_tissue()
+                tiles = self.wsi.get(self.TILE_KEY)
+                if is_empty_array(tiles):
+                    raise RuntimeError(f"No tiles generated")
+                
+            self.extract_features()
+            self.aggregate_features()
+            
+            print(f"Processing complete for {self.wsi.path}")
+            return True
+        
+        except Exception as e:
+            raise RuntimeError(str(e))
+    
+    def tile_tissue(self, tile_px=224):
+        """ TODO: look up px, mpp and overlap for models. """
+        try:
+            if self.TILE_KEY not in self.wsi.shapes:
+                zs.pp.tile_tissues(self.wsi, tile_px=tile_px, key_added=self.TILE_KEY, tissue_key=self.TISSUE_KEY)            
+            self.wsi.write(self.zarr_path)
+            return self.wsi
+        except Exception as e:
+            print(f"Error while extracting tiles: {e}")
+            raise            
+
+    def extract_features(self):
+        try:
+            if self.FEATURE_KEY not in self.wsi.tables:
+                start_time = datetime.now()
+                zs.tl.feature_extraction(self.wsi, model=self.model_name, tile_key=self.TILE_KEY, key_added=self.FEATURE_KEY)
+                self.elapsed_time = datetime.now() - start_time
+                self.wsi.write(self.zarr_path)
+            return self.wsi
+        except Exception as e:
+            raise RuntimeError(f"Error during feature extraction: {e}")
+
+    def aggregate_features(self):
+        try:
+            zs.tl.feature_aggregation(self.wsi, feature_key=self.FEATURE_KEY, tile_key=self.TILE_KEY)
+            self.wsi.write(self.zarr_path)
+            return self.wsi
+        except Exception as e:
+            raise RuntimeError(f"Error during feature aggregation: {e}")
+
+    def get_features(self):
+        return self.wsi.fetch.features_anndata(feature_key=self.FEATURE_KEY, tile_key=self.TILE_KEY)
+
+
 class SegmentMany:
-    def __init__(self, wsi_paths, cache_file, local_zarr_dir, segmentation_type, version="default"):
+    def __init__(self, wsi_paths, cache_file, local_zarr_dir, segmentation_type, version):
         self.wsi_paths = wsi_paths
         self.cache_file = cache_file
         self.local_zarr_dir = local_zarr_dir
-        if segmentation_type not in ["tissue", "artifact"]:
-            raise ValueError("segmentation_type must be one of ['tissue', 'artifact']")
+        if segmentation_type not in ["tissue", "artifact", "feature"]:
+            raise ValueError("segmentation_type must be one of ['tissue', 'artifact', 'feature']")
         self.segmentation_type = segmentation_type
         self.version = version
-        self.full_version = f"tissue_{version}" if segmentation_type=="tissue" else f"artifact_{version}"
+        self.full_version = f"{segmentation_type}_{version}"
         self.big_cache = load_big_cache(cache_file)
         self.processed = already_processed(self.big_cache)
         self.run_segmentation()
@@ -255,7 +319,6 @@ class SegmentMany:
                     print(f"Skipping {slide_name} ({category} {version}) — previously failed: {status}")
                     continue
 
-            # If not processed at all, attempt processing
             try:
                 if category == "tissue":
                     wsiobj = SegmentTissue(path, self.local_zarr_dir, version=self.version)
@@ -272,8 +335,14 @@ class SegmentMany:
                         "elapsed_time": wsiobj.elapsed_time,
                         "status": "complete"
                     }
+                elif category == "feature":
+                    wsiobj = ExtractFeatures(path, self.local_zarr_dir, model=self.version)
+                    slide_data = {
+                        "features": wsiobj.get_features(),
+                        "elapsed_time": wsiobj.elapsed_time,
+                        "status": "complete"
+                    }
 
-                # Update big cache
                 self.big_cache.setdefault(slide_name, {}).setdefault(category, {})[version] = slide_data
                 save_big_cache(self.big_cache, self.cache_file)
                 del wsiobj
@@ -283,7 +352,6 @@ class SegmentMany:
                 slide_data = {"status": f"error: {str(e)}"}
                 self.big_cache.setdefault(slide_name, {}).setdefault(category, {})[version] = slide_data
                 save_big_cache(self.big_cache, self.cache_file)
-
 
 
 if __name__ == "__main__":
