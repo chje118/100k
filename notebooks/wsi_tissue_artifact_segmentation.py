@@ -242,6 +242,10 @@ class SegmentMany:
             version = self.version
             key = (slide_name, category, version)
 
+            if key not in self.processed:
+                print("MISS:", key)
+                print("Closest processed keys:", list(self.processed.keys())[:5])
+            
             if key in self.processed:
                 status = self.processed[key]
                 if status == "complete":
