@@ -147,7 +147,7 @@ if __name__ == "__main__":
     print(f"Trying to open slide: {slide_path}")
     
     ocr = SlideLabelOCR(slide_path)
-    ocr.show_label_image()
+    ocr.show_label_image('label')
     ocr.print_results()
     print(f"Extracted rekvnr: {ocr.get_rekvnr()}")   
 
