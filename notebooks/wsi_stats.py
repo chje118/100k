@@ -2,8 +2,6 @@ import pandas as pd
 import os
 import pickle
 
-
-
 class WSIStats:
     def __init__(self, filename):
         self.filename = filename
@@ -57,6 +55,7 @@ class WSIStatsCache:
         if os.path.exists(self.cache_file):
             with open(self.cache_file, "rb") as f:
                 self.stats = pickle.load(f)
+                print(f"Loaded {len(self.stats)} previously processed entries.")
             return True
         return False
 
@@ -80,7 +79,7 @@ if __name__ == "__main__":
     ROOT_DIR = "//regsj.intern/appl/Deep_Visual_Proteomics"
 
     # Path to cache file
-    CACHE_FILE = "wsi_cache_christine.pkl"
+    CACHE_FILE = "wsi_cache.pkl"
 
     wsi_cache = WSIStatsCache(ROOT_DIR, CACHE_FILE)
     wsi_df = wsi_cache.main(reload=True)

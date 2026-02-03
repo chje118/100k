@@ -3,7 +3,6 @@ import copy
 
 class SNOMEDCodes: 
     """ Class to handle SNOMED codes. """
-    # TODO: Add validation checks, e.g. if df has required columns etc.
     def __init__(self, dataframe: pd.DataFrame):
         self.dataframe = dataframe
         self.first_letters = self._first_letters()
@@ -22,7 +21,7 @@ class SNOMEDCodes:
     def get_codes_by_letter(self, letter: str) -> pd.DataFrame:
         """ Get SNOMED codes starting with a specific letter. """
         return self.dataframe[self.dataframe['SKSkode'].str.startswith(letter)].copy()
-    
+
     def code_to_text(self) -> dict: 
         return dict(zip(self.dataframe['SKSkode'], self.dataframe['Kodetekst']))
 
@@ -96,18 +95,6 @@ class SNOMEDHierarchy:
         self.edited_hierarchy = copy.deepcopy(self.hierarchy)
         self._rebuild_code_to_region()
 
-    def _check_codes_preserved(self, codes_to_check):
-        """Check if all codes in codes_to_check are still present in the edited hierarchy."""
-        edited_codes = set()
-        for region in self.edited_hierarchy:
-            for sub in self.edited_hierarchy[region]["subregions"].values():
-                for code_info in sub["codes"]:
-                    edited_codes.add(code_info["code"])
-        missing = set(codes_to_check) - edited_codes
-        if missing:
-            print(f"Missing codes in edited hierarchy: {missing}")
-        return missing    
-
     def merge_main_regions(self, new_region, regions_to_merge, new_name=None):
         merged_subregions = {}
         affected_codes = []
@@ -133,6 +120,7 @@ class SNOMEDHierarchy:
             if region in self.edited_hierarchy:
                 del self.edited_hierarchy[region]
         self._rebuild_code_to_region()
+        # Automatic check after update
         self._check_codes_preserved(affected_codes)
 
     def update_region(self, region, new_name):
@@ -144,7 +132,20 @@ class SNOMEDHierarchy:
         else:
             print(f"Region {region} not found.")
         self._rebuild_code_to_region()
+        # Automatic check after update
         self._check_codes_preserved(affected_codes)
+
+    def _check_codes_preserved(self, codes_to_check):
+        """Check if all codes in codes_to_check are still present in the edited hierarchy."""
+        edited_codes = set()
+        for region in self.edited_hierarchy:
+            for sub in self.edited_hierarchy[region]["subregions"].values():
+                for code_info in sub["codes"]:
+                    edited_codes.add(code_info["code"])
+        missing = set(codes_to_check) - edited_codes
+        if missing:
+            print(f"Missing codes in edited hierarchy: {missing}")
+        return missing
 
     def split_main_region(self, original_region, subregion_map):
         if original_region not in self.edited_hierarchy:
@@ -177,6 +178,7 @@ class SNOMEDHierarchy:
         if not original_subregions:
             del self.edited_hierarchy[original_region]
         self._rebuild_code_to_region()
+        # Automatic check after update
         self._check_codes_preserved(affected_codes)
 
     def list_main_regions(self, edited=False):
