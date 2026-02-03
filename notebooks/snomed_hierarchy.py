@@ -5,14 +5,16 @@ class SNOMEDCodes:
     """ Class to handle SNOMED codes. """
     def __init__(self, dataframe: pd.DataFrame):
         self.dataframe = dataframe
-        self.first_letters = self._first_letters()
-
-    def _first_letters(self) -> set:
+        
+    def first_letters(self) -> set:
         """ Get unique first letters of SNOMED codes. """
         return {code[0] for code in self.dataframe['SKSkode'].dropna().unique() if code}
+
+    def snomed_set(self) -> set:
+        return set(self.dataframe['SKSkode'].dropna().astype(str))
     
     def get_first_letters(self) -> None:
-        print('SNOMED letters:', self.first_letters)
+        print('SNOMED letters:', self.first_letters())
 
     def get_letter_counts(self) -> None:
         prefixes = self.dataframe['SKSkode'].str[0].value_counts()
@@ -181,6 +183,64 @@ class SNOMEDHierarchy:
         # Automatic check after update
         self._check_codes_preserved(affected_codes)
 
+    def split_main_region_by_suffix(self, original_region, suffix_region_map):
+        if original_region not in self.edited_hierarchy:
+            print(f"Region {original_region} not found.")
+            return
+
+        original_subregions = self.edited_hierarchy[original_region]["subregions"]
+        affected_codes = []
+
+        all_codes = []
+        for sub in original_subregions.values():
+            all_codes.extend(sub["codes"])
+
+        for new_region, new_name in suffix_region_map.items():
+            if "_" not in new_region:
+                print(f"Invalid region key '{new_region}' (expected suffix '_<digit>').")
+                continue
+
+            suffix = new_region.split("_")[-1]
+
+            new_subregions = {}
+
+            for sub_key, sub in original_subregions.items():
+                matching_codes = [
+                    c for c in sub["codes"]
+                    if isinstance(c["code"], str) and c["code"].endswith(suffix)
+                ]
+
+                if matching_codes:
+                    new_subregions[sub_key] = {
+                        "name": sub["name"],
+                        "codes": matching_codes
+                    }
+                    affected_codes.extend([c["code"] for c in matching_codes])
+
+            if new_subregions:
+                self.edited_hierarchy[new_region] = {
+                    "name": new_name,
+                    "subregions": new_subregions
+                }
+
+        # Remove extracted codes from original region
+        for sub_key in list(original_subregions.keys()):
+            remaining_codes = [
+                c for c in original_subregions[sub_key]["codes"]
+                if c["code"] not in affected_codes
+            ]
+
+            if remaining_codes:
+                original_subregions[sub_key]["codes"] = remaining_codes
+            else:
+                del original_subregions[sub_key]
+
+        if not original_subregions:
+            del self.edited_hierarchy[original_region]
+
+        self._rebuild_code_to_region()
+        self._check_codes_preserved(affected_codes)
+    
     def list_main_regions(self, edited=False):
         """List only main regions with total number of codes in parentheses."""
         hierarchy = self.edited_hierarchy if edited else self.hierarchy
