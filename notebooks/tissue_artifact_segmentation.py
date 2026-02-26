@@ -170,9 +170,9 @@ class SegmentArtifacts:
             if self.ARTIFACT_KEY not in self.wsi.shapes:
                 start = datetime.now()
                 if self.version == "artifact_default":
-                    zs.seg._artifact.artifact(self.wsi, tissue_key=self.TISSUE_KEY, tile_key=self.TILE_KEY, key_added=self.ARTIFACT_KEY)
+                    zs.seg._artifact.artifact(self.wsi, tile_key=self.TILE_KEY, key_added=self.ARTIFACT_KEY)
                 else:
-                    zs.seg._artifact.artifact(self.wsi, tissue_key=self.TISSUE_KEY, tile_key=self.TILE_KEY, variant="10x", key_added=self.ARTIFACT_KEY)
+                    zs.seg._artifact.artifact(self.wsi, tile_key=self.TILE_KEY, variant="10x", key_added=self.ARTIFACT_KEY)
                 self.elapsed_time = datetime.now() - start
                 self.wsi.write(self.zarr_path)
         except Exception as e:
@@ -230,10 +230,6 @@ class SegmentMany:
             version = self.version
             key = (slide_name, category, version)
 
-            if key not in self.processed:
-                print("MISS:", key)
-                print("Closest processed keys:", list(self.processed.keys())[:5])
-            
             if key in self.processed:
                 status = self.processed[key]
                 if status == "complete":
