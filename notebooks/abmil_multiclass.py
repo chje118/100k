@@ -85,14 +85,14 @@ class ABMIL(nn.Module):
 
         return logits, A
     
-def train_ABMIL(train_df, train_dataset, n_epochs=10):
+def train_ABMIL(train_df, train_dataset, label_col,n_epochs=10):
     # DataLoader: decides when items are loaded, handles shuffling and batching
     train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
 
     # Extract Feature Dimension and Number of Classes
     sample_feats, _, _ = train_dataset[0]
     feat_dim = sample_feats.shape[1]
-    n_classes = train_df["label"].nunique()
+    n_classes = train_df[label_col].nunique()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -186,9 +186,27 @@ def validate_ABMIL(model, val_dataset):
 
     return all_labels, all_preds
 
+def confusion_matrix_report(all_labels, all_preds):
+    """
+    all_labels: list of true labels
+    all_preds: list of predicted labels
 
-def plot_slide_attention_wsiviewer(model, dataset, slide_idx, feature_key):
-    model.eval()
+    Interpretation:
+    If accuracy is low → model may overfit or you may have too few slides
+    If accuracy is high → attention can now be visualized (next step)
+    """
+    cm = confusion_matrix(all_labels, all_preds)
+    print(classification_report(all_labels, all_preds))
+
+    plt.figure(figsize=(6,5))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.show()
+
+
+def view_slide_attention(abmil_model, dataset, slide_idx, feature_key, filename_col, zarr_dir):
+    abmil_model.eval()
     device = next(model.parameters()).device
 
     # Load slide features and tile IDs
@@ -209,8 +227,8 @@ def plot_slide_attention_wsiviewer(model, dataset, slide_idx, feature_key):
     A = (A - A.min()) / (A.max() - A.min() + 1e-8)  # normalize to [0,1]
 
     # Open the WSI
-    slide_path = dataset.df.iloc[slide_idx]['filepath']
-    zarr_path = os.path.splitext(slide_path)[0] + ".zarr"
+    slide_path = dataset.df.iloc[slide_idx][filename_col]
+    zarr_path = os.path.join(zarr_dir, os.path.basename(slide_path).replace(".mrxs", ".zarr"))
     wsi = open_wsi(slide_path, zarr_path)
 
     # Add attention to feature table (no subsampling!)
@@ -230,58 +248,44 @@ def plot_slide_attention_wsiviewer(model, dataset, slide_idx, feature_key):
     viewer.show()
 
 
-def confusion_matrix_report(all_labels, all_preds):
-    """
-    all_labels: list of true labels
-    all_preds: list of predicted labels
-
-    Interpretation:
-    If accuracy is low → model may overfit or you may have too few slides
-    If accuracy is high → attention can now be visualized (next step)
-    """
-    cm = confusion_matrix(all_labels, all_preds)
-    print(classification_report(all_labels, all_preds))
-
-    plt.figure(figsize=(6,5))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-    plt.xlabel("Predicted")
-    plt.ylabel("True")
-    plt.show()
-
-
 # Example Usage
 if __name__ == "__main__":
+    # update to fit changes made to the code
     from sklearn.model_selection import train_test_split
 
     df = pd.DataFrame()
+    label_col = "label"
+    filename_col = "filename"
+    feature_key = "features"
+    zarr_dir = "zarr_dir"
 
     # Splitting Data into Training and Validation Sets
     train_df, val_df = train_test_split(
         df,
         test_size=0.2,      # 20% of slides for validation
-        stratify=df['label'],  # preserve class distribution
+        stratify=df[label_col],  # preserve class distribution
         random_state=42
     )
 
     train_dataset = ZarrSlideDataset(
         df=train_df, 
-        filename_col="filename", 
-        label_col="label", 
-        feature_key="features"
+        filename_col=filename_col, 
+        label_col=label_col, 
+        feature_key=feature_key
     )
 
     val_dataset = ZarrSlideDataset(
         df=val_df,
-        filename_col='filename',
-        label_col='label',
-        feature_key='features'
+        filename_col=filename_col,
+        label_col=label_col,
+        feature_key=feature_key
     )
 
     train_df = train_df.reset_index(drop=True)
     val_df = val_df.reset_index(drop=True)
     
-    model = train_ABMIL(train_dataset, train_df, n_epochs=10)
+    model = train_ABMIL(train_df, train_dataset, label_col, n_epochs=10)
     all_labels, all_preds = validate_ABMIL(model, val_dataset)
     confusion_matrix_report(all_labels, all_preds)
 
-    plot_slide_attention_wsiviewer(model, val_dataset, slide_idx=0, feature_key='features')
+    view_slide_attention(model, val_dataset, slide_idx=0, feature_key=feature_key, filename_col=filename_col, zarr_dir=zarr_dir)
