@@ -19,12 +19,14 @@ import lazyslide as zs
 
 
 class ZarrSlideDataset(Dataset):
-    def __init__(self, df, filename_col, label_col, feature_key):
+    def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir):
         self.df = df.reset_index(drop=True)
         self.filename_col = filename_col
         self.label_col = label_col
         self.feature_key = feature_key
-
+        self.tile_key = tile_key
+        self.zarr_dir = zarr_dir
+    
     def __len__(self):
         return len(self.df)
 
@@ -32,10 +34,10 @@ class ZarrSlideDataset(Dataset):
         row = self.df.iloc[idx]
 
         slide_path = row[self.filename_col]
-        zarr_path = os.path.splitext(slide_path)[0] + ".zarr"
+        zarr_path = os.path.join(self.zarr_dir, os.path.basename(slide_path).replace(".mrxs", ".zarr"))
 
         wsi = open_wsi(slide_path, zarr_path)
-        adata = wsi.tables[self.feature_key]
+        adata = wsi.tables[self.tile_key]
 
         feats = torch.tensor(adata.X[:]).float() # tile features as a PyTorch tensor
         tile_ids = np.array(adata.obs['tile_id']) # save tile IDs for visualization
@@ -238,7 +240,7 @@ def view_slide_attention(abmil_model, dataset, slide_idx, feature_key, filename_
     # Plot with WSIViewer
     viewer = zs.pl.WSIViewer(wsi)
     viewer.add_tiles(
-        key='tiles',           # polygon table
+        key='tiles_224',           # polygon table
         feature_key=feature_key,
         color_by='attention',  # use the column we just added
         style='heatmap',
