@@ -250,6 +250,40 @@ def view_slide_attention(abmil_model, dataset, slide_idx, feature_key, filename_
     viewer.show()
 
 
+def save_model(model, save_path):
+    """
+    Save the trained ABMIL model to disk.
+    
+    Args:
+        model (ABMIL): Trained ABMIL model
+        save_path (str): Path to save the model (e.g., 'models/abmil_model.pth')
+    """
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    torch.save(model.state_dict(), save_path)
+    print(f"Model saved to {save_path}")
+
+
+def load_model(model_path, in_dim, n_classes, hidden_dim=256, device="cpu"):
+    """
+    Load a trained ABMIL model from disk.
+    
+    Args:
+        model_path (str): Path to the saved model
+        in_dim (int): Feature size per tile (must match training)
+        n_classes (int): Number of output classes (must match training)
+        hidden_dim (int): Size of attention hidden layer (must match training)
+        device (str): Device to load model on ('cpu' or 'cuda')
+    
+    Returns:
+        ABMIL: Loaded model ready for inference
+    """
+    model = ABMIL(in_dim, n_classes, hidden_dim).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()  # Set to evaluation mode
+    print(f"Model loaded from {model_path}")
+    return model
+
+
 # Example Usage
 if __name__ == "__main__":
     # update to fit changes made to the code
