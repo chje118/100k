@@ -207,15 +207,30 @@ def confusion_matrix_report(all_labels, all_preds):
     plt.show()
 
 
-def view_slide_attention(abmil_model, dataset, slide_idx, feature_key, filename_col, zarr_dir):
-    abmil_model.eval()
-    device = next(abmil_model.parameters()).device
+def view_slide_attention(model, dataset, slide_idx, feature_key, filename_col, zarr_dir, tile_key='tiles_224'):
+    """
+    Visualize attention heatmap for a specific slide based on the trained ABMIL model.
+    
+    Args:
+        model (ABMIL): Trained ABMIL model
+        dataset (ZarrSlideDataset or Subset): Dataset containing slide information
+        slide_idx (int): Index of the slide to visualize in the dataset
+        feature_key (str): Key for features in the Zarr table (e.g., 'features_conch')
+        filename_col (str): Column name in dataset containing slide file paths
+        zarr_dir (str): Directory containing Zarr-converted slides
+        tile_key (str): Key for tile polygons in the Zarr table (default: 'tiles_224')
+    
+    Returns:
+        A (np.ndarray): Attention weights for each tile (normalized to [0,1])
+    """
+    model.eval()
+    device = next(model.parameters()).device
 
     # Load slide features and tile IDs
     feats, tile_ids, label = dataset[slide_idx]
     if feats.shape[0] == 0:
         print("Slide has no tiles!")
-        return
+        return None
     feats = feats.to(device)
 
     # Normalize features
@@ -228,26 +243,39 @@ def view_slide_attention(abmil_model, dataset, slide_idx, feature_key, filename_
     A = A.squeeze(1).cpu().numpy()
     A = (A - A.min()) / (A.max() - A.min() + 1e-8)  # normalize to [0,1]
 
+    # Handle both Subset and direct ZarrSlideDataset
+    if hasattr(dataset, 'dataset'):  # This is a Subset
+        base_dataset = dataset.dataset
+        actual_idx = dataset.indices[slide_idx]
+    else:  # This is the original ZarrSlideDataset
+        base_dataset = dataset
+        actual_idx = slide_idx
+
     # Open the WSI
-    slide_path = dataset.df.iloc[slide_idx][filename_col]
+    slide_path = base_dataset.df.iloc[actual_idx][filename_col]
     zarr_path = os.path.join(zarr_dir, os.path.basename(slide_path).replace(".mrxs", ".zarr"))
     wsi = open_wsi(slide_path, zarr_path)
 
-    # Add attention to feature table (no subsampling!)
+    # Add attention to feature table
     adata = wsi.tables[feature_key]
     adata.obs['attention'] = A
 
     # Plot with WSIViewer
     viewer = zs.pl.WSIViewer(wsi)
     viewer.add_tiles(
-        key='tiles_224',           # polygon table
+        key=tile_key,
         feature_key=feature_key,
-        color_by='attention',  # use the column we just added
+        color_by='attention',
         style='heatmap',
         cmap='hot',
         alpha=0.8
     )
     viewer.show()
+    
+    print(f"Slide {slide_idx}: True Label={label}, Predicted Class={torch.argmax(logits).item()}")
+    print(f"Attention weights - Min: {A.min():.4f}, Max: {A.max():.4f}, Mean: {A.mean():.4f}")
+    
+    return A
 
 
 def save_model(model, save_path):
