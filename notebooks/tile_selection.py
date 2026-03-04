@@ -1,45 +1,39 @@
 import os
+from pyexpat import features
 from typing import List, Literal, Tuple
-
 import numpy as np
 import pandas as pd
 from wsidata import open_wsi
 
 
 class TileSelector:
-    """
-    Class-based tile selection:
-    - builds per-tile metadata/feature tables
-    - performs greedy diversity sampling per domain
-    - enforces a minimum spatial distance constraint
-    """
-
     def __init__(
         self,
-        feature_key: str = "features_conch",
+        wsi,
+        feature_key: str,
+        domain_key: str,
         tile_key: str = "tiles_224",
-        domain_key: str = "domain",
         n_per_domain: int = 10,
         min_distance_px: float = 500.0,
         score_mode: Literal["maxmin", "sum"] = "maxmin",
-        on_fail: Literal["stop", "relax"] = "stop",
+        on_fail: Literal["stop", "relax"] = "relax",
     ) -> None:
+        self.wsi = wsi
         self.feature_key = feature_key
-        self.tile_key = tile_key
         self.domain_key = domain_key
+        self.tile_key = tile_key
         self.n_per_domain = n_per_domain
         self.min_distance_px = float(min_distance_px)
         self.score_mode = score_mode
         self.on_fail = on_fail
+        self.load_tile_table()
 
-    # ------- Data access -------
-
-    def get_features_and_tiles(self, wsi) -> Tuple[pd.DataFrame, np.ndarray]:
+    def get_features_and_tiles(self):
         """
-        Fetch tile geometries and features and ensure they are aligned.
+        Fetch tile geometries and features.
         """
-        tiles_gdf = wsi.shapes[self.tile_key]
-        adata = wsi.tables[self.feature_key]
+        tiles_gdf = self.wsi.shapes[self.tile_key]
+        adata = self.wsi.tables[self.feature_key]
 
         X = adata.X
         if hasattr(X, "toarray"):
@@ -49,17 +43,16 @@ class TileSelector:
 
         if len(tiles_gdf) != features.shape[0]:
             raise ValueError(
-                f"Number of tiles ({len(tiles_gdf)}) and feature rows "
-                f"({features.shape[0]}) do not match."
+                f"Number of tiles ({len(tiles_gdf)}) and feature rows ({features.shape[0]}) do not match."
             )
 
         return tiles_gdf, features
 
-    def load_tile_table(self, wsi) -> Tuple[pd.DataFrame, np.ndarray]:
+    def load_tile_table(self):
         """
         Build a per-tile table with domain labels, centroids and features.
         """
-        tiles_gdf, features = self.get_features_and_tiles(wsi)
+        tiles_gdf, features = self.get_features_and_tiles()
 
         if self.domain_key in tiles_gdf.columns:
             domains = tiles_gdf[self.domain_key].to_numpy()
@@ -88,9 +81,11 @@ class TileSelector:
             }
         )
 
-        return meta_df, features
+        self.meta_df = meta_df
+        self.features = features
+        self.centroids = np.stack([cx, cy], axis=1)
 
-    # ------- Feature utilities -------
+        return meta_df, features
 
     @staticmethod
     def standardize_features(features: np.ndarray) -> np.ndarray:
@@ -102,27 +97,20 @@ class TileSelector:
         std_safe = np.where(std == 0, 1.0, std)
         return (features - mean) / std_safe
 
-    # ------- Core greedy sampler -------
-
-    def greedy_diverse_subset(
-        self,
-        features: np.ndarray,
-        centroids: np.ndarray,
-        n: int,
-    ) -> List[int]:
+    def greedy_diverse_subset(self) -> List[int]:
         """
         Greedy diversity sampling with a minimum spatial distance constraint.
         """
-        m = features.shape[0]
-        if m == 0 or n <= 0:
+        m = self.features.shape[0]
+        if m == 0 or self.n_per_domain <= 0:
             return []
 
         if m == 1:
             return [0]
 
-        F_std = self.standardize_features(features)
+        features_std = self.standardize_features(self.features)
 
-        mean_vec = F_std.mean(axis=0, keepdims=True)
+        mean_vec = features_std.mean(axis=0, keepdims=True)
         d2_center = np.sum((F_std - mean_vec) ** 2, axis=1)
         first_idx = int(np.argmax(d2_center))
 
@@ -184,15 +172,22 @@ class TileSelector:
 
     # ------- Domain-level selection -------
 
-    def select_tiles_per_domain(
-        self,
-        tile_table: pd.DataFrame,
-        features: np.ndarray,
-        n: int,
-    ) -> pd.DataFrame:
+    def select_tiles_per_domain(self) -> pd.DataFrame:
         """
         Run greedy diversity sampling independently within each domain.
         """
+        if tile_table is None or features is None:
+            if self.meta_df is None or self.features is None:
+                raise ValueError(
+                    "No cached tile_table/features. Call `load_tile_table()` first "
+                    "or pass `tile_table` and `features` explicitly."
+                )
+            tile_table = self.meta_df
+            features = self.features
+
+        if n is None:
+            n = self.n_per_domain
+
         if "domain" not in tile_table.columns:
             raise KeyError("Expected column 'domain' in tile_table.")
 
@@ -234,8 +229,6 @@ class TileSelector:
         selected_df = pd.concat(selected_rows, axis=0)
         return selected_df
 
-
-    # ------- Sanity check -------
 
     @staticmethod
     def check_min_distance(
