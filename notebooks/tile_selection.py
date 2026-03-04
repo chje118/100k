@@ -1,10 +1,6 @@
-import os
-from pyexpat import features
-from typing import List, Literal, Tuple
+from typing import List, Literal
 import numpy as np
 import pandas as pd
-from wsidata import open_wsi
-
 
 class TileSelector:
     def __init__(
