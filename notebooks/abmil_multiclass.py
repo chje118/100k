@@ -2,8 +2,8 @@
 Attention-Based Multiple Instance Learning (ABMIL) for Whole Slide Image Classification.
 Assumes multi-class, single-label classification.
 """
-
-# TODO: hotdog/not hotdog (binary classification), allowing multiple labels per slide (healty/non-healthy)
+# TODO: tqdm progress bars
+# TODO: check parameters for ABMIL (hidden_dim, learning rate, etc.) for loading/saving model
 
 import os
 import torch
