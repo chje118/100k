@@ -209,7 +209,7 @@ def confusion_matrix_report(all_labels, all_preds):
 
 def view_slide_attention(abmil_model, dataset, slide_idx, feature_key, filename_col, zarr_dir):
     abmil_model.eval()
-    device = next(model.parameters()).device
+    device = next(abmil_model.parameters()).device
 
     # Load slide features and tile IDs
     feats, tile_ids, label = dataset[slide_idx]
