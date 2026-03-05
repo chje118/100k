@@ -8,15 +8,16 @@ class TileSelector:
         self,
         wsi,
         feature_key: str,
-        domain_keys,  # str or list of str
+        domain_keys: List[str]|str, 
         tile_key: str = "tiles_224",
         n_per_domain: int = 10,
         min_distance_px: float = 500.0,
         score_mode: Literal["maxmin", "sum"] = "maxmin",
         on_fail: Literal["stop", "relax"] = "relax",
-        agreement_mode: Literal["at_least", "exactly", "all_different"] = "at_least",
-        min_agreement: int = None,
-    ) -> None:
+        agreement_mode: Literal["all_same", "all_different"] = "all_same",
+        ) -> None:
+        # TODO: add options, at_lest, exactly, at_most for agreement_mode, with n_agreement parameter
+        
         self.wsi = wsi
         self.feature_key = feature_key
         self.domain_keys = [domain_keys] if isinstance(domain_keys, str) else domain_keys
@@ -26,14 +27,10 @@ class TileSelector:
         self.score_mode = score_mode
         self.on_fail = on_fail
         self.agreement_mode = agreement_mode
-        self.min_agreement = min_agreement if min_agreement is not None else len(self.domain_keys)
-        self.domain_col = self.domain_keys[0] if len(self.domain_keys) == 1 else "domain"
         self.load_tile_table()
 
     def get_features_and_tiles(self):
-        """
-        Fetch tile geometries and features.
-        """
+        """ Fetch tile geometries and features. """
         tiles_gdf = self.wsi.shapes[self.tile_key]
         adata = self.wsi.tables[self.feature_key]
 
@@ -57,12 +54,12 @@ class TileSelector:
         tiles_gdf, features = self.get_features_and_tiles()
 
         domains_list = []
-        for dk in self.domain_keys:
-            if dk in tiles_gdf.columns:
-                domains_list.append(tiles_gdf[dk].to_numpy())
+        for dom_key in self.domain_keys:
+            if dom_key in tiles_gdf.columns:
+                domains_list.append(tiles_gdf[dom_key].to_numpy())
             else:
                 raise KeyError(
-                    f"Domain key '{dk}' not found in tile GeoDataFrame."
+                    f"Domain key '{dom_key}' not found in tile GeoDataFrame."
                 )
 
         if len(self.domain_keys) == 1:
@@ -73,13 +70,8 @@ class TileSelector:
                 domain_values = [d[i] for d in domains_list]
                 counter = Counter(domain_values)
                 max_count = counter.most_common(1)[0][1]
-                if self.agreement_mode == "at_least":
-                    if max_count >= self.min_agreement:
-                        consensus = counter.most_common(1)[0][0]
-                    else:
-                        consensus = None
-                elif self.agreement_mode == "exactly":
-                    if max_count == self.min_agreement:
+                if self.agreement_mode == "all_same":
+                    if max_count == len(self.domain_keys):
                         consensus = counter.most_common(1)[0][0]
                     else:
                         consensus = None
@@ -119,7 +111,9 @@ class TileSelector:
 
     @staticmethod
     def standardize_features(features: np.ndarray) -> np.ndarray:
-        """Zero-mean, unit-variance scaling per feature, with numerical safety."""
+        """
+        Zero-mean, unit-variance scaling per feature, with numerical safety.
+        """
         if features.size == 0:
             return features
         mean = features.mean(axis=0, keepdims=True)
