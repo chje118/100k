@@ -132,7 +132,7 @@ def train_ABMIL(train_df, train_dataset, label_col,n_epochs=10):
             
             # Compute loss - logits is shape (n_classes,), label is shape ()
             # CrossEntropyLoss expects both to have batch dimension
-            loss = loss_fn(logits.unsqueeze(0), label.unsqueeze(0))
+            loss = loss_fn(logits.unsqueeze(0), label)
 
             # Clear gradients
             optimizer.zero_grad()
