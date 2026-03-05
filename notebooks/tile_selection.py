@@ -2,6 +2,7 @@ from typing import List, Literal
 import numpy as np
 import pandas as pd
 from collections import Counter
+import matplotlib.pyplot as plt
 
 from wsidata import open_wsi
 
@@ -318,7 +319,7 @@ class TileSelector:
                 .reset_index(drop=True)
                 .copy()
             )
-            result = self.select_tiles_for_domain(domain_value, df_dom)
+            result = self.select_tiles_for_domain(df_dom)
             if result is not None:
                 selected_rows.append(result)
 
@@ -347,6 +348,59 @@ class TileSelector:
 
         return True
 
+    def plot_domains(self, selected: pd.DataFrame | None = None):
+        """ Visualize domains and overlay selected tiles. """
+        fig, ax = plt.subplots(figsize=(6, 6))
+        
+        df = self.meta_df
+        if df.empty:
+            return ax
+
+        # Assign a color to each domain value
+        # convert None/NaN to a consistent string for coloring
+        domains = df[self.domain_col].where(pd.notna(df[self.domain_col]), other="nan")
+        domains = domains.astype(str)
+        unique = domains.unique()
+        cmap = plt.get_cmap("tab10")
+        color_map = {val: cmap(i % cmap.N) for i, val in enumerate(unique) if val != "nan"}
+        # fallback for NaN/None (light, almost white)
+        color_map["nan"] = (0.9, 0.9, 0.9, 0.3)
+
+        colors = domains.map(lambda v: color_map.get(v, color_map["nan"]))
+
+        # smaller markers to avoid pixel-scale overcrowding
+        ax.scatter(df["cx"], df["cy"], c=list(colors), s=2, alpha=0.4, label="all tiles")
+        handles = []
+        for val, col in color_map.items():
+            handles.append(plt.Line2D([], [], marker="o", color=col, linestyle="", label=val))
+
+        if selected is not None and not selected.empty:
+            # black crosses for selected points
+            ax.scatter(selected["cx"], selected["cy"],
+                       c="black", s=15, marker="x", label="selected")
+        
+        ax.legend(handles=handles + ([plt.Line2D([], [], marker="x", color="black", linestyle="", label="selected")] if selected is not None and not selected.empty else []))
+        ax.set_xlabel("cx")
+        ax.set_ylabel("cy")
+        ax.set_title("Tile domains and selections")
+        return ax
+    
+    def zoom_to_selected(self, selected: pd.DataFrame):
+        """ Visualize selected tiles with zoomed-in view. """
+        # TODO: domain_consensus column added to the tile table 
+        # TODO: zoom to selected tiles 
+        viewer = zs.pl.WSIViewer(wsi)
+        viewer.add_tiles(
+            key=tile_key,
+            feature_key=feature_key,
+            color_by='domain_consensus',
+            style='heatmap',
+            alpha=0.6
+        )
+        viewer.show()
+    
+ 
+
 if __name__ == "__main__":
     import open_wsi
 
@@ -365,6 +419,7 @@ if __name__ == "__main__":
     selected_tiles = selector.select_tiles_per_domain()
     print(f"Selected {len(selected_tiles)} tiles")
     print(selected_tiles.head())
+    selector.plot_domains(selected_tiles)
     
     # Multiple Domains
     selector_multi = TileSelector(
@@ -378,3 +433,5 @@ if __name__ == "__main__":
     selected_tiles_multi = selector_multi.select_tiles_per_domain()
     print(f"Selected {len(selected_tiles_multi)} tiles with consensus")
     print(selected_tiles_multi.head())
+    selector_multi.plot_domains(selected_tiles_multi)
+    
