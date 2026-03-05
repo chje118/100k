@@ -16,7 +16,7 @@ class TileSelector:
         on_fail: Literal["stop", "relax"] = "relax",
         agreement_mode: Literal["all_same", "all_different", "at_least", "exactly", "at_most"] = "all_same",
         min_agreement: int | None = None,
-        ) -> None:
+        ):
         self.wsi = wsi
         self.feature_key = feature_key
         self.domain_keys = [domain_keys] if isinstance(domain_keys, str) else domain_keys
@@ -26,7 +26,7 @@ class TileSelector:
         self.score_mode = score_mode
         self.on_fail = on_fail
         self.agreement_mode = agreement_mode
-        self.min_agreement = min_agreement if min_agreement is not None else len(self.domain_keys)
+        self.min_agreement = min_agreement
         self.load_tile_table()
 
     def get_features_and_tiles(self):
@@ -48,50 +48,37 @@ class TileSelector:
         return tiles_gdf, features
 
     @staticmethod
-    def compute_domain_consensus(
-        domain_values: List,
-        mode: Literal["all_same", "all_different", "at_least", "exactly", "at_most"] = "all_same",
-        min_agreement: int | None = None,
-    ) -> object:
-        """Compute consensus domain label from multiple annotations.
+    def compute_domain_consensus(domain_values, mode, min_agreement) -> object:
+        """ Compute consensus domain label from multiple annotations.
         
         Parameters
-        ----------
-        domain_values : list
-            Values from all domain columns for a single tile.
-        mode : str
-            Agreement mode:
+        - domain_values (list): Values from all domain columns for a single tile.
+        - mode (str): Agreement mode:
             - 'all_same': all values must be identical
             - 'all_different': all values must be unique
             - 'at_least': at least min_agreement values must match
             - 'exactly': exactly min_agreement values must match
             - 'at_most': at most min_agreement values must match
-        min_agreement : int or None
-            Threshold for 'at_least', 'exactly', 'at_most' modes.
-            Defaults to len(domain_values) if not specified.
+        - min_agreement (int or None): Threshold for 'at_least', 'exactly', 'at_most' modes.
         
-        Returns
-        -------
-        object or None
-            Consensus label or None if agreement condition not met.
+        Returns:
+        - Consensus label or None if agreement condition not met.
         """
+
         counter = Counter(domain_values)
         most_common, count = counter.most_common(1)[0]
         n_values = len(domain_values)
-
+        
         if mode == "all_same":
             return most_common if count == n_values else None
         elif mode == "all_different":
             return "all_different" if count == 1 else None
         elif mode == "at_least":
-            threshold = min_agreement if min_agreement is not None else n_values
-            return most_common if count >= threshold else None
+            return most_common if count >= min_agreement else None
         elif mode == "exactly":
-            threshold = min_agreement if min_agreement is not None else n_values
-            return most_common if count == threshold else None
+            return most_common if count == min_agreement else None
         elif mode == "at_most":
-            threshold = min_agreement if min_agreement is not None else n_values
-            return most_common if count <= threshold else None
+            return most_common if count <= min_agreement else None
         return None
 
     def extract_domain_columns(self, tiles_gdf: pd.DataFrame) -> List[np.ndarray]:
@@ -104,7 +91,7 @@ class TileSelector:
         return domains_list
 
     def collapse_domains(self, domains_list: List[np.ndarray]) -> np.ndarray:
-        """Collapse multiple domain annotations into consensus labels."""
+        """ Collapse multiple domain annotations into consensus labels."""
         if len(domains_list) == 1:
             return domains_list[0]
 
@@ -121,7 +108,7 @@ class TileSelector:
 
     @staticmethod
     def extract_centroids(tiles_gdf: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-        """Extract (x, y) coordinates from geometry column."""
+        """ Extract (x, y) coordinates from geometry column. """
         centroids = tiles_gdf["geometry"].centroid
         return centroids.x.to_numpy(), centroids.y.to_numpy()
 
@@ -130,14 +117,7 @@ class TileSelector:
         """Extract tile_id column if present."""
         return tiles_gdf["tile_id"].to_numpy() if "tile_id" in tiles_gdf.columns else None
 
-    def build_meta_df(
-        self,
-        tiles_gdf: pd.DataFrame,
-        domains: np.ndarray,
-        cx: np.ndarray,
-        cy: np.ndarray,
-        tile_id: np.ndarray | None = None,
-    ) -> pd.DataFrame:
+    def build_meta_df(self, tiles_gdf, domains, cx, cy, tile_id=None) -> pd.DataFrame:
         """Build metadata table with domains, centroids, and tile indices."""
         tile_idx = np.arange(len(tiles_gdf), dtype=int)
         return pd.DataFrame(
@@ -160,6 +140,7 @@ class TileSelector:
         tile_id = self.extract_tile_ids(tiles_gdf)
         meta_df = self.build_meta_df(tiles_gdf, domains, cx, cy, tile_id)
 
+        # Store results in instance variables
         self.meta_df = meta_df
         self.features = features
         self.centroids = np.stack([cx, cy], axis=1)
@@ -181,45 +162,31 @@ class TileSelector:
 
     @staticmethod
     def squared_euclidean_distances(coords1: np.ndarray, coords2: np.ndarray) -> np.ndarray:
-        """Compute pairwise squared Euclidean distances (faster, used for constraints).
-        
+        """ Compute pairwise squared Euclidean distances. 
+
         Parameters
-        ----------
-        coords1 : (n, d)
-            First set of coordinates.
-        coords2 : (m, d)
-            Second set of coordinates.
-        
+        - coords1: (n1, d) array of coordinates
+        - coords2: (n2, d) array of coordinates
+
         Returns
-        -------
-        distances_squared : (n, m)
-            Pairwise squared distances.
+        - (n1, n2) array of squared distances
+
+        d: dimensionality of coordinates (e.g., 2 for (x, y))
         """
         diff = coords1[:, None, :] - coords2[None, :, :]
         return np.sum(diff**2, axis=2)
 
     @staticmethod
-    def satisfies_distance_constraint(
-        candidate_coords: np.ndarray,
-        selected_coords: np.ndarray,
-        min_distance: float,
-    ) -> bool:
-        """Check if a candidate location satisfies minimum distance constraint.
+    def satisfies_distance_constraint(candidate_coords, selected_coords, min_distance):
+        """ Check if a candidate location satisfies minimum distance constraint.
         
         Parameters
-        ----------
-        candidate_coords : (2,)
-            Coordinates of the candidate tile.
-        selected_coords : (n, 2)
-            Coordinates of already-selected tiles.
-        min_distance : float
-            Minimum required distance.
+        - candidate_coords (2,): Coordinates of the candidate tile.
+        - selected_coords (n, 2): Coordinates of already-selected tiles.
+        - min_distance (float): Minimum required distance.
         
         Returns
-        -------
-        bool
-            True if the candidate is at least `min_distance` away from all
-            selected tiles, False otherwise.
+        - bool: True if the candidate is at least `min_distance` away from all selected tiles, False otherwise.
         """
         if min_distance <= 0 or selected_coords.shape[0] == 0:
             return True
@@ -230,32 +197,28 @@ class TileSelector:
         return np.min(distances_sq) >= (min_distance**2)
 
     def greedy_diverse_subset(self, features: np.ndarray, centroid: np.ndarray, n: int) -> List[int]:
-        """Greedy diversity sampling with spatial distance constraint.
+        """ Greedy diversity sampling with spatial distance constraint.
         
         For each selection step, candidates are ranked by diversity score and selected in order
         of decreasing diversity, with the first candidate that meets the spatial distance
         constraint being chosen.
 
         Parameters
-        ----------
-        features : (m, d)
-            Feature matrix.
-        centroid : (m, 2)
-            Centroid coordinates.
-        n : int
-            Number of tiles to select.
+        - features (m, d): Feature matrix.
+        - centroid (m, 2): Centroid coordinates.
+        - n (int): Number of tiles to select.
 
         Returns
-        -------
-        list of int
-            Indices of selected tiles.
+        - List[int]: Indices of selected tiles.
         """
+        # Handle edge cases: no tiles, n <= 0, or only one tile
         m = features.shape[0]
         if m == 0 or n <= 0:
             return []
         if m == 1:
             return [0]
 
+        # Ensure n does not exceed available tiles
         n = min(n, m)
         features_std = self.standardize_features(features)
 
@@ -264,10 +227,12 @@ class TileSelector:
         d2_center = np.sum((features_std - mean_vec) ** 2, axis=1)
         first_idx = int(np.argmax(d2_center))
 
+        # Initialize selection and availability tracking
         selected = [first_idx]
         available = np.ones(m, dtype=bool)
         available[first_idx] = False
 
+        # Initialize current minimum distance for selection, which can be relaxed if needed
         current_min_distance = self.min_distance_px
         base_min_distance = self.min_distance_px
 
@@ -281,9 +246,11 @@ class TileSelector:
             features_cand = features_std[available_idx]
             d2_features = self.squared_euclidean_distances(features_cand, features_sel)
 
+            # sum: sum of squared distances to selected set
             if self.score_mode == "sum":
                 diversity_scores = d2_features.sum(axis=1)
-            else:  # "maxmin"
+            # maxmin: minimum squared distance to selected set
+            else:
                 diversity_scores = d2_features.min(axis=1)
 
             # Try candidates in order of decreasing diversity
@@ -293,6 +260,7 @@ class TileSelector:
             sel_coords = centroid[selected]
             selected_idx = None
 
+            # Check candidates against distance constraint in order of diversity
             for candidate_idx in sorted_candidates:
                 cand_coord = centroid[candidate_idx]
                 
@@ -303,14 +271,10 @@ class TileSelector:
                     break
 
             if selected_idx is None:
-                # Relax distance constraint or stop
-                if (
-                    self.on_fail == "relax"
-                    and current_min_distance > base_min_distance * 0.3
-                ):
+                if (self.on_fail == "relax" and current_min_distance > base_min_distance * 0.3):
                     current_min_distance *= 0.9
                     continue
-                else:
+                else: # on_fail == "stop" or minimum distance already relaxed significantly
                     break
 
             selected.append(selected_idx)
@@ -318,10 +282,8 @@ class TileSelector:
 
         return selected
 
-    def select_tiles_for_domain(
-        self, domain_value: object, df_dom: pd.DataFrame
-    ) -> pd.DataFrame | None:
-        """Select tiles within a single domain."""
+    def select_tiles_for_domain(self, df_dom):
+        """ Select tiles within a single domain."""
         if df_dom.empty:
             return None
 
@@ -337,15 +299,14 @@ class TileSelector:
             return None
 
         df_sel = df_dom.iloc[chosen].copy()
-        df_sel["domain_tile_rank"] = np.arange(1, len(df_sel) + 1, dtype=int)
         return df_sel
 
-    def iterate_domains(self, tile_table: pd.DataFrame) -> list:
-        """Get sorted unique domain values (excluding None)."""
+    def iterate_domains(self, tile_table):
+        """ Get sorted unique domain values (excluding None). """
         return sorted(tile_table[self.domain_col].dropna().unique())
 
-    def select_tiles_per_domain(self) -> pd.DataFrame:
-        """Run selection independently within each domain."""
+    def select_tiles_per_domain(self):
+        """ Run selection independently within each domain. """
         tile_table = self.meta_df
         selected_rows = []
 
@@ -364,12 +325,8 @@ class TileSelector:
 
         return pd.concat(selected_rows, axis=0, ignore_index=True)
 
-    def check_min_distance(
-        self,
-        df: pd.DataFrame,
-        min_distance_px: float,
-    ) -> bool:
-        """Verify all selected tiles within each domain meet the distance constraint."""
+    def check_min_distance(self, df, min_distance_px):
+        """ Verify all selected tiles within each domain meet the distance constraint. """
         if df.empty or min_distance_px <= 0:
             return True
 
