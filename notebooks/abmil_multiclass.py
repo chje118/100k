@@ -16,6 +16,7 @@ from sklearn.metrics import confusion_matrix, classification_report
 import seaborn as sns
 import matplotlib.pyplot as plt
 import lazyslide as zs
+from tqdm import tqdm
 
 
 class ZarrSlideDataset(Dataset):
@@ -37,7 +38,8 @@ class ZarrSlideDataset(Dataset):
         zarr_path = os.path.join(self.zarr_dir, os.path.basename(slide_path).replace(".mrxs", ".zarr"))
 
         wsi = open_wsi(slide_path, zarr_path)
-        adata = wsi.tables[self.tile_key]
+        # Load features from feature_key table (NOT tile_key, which contains coordinates)
+        adata = wsi.tables[self.feature_key]
 
         feats = torch.tensor(adata.X[:]).float() # tile features as a PyTorch tensor
         tile_ids = np.array(adata.obs['tile_id']) # save tile IDs for visualization
@@ -106,12 +108,12 @@ def train_ABMIL(train_df, train_dataset, label_col,n_epochs=10):
     loss_fn = torch.nn.CrossEntropyLoss()
 
     # Training Loop
-    for epoch in range(n_epochs):
+    for epoch in tqdm(range(n_epochs), desc="Epochs"):
         model.train()
         total_loss = 0.0
 
         # Loop over slides
-        for feats, tile_ids, label in train_loader:
+        for feats, tile_ids, label in tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs}", leave=False):
             if feats.dim() == 3:
                 feats = feats.squeeze(0)
             if tile_ids.ndim == 2:
@@ -128,8 +130,9 @@ def train_ABMIL(train_df, train_dataset, label_col,n_epochs=10):
             # Forward pass
             logits, _ = model(feats)
             
-            # Compute loss
-            loss = loss_fn(logits.unsqueeze(0), label)
+            # Compute loss - logits is shape (n_classes,), label is shape ()
+            # CrossEntropyLoss expects both to have batch dimension
+            loss = loss_fn(logits.unsqueeze(0), label.unsqueeze(0))
 
             # Clear gradients
             optimizer.zero_grad()
@@ -161,7 +164,7 @@ def validate_ABMIL(model, val_dataset):
     all_preds = []
 
     with torch.no_grad():   # Disables gradient computation (save memory)
-        for feats, tile_ids, label in val_loader:
+        for feats, tile_ids, label in tqdm(val_loader, desc="Validation", leave=False):
             if feats.dim() == 3:
                 feats = feats.squeeze(0)
             if tile_ids.ndim == 2:
@@ -208,21 +211,6 @@ def confusion_matrix_report(all_labels, all_preds):
 
 
 def view_slide_attention(model, dataset, slide_idx, feature_key, filename_col, zarr_dir, tile_key='tiles_224'):
-    """
-    Visualize attention heatmap for a specific slide based on the trained ABMIL model.
-    
-    Args:
-        model (ABMIL): Trained ABMIL model
-        dataset (ZarrSlideDataset or Subset): Dataset containing slide information
-        slide_idx (int): Index of the slide to visualize in the dataset
-        feature_key (str): Key for features in the Zarr table (e.g., 'features_conch')
-        filename_col (str): Column name in dataset containing slide file paths
-        zarr_dir (str): Directory containing Zarr-converted slides
-        tile_key (str): Key for tile polygons in the Zarr table (default: 'tiles_224')
-    
-    Returns:
-        A (np.ndarray): Attention weights for each tile (normalized to [0,1])
-    """
     model.eval()
     device = next(model.parameters()).device
 
@@ -241,7 +229,15 @@ def view_slide_attention(model, dataset, slide_idx, feature_key, filename_col, z
         logits, A = model(feats)
 
     A = A.squeeze(1).cpu().numpy()
-    A = (A - A.min()) / (A.max() - A.min() + 1e-8)  # normalize to [0,1]
+    print(f"DEBUG: Raw attention before normalization - shape: {A.shape}, min: {A.min():.6f}, max: {A.max():.6f}, std: {A.std():.6f}")
+    
+    # Normalize to [0,1] - only if there's variation
+    if A.max() > A.min():
+        A_normalized = (A - A.min()) / (A.max() - A.min() + 1e-8)
+        print(f"DEBUG: Attention after normalization - shape: {A_normalized.shape}, min: {A_normalized.min():.6f}, max: {A_normalized.max():.6f}, std: {A_normalized.std():.6f}")
+    else:
+        print("WARNING: All attention weights are identical! Model may not be learning attention.")
+        A_normalized = A  # Keep original uniform values for debugging
 
     # Handle both Subset and direct ZarrSlideDataset
     if hasattr(dataset, 'dataset'):  # This is a Subset
@@ -256,9 +252,15 @@ def view_slide_attention(model, dataset, slide_idx, feature_key, filename_col, z
     zarr_path = os.path.join(zarr_dir, os.path.basename(slide_path).replace(".mrxs", ".zarr"))
     wsi = open_wsi(slide_path, zarr_path)
 
-    # Add attention to feature table
+    # Add attention to feature table - ensure it's the same length as the observations
     adata = wsi.tables[feature_key]
-    adata.obs['attention'] = A
+    print(f"DEBUG: adata.obs shape: {adata.obs.shape}, adata.X shape: {adata.X.shape}, attention shape: {A_normalized.shape}")
+    
+    if len(A_normalized) != adata.n_obs:
+        print(f"ERROR: Attention weights ({len(A_normalized)}) don't match observations ({adata.n_obs})!")
+        return A_normalized
+    
+    adata.obs['attention'] = A_normalized
 
     # Plot with WSIViewer
     viewer = zs.pl.WSIViewer(wsi)
@@ -273,9 +275,10 @@ def view_slide_attention(model, dataset, slide_idx, feature_key, filename_col, z
     viewer.show()
     
     print(f"Slide {slide_idx}: True Label={label}, Predicted Class={torch.argmax(logits).item()}")
-    print(f"Attention weights - Min: {A.min():.4f}, Max: {A.max():.4f}, Mean: {A.mean():.4f}")
+    print(f"Attention weights - Min: {A_normalized.min():.4f}, Max: {A_normalized.max():.4f}, Mean: {A_normalized.mean():.4f}, Std: {A_normalized.std():.4f}")
     
-    return A
+    return A_normalized
+
 
 
 def save_model(model, save_path):
@@ -352,4 +355,4 @@ if __name__ == "__main__":
     all_labels, all_preds = validate_ABMIL(model, val_dataset)
     confusion_matrix_report(all_labels, all_preds)
 
-    view_slide_attention(model, val_dataset, slide_idx=0, feature_key=feature_key, filename_col=filename_col, zarr_dir=zarr_dir)
+    view_slide_attention(model, val_dataset, slide_idx=0, filename_col=filename_col, zarr_dir=zarr_dir)
