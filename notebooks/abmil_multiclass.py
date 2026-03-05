@@ -2,7 +2,6 @@
 Attention-Based Multiple Instance Learning (ABMIL) for Whole Slide Image Classification.
 Assumes multi-class, single-label classification.
 """
-# TODO: check parameters for ABMIL (hidden_dim, learning rate, etc.) for loading/saving model
 
 import os
 import torch
@@ -37,7 +36,6 @@ class ZarrSlideDataset(Dataset):
         zarr_path = os.path.join(self.zarr_dir, os.path.basename(slide_path).replace(".mrxs", ".zarr"))
 
         wsi = open_wsi(slide_path, zarr_path)
-        # Load features from feature_key table (NOT tile_key, which contains coordinates)
         adata = wsi.tables[self.feature_key]
 
         feats = torch.tensor(adata.X[:]).float() # tile features as a PyTorch tensor
@@ -67,12 +65,14 @@ class ABMIL(nn.Module):
 
     def forward(self, x):
         """
-        param: 
-        x: slide with shape, [n_tiles, feat_dim]
+        Forward pass of ABMIL:
+
+        Parameters: 
+        - x: slide with shape, [n_tiles, feat_dim]
         
-        output:
-        logits: used for training (CrossEntropyLoss)
-        A: attention weights (for interpretability)
+        Returns:
+        - logits: used for training (CrossEntropyLoss)
+        - A: attention weights (for interpretability)
         """
         # Compute attention scores
         A = self.attn(x)
@@ -88,7 +88,7 @@ class ABMIL(nn.Module):
 
         return logits, A
     
-def train_ABMIL(train_df, train_dataset, label_col,n_epochs=10):
+def train_ABMIL(train_df, train_dataset, label_col, n_epochs=10):
     # DataLoader: decides when items are loaded, handles shuffling and batching
     train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
 
@@ -97,7 +97,8 @@ def train_ABMIL(train_df, train_dataset, label_col,n_epochs=10):
     feat_dim = sample_feats.shape[1]
     n_classes = train_df[label_col].nunique()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu" 
+    print(f"Using device: {device}")
 
     # Create the ABMIL Model
     model = ABMIL(feat_dim, n_classes).to(device)
@@ -129,8 +130,7 @@ def train_ABMIL(train_df, train_dataset, label_col,n_epochs=10):
             # Forward pass
             logits, _ = model(feats)
             
-            # Compute loss - logits is shape (n_classes,), label is shape ()
-            # CrossEntropyLoss expects both to have batch dimension
+            # Compute loss
             loss = loss_fn(logits.unsqueeze(0), label)
 
             # Clear gradients
@@ -192,12 +192,9 @@ def validate_ABMIL(model, val_dataset):
 
 def confusion_matrix_report(all_labels, all_preds):
     """
-    all_labels: list of true labels
-    all_preds: list of predicted labels
-
-    Interpretation:
-    If accuracy is low → model may overfit or you may have too few slides
-    If accuracy is high → attention can now be visualized (next step)
+    Parameters:
+    - all_labels: list of true labels
+    - all_preds: list of predicted labels
     """
     cm = confusion_matrix(all_labels, all_preds)
     print(classification_report(all_labels, all_preds))
@@ -239,10 +236,10 @@ def view_slide_attention(model, dataset, slide_idx, feature_key, filename_col, z
         A_normalized = A  # Keep original uniform values for debugging
 
     # Handle both Subset and direct ZarrSlideDataset
-    if hasattr(dataset, 'dataset'):  # This is a Subset
+    if hasattr(dataset, 'dataset'):
         base_dataset = dataset.dataset
         actual_idx = dataset.indices[slide_idx]
-    else:  # This is the original ZarrSlideDataset
+    else:  
         base_dataset = dataset
         actual_idx = slide_idx
 
@@ -251,7 +248,7 @@ def view_slide_attention(model, dataset, slide_idx, feature_key, filename_col, z
     zarr_path = os.path.join(zarr_dir, os.path.basename(slide_path).replace(".mrxs", ".zarr"))
     wsi = open_wsi(slide_path, zarr_path)
 
-    # Add attention to feature table - ensure it's the same length as the observations
+    # Add attention to feature table
     adata = wsi.tables[feature_key]
     print(f"DEBUG: adata.obs shape: {adata.obs.shape}, adata.X shape: {adata.X.shape}, attention shape: {A_normalized.shape}")
     
@@ -279,15 +276,13 @@ def view_slide_attention(model, dataset, slide_idx, feature_key, filename_col, z
     return A_normalized
 
 
-
 def save_model(model, model_name):
     """
     Save the trained ABMIL model to disk with auto-generated filename including model parameters.
     
-    Args:
-        model (ABMIL): Trained ABMIL model
-        model_name (str): Base name for the model (e.g., 'manualname')
-        save_dir (str): Directory to save the model (default: 'models/')
+    Parameters:
+    - model (ABMIL): Trained ABMIL model
+    - model_name (str): Base name for the model (e.g., 'abmil_placenta')
     """
     in_dim = model.classifier.in_features
     n_classes = model.classifier.out_features
@@ -301,30 +296,31 @@ def save_model(model, model_name):
     print(f"Model saved to {save_path}")
 
 
-def load_model(model_path, in_dim, n_classes, hidden_dim=256, device="cpu"):
+def load_model(model_path, in_dim, n_classes, hidden_dim=256):
     """
     Load a trained ABMIL model from disk.
     
-    Args:
-        model_path (str): Path to the saved model
-        in_dim (int): Feature size per tile (must match training)
-        n_classes (int): Number of output classes (must match training)
-        hidden_dim (int): Size of attention hidden layer (must match training)
-        device (str): Device to load model on ('cpu' or 'cuda')
+    Parameters:
+    - model_path (str): Path to the saved model
+    - in_dim (int): Feature size per tile (must match training)
+    - n_classes (int): Number of output classes (must match training)
+    - hidden_dim (int): Size of attention hidden layer (must match training)
     
     Returns:
         ABMIL: Loaded model ready for inference
     """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Loading model from {model_path} on device: {device}")
+
     model = ABMIL(in_dim, n_classes, hidden_dim).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()  # Set to evaluation mode
-    print(f"Model loaded from {model_path}")
+    print(f"Model successfully loaded")
     return model
 
 
 # Example Usage
 if __name__ == "__main__":
-    # update to fit changes made to the code
     from sklearn.model_selection import train_test_split
 
     df = pd.DataFrame()
