@@ -3,6 +3,8 @@ import numpy as np
 import pandas as pd
 from collections import Counter
 
+from wsidata import open_wsi
+
 class TileSelector:
     def __init__(
         self,
@@ -344,3 +346,35 @@ class TileSelector:
                 return False
 
         return True
+
+if __name__ == "__main__":
+    import open_wsi
+
+    slide_path = "path/to/slide.mrxs"
+    zarr_path = "path/to/slide.zarr"
+    wsi = open_wsi(slide_path, zarr_path)
+    
+    # Single Domain
+    selector = TileSelector(
+        wsi=wsi,
+        feature_key="features",
+        domain_keys="domain_conch",
+        n_per_domain=5,
+        min_distance_px=500.0
+    )
+    selected_tiles = selector.select_tiles_per_domain()
+    print(f"Selected {len(selected_tiles)} tiles")
+    print(selected_tiles.head())
+    
+    # Multiple Domains
+    selector_multi = TileSelector(
+        wsi=wsi,
+        feature_key="features", 
+        domain_keys=["domain_conch", "domain_uni", "domain_hopt"],
+        n_per_domain=3,
+        agreement_mode="all_same",
+        min_distance_px=300.0
+    )
+    selected_tiles_multi = selector_multi.select_tiles_per_domain()
+    print(f"Selected {len(selected_tiles_multi)} tiles with consensus")
+    print(selected_tiles_multi.head())
