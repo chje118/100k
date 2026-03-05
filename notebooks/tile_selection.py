@@ -14,7 +14,8 @@ class TileSelector:
         min_distance_px: float = 500.0,
         score_mode: Literal["maxmin", "sum"] = "maxmin",
         on_fail: Literal["stop", "relax"] = "relax",
-        agreement_mode: Literal["all_same", "all_different"] = "all_same",
+        agreement_mode: Literal["all_same", "all_different", "at_least", "exactly", "at_most"] = "all_same",
+        min_agreement: int | None = None,
         ) -> None:
         self.wsi = wsi
         self.feature_key = feature_key
@@ -25,6 +26,7 @@ class TileSelector:
         self.score_mode = score_mode
         self.on_fail = on_fail
         self.agreement_mode = agreement_mode
+        self.min_agreement = min_agreement if min_agreement is not None else len(self.domain_keys)
         self.load_tile_table()
 
     def get_features_and_tiles(self):
@@ -47,7 +49,9 @@ class TileSelector:
 
     @staticmethod
     def compute_domain_consensus(
-        domain_values: List, mode: Literal["all_same", "all_different"]
+        domain_values: List,
+        mode: Literal["all_same", "all_different", "at_least", "exactly", "at_most"] = "all_same",
+        min_agreement: int | None = None,
     ) -> object:
         """Compute consensus domain label from multiple annotations.
         
@@ -56,7 +60,15 @@ class TileSelector:
         domain_values : list
             Values from all domain columns for a single tile.
         mode : str
-            'all_same' requires all identical, 'all_different' requires all unique.
+            Agreement mode:
+            - 'all_same': all values must be identical
+            - 'all_different': all values must be unique
+            - 'at_least': at least min_agreement values must match
+            - 'exactly': exactly min_agreement values must match
+            - 'at_most': at most min_agreement values must match
+        min_agreement : int or None
+            Threshold for 'at_least', 'exactly', 'at_most' modes.
+            Defaults to len(domain_values) if not specified.
         
         Returns
         -------
@@ -65,11 +77,21 @@ class TileSelector:
         """
         counter = Counter(domain_values)
         most_common, count = counter.most_common(1)[0]
+        n_values = len(domain_values)
 
         if mode == "all_same":
-            return most_common if count == len(domain_values) else None
+            return most_common if count == n_values else None
         elif mode == "all_different":
             return "all_different" if count == 1 else None
+        elif mode == "at_least":
+            threshold = min_agreement if min_agreement is not None else n_values
+            return most_common if count >= threshold else None
+        elif mode == "exactly":
+            threshold = min_agreement if min_agreement is not None else n_values
+            return most_common if count == threshold else None
+        elif mode == "at_most":
+            threshold = min_agreement if min_agreement is not None else n_values
+            return most_common if count <= threshold else None
         return None
 
     def extract_domain_columns(self, tiles_gdf: pd.DataFrame) -> List[np.ndarray]:
@@ -89,7 +111,11 @@ class TileSelector:
         consensus = []
         for i in range(len(domains_list[0])):
             domain_values = [d[i] for d in domains_list]
-            label = self.compute_domain_consensus(domain_values, self.agreement_mode)
+            label = self.compute_domain_consensus(
+                domain_values, 
+                mode=self.agreement_mode,
+                min_agreement=self.min_agreement
+            )
             consensus.append(label)
         return np.array(consensus, dtype=object)
 
@@ -361,81 +387,3 @@ class TileSelector:
                 return False
 
         return True
-"    def select_tiles_per_domain(self) -> pd.DataFrame:
-        """
-        Run greedy diversity sampling independently within each domain.
-        
-        Returns:
-        - DataFrame with selected tiles per domain, ranked by domain_tile_rank
-        """
-        tile_table = self.meta_df
-        features = self.features
-        n = self.n_per_domain
-
-        if self.domain_col not in tile_table.columns:
-            raise KeyError(f"Expected column '{self.domain_col}' in tile_table.")
-
-        if features.shape[0] != len(tile_table):
-            raise ValueError(
-                "features and tile_table must have the same number of rows."
-            )
-
-        selected_rows = []
-
-        for dom in sorted(tile_table[self.domain_col].dropna().unique()):
-            df_dom = tile_table[tile_table[self.domain_col] == dom].reset_index(drop=True).copy()
-            if df_dom.empty:
-                continue
-
-            features_dom = features[df_dom.index.to_numpy()]
-            centroid_dom = df_dom[["cx", "cy"]].to_numpy()
-
-            if len(df_dom) <= 1:
-                chosen = list(range(len(df_dom)))
-            else:
-                chosen = self.greedy_diverse_subset(
-                    features_dom,
-                    centroid_dom,
-                    n=n,
-                )
-
-            if not chosen:
-                continue
-
-            df_sel = df_dom.iloc[chosen].copy()
-            df_sel["domain_tile_rank"] = np.arange(1, len(df_sel) + 1, dtype=int)
-            selected_rows.append(df_sel)
-
-        if not selected_rows:
-            return tile_table.iloc[0:0].copy()
-
-        selected_df = pd.concat(selected_rows, axis=0, ignore_index=True)
-        return selected_df
-
-
-    def check_min_distance(
-        self,
-        df: pd.DataFrame,
-        min_distance_px: float,
-    ) -> bool:
-        """
-        Verify that all selected tiles within each domain are at least `min_distance_px` apart.
-        """
-        if df.empty or min_distance_px <= 0:
-            return True
-
-        min_d2 = float(min_distance_px**2)
-
-        for _, group in df.groupby(self.domain_col):
-            coords = group[["cx", "cy"]].to_numpy()
-            if len(coords) <= 1:
-                continue
-
-            diff = coords[:, None, :] - coords[None, :, :]
-            d2 = np.sum(diff**2, axis=2)
-            mask = np.triu(np.ones_like(d2, dtype=bool), k=1)
-            if mask.any() and np.any(d2[mask] < min_d2):
-                return False
-
-        return True
-    
