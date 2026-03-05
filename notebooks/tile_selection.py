@@ -16,8 +16,6 @@ class TileSelector:
         on_fail: Literal["stop", "relax"] = "relax",
         agreement_mode: Literal["all_same", "all_different"] = "all_same",
         ) -> None:
-        # TODO: add options, at_lest, exactly, at_most for agreement_mode, with n_agreement parameter
-        
         self.wsi = wsi
         self.feature_key = feature_key
         self.domain_keys = [domain_keys] if isinstance(domain_keys, str) else domain_keys
@@ -47,53 +45,76 @@ class TileSelector:
 
         return tiles_gdf, features
 
-    def load_tile_table(self):
+    @staticmethod
+    def compute_domain_consensus(
+        domain_values: List, mode: Literal["all_same", "all_different"]
+    ) -> object:
+        """Compute consensus domain label from multiple annotations.
+        
+        Parameters
+        ----------
+        domain_values : list
+            Values from all domain columns for a single tile.
+        mode : str
+            'all_same' requires all identical, 'all_different' requires all unique.
+        
+        Returns
+        -------
+        object or None
+            Consensus label or None if agreement condition not met.
         """
-        Build a per-tile table with domain labels, centroids and features.
-        """
-        tiles_gdf, features = self.get_features_and_tiles()
+        counter = Counter(domain_values)
+        most_common, count = counter.most_common(1)[0]
 
+        if mode == "all_same":
+            return most_common if count == len(domain_values) else None
+        elif mode == "all_different":
+            return "all_different" if count == 1 else None
+        return None
+
+    def extract_domain_columns(self, tiles_gdf: pd.DataFrame) -> List[np.ndarray]:
+        """Extract domain column arrays from GeoDataFrame."""
         domains_list = []
         for dom_key in self.domain_keys:
-            if dom_key in tiles_gdf.columns:
-                domains_list.append(tiles_gdf[dom_key].to_numpy())
-            else:
-                raise KeyError(
-                    f"Domain key '{dom_key}' not found in tile GeoDataFrame."
-                )
+            if dom_key not in tiles_gdf.columns:
+                raise KeyError(f"Domain key '{dom_key}' not found.")
+            domains_list.append(tiles_gdf[dom_key].to_numpy())
+        return domains_list
 
-        if len(self.domain_keys) == 1:
-            domains = domains_list[0]
-        else:
-            domains = []
-            for i in range(len(tiles_gdf)):
-                domain_values = [d[i] for d in domains_list]
-                counter = Counter(domain_values)
-                max_count = counter.most_common(1)[0][1]
-                if self.agreement_mode == "all_same":
-                    if max_count == len(self.domain_keys):
-                        consensus = counter.most_common(1)[0][0]
-                    else:
-                        consensus = None
-                elif self.agreement_mode == "all_different":
-                    if max_count == 1:
-                        consensus = "all_different"
-                    else:
-                        consensus = None
-                domains.append(consensus)
-            domains = np.array(domains, dtype=object)
+    def collapse_domains(self, domains_list: List[np.ndarray]) -> np.ndarray:
+        """Collapse multiple domain annotations into consensus labels."""
+        if len(domains_list) == 1:
+            return domains_list[0]
 
+        consensus = []
+        for i in range(len(domains_list[0])):
+            domain_values = [d[i] for d in domains_list]
+            label = self.compute_domain_consensus(domain_values, self.agreement_mode)
+            consensus.append(label)
+        return np.array(consensus, dtype=object)
+
+    @staticmethod
+    def extract_centroids(tiles_gdf: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+        """Extract (x, y) coordinates from geometry column."""
         centroids = tiles_gdf["geometry"].centroid
-        cx = centroids.x.to_numpy()
-        cy = centroids.y.to_numpy()
+        return centroids.x.to_numpy(), centroids.y.to_numpy()
 
+    @staticmethod
+    def extract_tile_ids(tiles_gdf: pd.DataFrame) -> np.ndarray | None:
+        """Extract tile_id column if present."""
+        return tiles_gdf["tile_id"].to_numpy() if "tile_id" in tiles_gdf.columns else None
+
+    def build_meta_df(
+        self,
+        tiles_gdf: pd.DataFrame,
+        domains: np.ndarray,
+        cx: np.ndarray,
+        cy: np.ndarray,
+        tile_id: np.ndarray | None = None,
+    ) -> pd.DataFrame:
+        """Build metadata table with domains, centroids, and tile indices."""
         tile_idx = np.arange(len(tiles_gdf), dtype=int)
-
-        tile_id = None
-        if "tile_id" in tiles_gdf.columns:
-            tile_id = tiles_gdf["tile_id"].to_numpy()
-
-        meta_df = pd.DataFrame(
+        return pd.DataFrame(
             {
                 **({"tile_id": tile_id} if tile_id is not None else {}),
                 "tile_idx": tile_idx,
@@ -103,9 +124,20 @@ class TileSelector:
             }
         )
 
+    def load_tile_table(self):
+        """Build a per-tile table with domain labels, centroids, and features."""
+        tiles_gdf, features = self.get_features_and_tiles()
+
+        domains_list = self.extract_domain_columns(tiles_gdf)
+        domains = self.collapse_domains(domains_list)
+        cx, cy = self.extract_centroids(tiles_gdf)
+        tile_id = self.extract_tile_ids(tiles_gdf)
+        meta_df = self.build_meta_df(tiles_gdf, domains, cx, cy, tile_id)
+
         self.meta_df = meta_df
         self.features = features
         self.centroids = np.stack([cx, cy], axis=1)
+        self.domain_col = "domain" if len(self.domain_keys) > 1 else self.domain_keys[0]
 
         return meta_df, features
 
@@ -121,32 +153,87 @@ class TileSelector:
         std_safe = np.where(std == 0, 1.0, std)
         return (features - mean) / std_safe
 
-    def greedy_diverse_subset(self, features: np.ndarray, centroid: np.ndarray, n: int) -> List[int]:
+    @staticmethod
+    def squared_euclidean_distances(coords1: np.ndarray, coords2: np.ndarray) -> np.ndarray:
+        """Compute pairwise squared Euclidean distances (faster, used for constraints).
+        
+        Parameters
+        ----------
+        coords1 : (n, d)
+            First set of coordinates.
+        coords2 : (m, d)
+            Second set of coordinates.
+        
+        Returns
+        -------
+        distances_squared : (n, m)
+            Pairwise squared distances.
         """
-        Greedy diversity sampling with minimum spatial distance constraint enforced during selection.
+        diff = coords1[:, None, :] - coords2[None, :, :]
+        return np.sum(diff**2, axis=2)
+
+    @staticmethod
+    def satisfies_distance_constraint(
+        candidate_coords: np.ndarray,
+        selected_coords: np.ndarray,
+        min_distance: float,
+    ) -> bool:
+        """Check if a candidate location satisfies minimum distance constraint.
+        
+        Parameters
+        ----------
+        candidate_coords : (2,)
+            Coordinates of the candidate tile.
+        selected_coords : (n, 2)
+            Coordinates of already-selected tiles.
+        min_distance : float
+            Minimum required distance.
+        
+        Returns
+        -------
+        bool
+            True if the candidate is at least `min_distance` away from all
+            selected tiles, False otherwise.
+        """
+        if min_distance <= 0 or selected_coords.shape[0] == 0:
+            return True
+        distances_sq = TileSelector.squared_euclidean_distances(
+            candidate_coords.reshape(1, -1),
+            selected_coords,
+        )
+        return np.min(distances_sq) >= (min_distance**2)
+
+    def greedy_diverse_subset(self, features: np.ndarray, centroid: np.ndarray, n: int) -> List[int]:
+        """Greedy diversity sampling with spatial distance constraint.
         
         For each selection step, candidates are ranked by diversity score and selected in order
         of decreasing diversity, with the first candidate that meets the spatial distance
         constraint being chosen.
 
-        Parameters:
-        - features: Feature matrix (m x d)
-        - centroids: Centroid coordinates (m x 2)
-        - n: Number of tiles to select
+        Parameters
+        ----------
+        features : (m, d)
+            Feature matrix.
+        centroid : (m, 2)
+            Centroid coordinates.
+        n : int
+            Number of tiles to select.
 
-        Returns:
-        - List of indices of selected tiles
+        Returns
+        -------
+        list of int
+            Indices of selected tiles.
         """
         m = features.shape[0]
         if m == 0 or n <= 0:
             return []
-
         if m == 1:
             return [0]
 
         n = min(n, m)
         features_std = self.standardize_features(features)
 
+        # Start with the most "central" tile
         mean_vec = features_std.mean(axis=0, keepdims=True)
         d2_center = np.sum((features_std - mean_vec) ** 2, axis=1)
         first_idx = int(np.argmax(d2_center))
@@ -163,43 +250,34 @@ class TileSelector:
             if available_idx.size == 0:
                 break
 
-            # Compute diversity scores for all available candidates
+            # Compute diversity scores using feature distances
             features_sel = features_std[selected]
             features_cand = features_std[available_idx]
-            diff_f = features_cand[:, None, :] - features_sel[None, :, :]
-            d2_features = np.sum(diff_f**2, axis=2)
+            d2_features = self.squared_euclidean_distances(features_cand, features_sel)
 
             if self.score_mode == "sum":
                 diversity_scores = d2_features.sum(axis=1)
-            else:
+            else:  # "maxmin"
                 diversity_scores = d2_features.min(axis=1)
 
-            # Sort candidates by diversity score (highest first)
+            # Try candidates in order of decreasing diversity
             sorted_order = np.argsort(-diversity_scores)
             sorted_candidates = available_idx[sorted_order]
 
-            # Try candidates in order of decreasing diversity
-            selected_idx = None
             sel_coords = centroid[selected]
+            selected_idx = None
 
             for candidate_idx in sorted_candidates:
-                cand_coord = centroid[candidate_idx:candidate_idx+1]
+                cand_coord = centroid[candidate_idx]
                 
-                # Check spatial distance constraint
-                if current_min_distance > 0:
-                    diff = cand_coord - sel_coords
-                    d2 = np.sum(diff**2, axis=1)
-                    min_d2 = d2.min()
-                    
-                    if min_d2 >= (current_min_distance**2):
-                        selected_idx = candidate_idx
-                        break
-                else:
+                if self.satisfies_distance_constraint(
+                    cand_coord, sel_coords, current_min_distance
+                ):
                     selected_idx = candidate_idx
                     break
 
             if selected_idx is None:
-                # No candidate met the distance constraint
+                # Relax distance constraint or stop
                 if (
                     self.on_fail == "relax"
                     and current_min_distance > base_min_distance * 0.3
@@ -214,7 +292,76 @@ class TileSelector:
 
         return selected
 
+    def select_tiles_for_domain(
+        self, domain_value: object, df_dom: pd.DataFrame
+    ) -> pd.DataFrame | None:
+        """Select tiles within a single domain."""
+        if df_dom.empty:
+            return None
+
+        features_dom = self.features[df_dom["tile_idx"].to_numpy()]
+        centroid_dom = df_dom[["cx", "cy"]].to_numpy()
+
+        if len(df_dom) <= 1:
+            chosen = list(range(len(df_dom)))
+        else:
+            chosen = self.greedy_diverse_subset(features_dom, centroid_dom, n=self.n_per_domain)
+
+        if not chosen:
+            return None
+
+        df_sel = df_dom.iloc[chosen].copy()
+        df_sel["domain_tile_rank"] = np.arange(1, len(df_sel) + 1, dtype=int)
+        return df_sel
+
+    def iterate_domains(self, tile_table: pd.DataFrame) -> list:
+        """Get sorted unique domain values (excluding None)."""
+        return sorted(tile_table[self.domain_col].dropna().unique())
+
     def select_tiles_per_domain(self) -> pd.DataFrame:
+        """Run selection independently within each domain."""
+        tile_table = self.meta_df
+        selected_rows = []
+
+        for domain_value in self.iterate_domains(tile_table):
+            df_dom = (
+                tile_table[tile_table[self.domain_col] == domain_value]
+                .reset_index(drop=True)
+                .copy()
+            )
+            result = self.select_tiles_for_domain(domain_value, df_dom)
+            if result is not None:
+                selected_rows.append(result)
+
+        if not selected_rows:
+            return tile_table.iloc[0:0].copy()
+
+        return pd.concat(selected_rows, axis=0, ignore_index=True)
+
+    def check_min_distance(
+        self,
+        df: pd.DataFrame,
+        min_distance_px: float,
+    ) -> bool:
+        """Verify all selected tiles within each domain meet the distance constraint."""
+        if df.empty or min_distance_px <= 0:
+            return True
+
+        min_d2 = float(min_distance_px**2)
+        domain_col = self.domain_col
+
+        for _, group in df.groupby(domain_col):
+            coords = group[["cx", "cy"]].to_numpy()
+            if len(coords) <= 1:
+                continue
+
+            d2 = self.squared_euclidean_distances(coords, coords)
+            mask = np.triu(np.ones_like(d2, dtype=bool), k=1)
+            if mask.any() and np.any(d2[mask] < min_d2):
+                return False
+
+        return True
+"    def select_tiles_per_domain(self) -> pd.DataFrame:
         """
         Run greedy diversity sampling independently within each domain.
         
