@@ -2,7 +2,6 @@
 Attention-Based Multiple Instance Learning (ABMIL) for Whole Slide Image Classification.
 Assumes multi-class, single-label classification.
 """
-# TODO: tqdm progress bars
 # TODO: check parameters for ABMIL (hidden_dim, learning rate, etc.) for loading/saving model
 
 import os
@@ -281,15 +280,23 @@ def view_slide_attention(model, dataset, slide_idx, feature_key, filename_col, z
 
 
 
-def save_model(model, save_path):
+def save_model(model, model_name):
     """
-    Save the trained ABMIL model to disk.
+    Save the trained ABMIL model to disk with auto-generated filename including model parameters.
     
     Args:
         model (ABMIL): Trained ABMIL model
-        save_path (str): Path to save the model (e.g., 'models/abmil_model.pth')
+        model_name (str): Base name for the model (e.g., 'manualname')
+        save_dir (str): Directory to save the model (default: 'models/')
     """
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    in_dim = model.classifier.in_features
+    n_classes = model.classifier.out_features
+    hidden_dim = model.attn[0].out_features
+    
+    filename = f"{model_name}_{in_dim}_{n_classes}_{hidden_dim}.pth"
+    save_path = os.path.join("models/", filename)
+    
+    os.makedirs("models/", exist_ok=True)
     torch.save(model.state_dict(), save_path)
     print(f"Model saved to {save_path}")
 
