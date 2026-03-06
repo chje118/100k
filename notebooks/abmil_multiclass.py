@@ -88,9 +88,19 @@ class ABMIL(nn.Module):
 
         return logits, A
     
-def train_ABMIL(train_df, train_dataset, label_col, n_epochs=10):
-    # DataLoader: decides when items are loaded, handles shuffling and batching
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+def train_ABMIL(train_df, train_dataset, label_col, n_epochs=10, class_weights=None):
+    """
+    Train ABMIL model with optional class weights for handling class imbalance.
+    
+    Parameters:
+    - train_df: DataFrame with training data
+    - train_dataset: ZarrSlideDataset instance
+    - label_col: Column name for labels
+    - n_epochs: Number of training epochs
+    - class_weights: Optional tensor of class weights (shape: [n_classes])
+                   Higher weights give more importance to that class during training.
+                   Useful for handling class imbalance or emphasizing severe classes.
+    """
 
     # Extract Feature Dimension and Number of Classes
     sample_feats, _, _ = train_dataset[0]
@@ -105,7 +115,15 @@ def train_ABMIL(train_df, train_dataset, label_col, n_epochs=10):
 
     # Create Optimizer and Loss Function
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    loss_fn = torch.nn.CrossEntropyLoss()
+    if class_weights is not None:
+        if isinstance(class_weights, (list, np.ndarray)):
+            class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
+        elif isinstance(class_weights, torch.Tensor):
+            class_weights = class_weights.to(device)
+        loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights)
+        print(f"Using class weights: {class_weights.cpu().numpy()}")
+    else:
+        loss_fn = torch.nn.CrossEntropyLoss()
 
     # Training Loop
     for epoch in tqdm(range(n_epochs), desc="Epochs"):
@@ -148,6 +166,59 @@ def train_ABMIL(train_df, train_dataset, label_col, n_epochs=10):
         print(f"Epoch {epoch+1}/{n_epochs} | Loss: {total_loss:.4f}")
 
     return model
+
+
+def compute_class_weights(train_df, label_col, method="balanced"):
+    """
+    Compute class weights for handling class imbalance in ABMIL training.
+    
+    Parameters:
+    - train_df: DataFrame with training data
+    - label_col: Column name for labels
+    - method: Weighting strategy
+        - "balanced": Inverse frequency weighting (sklearn-like)
+        - "severity": Custom weights for different severity levels
+        - "manual": Return template for manual specification
+    
+    Returns:
+    - torch.Tensor: Class weights tensor
+    """
+    labels = train_df[label_col].values
+    n_classes = len(np.unique(labels))
+    class_counts = np.bincount(labels, minlength=n_classes)
+    
+    if method == "balanced":
+        # Inverse frequency weighting (sklearn.utils.class_weight.compute_class_weight)
+        weights = len(labels) / (n_classes * class_counts)
+        weights = weights / weights.sum() * n_classes  # Normalize so mean weight = 1
+        
+    elif method == "severity":
+        # Example: Assume higher class indices are more severe
+        # Customize this based on your specific severity mapping
+        severity_weights = np.array([1.0, 2.0, 3.0, 4.0])  # Example for 4 classes
+        if len(severity_weights) != n_classes:
+            print(f"WARNING: Severity weights ({len(severity_weights)}) don't match n_classes ({n_classes})")
+            print("Using balanced weights instead")
+            weights = len(labels) / (n_classes * class_counts)
+        else:
+            weights = severity_weights
+            
+    elif method == "manual":
+        print("Manual class weights template:")
+        print(f"Number of classes: {n_classes}")
+        print(f"Class counts: {class_counts}")
+        print("Example weights (modify as needed):")
+        template_weights = np.ones(n_classes)
+        for i in range(n_classes):
+            print(f"  Class {i}: weight = {template_weights[i]:.2f} (count: {class_counts[i]})")
+        return None
+    
+    else:
+        raise ValueError(f"Unknown method: {method}. Use 'balanced', 'severity', or 'manual'")
+    
+    weights_tensor = torch.tensor(weights, dtype=torch.float)
+    print(f"Computed {method} class weights: {weights}")
+    return weights_tensor
 
 
 def validate_ABMIL(model, val_dataset):
