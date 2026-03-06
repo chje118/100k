@@ -241,6 +241,78 @@ class SNOMEDHierarchy:
         self._rebuild_code_to_region()
         self._check_codes_preserved(affected_codes)
     
+    def fine_split(self, original_region, subregion_map):
+        """ Perform a fine-grained split using explicit prefixes or existing subregions."""
+        if original_region not in self.edited_hierarchy:
+            print(f"Region {original_region} not found.")
+            return
+
+        original_subregions = self.edited_hierarchy[original_region]["subregions"]
+        affected_codes = []
+
+        def _collect_codes(identifier):
+            # strip trailing plus signs which are often used in labels
+            base = identifier.rstrip("+")
+            codes = []
+            if base in original_subregions:
+                codes.extend([c["code"] for c in original_subregions[base]["codes"]])
+            else:
+                for subdict in original_subregions.values():
+                    for c in subdict["codes"]:
+                        if isinstance(c["code"], str) and c["code"].startswith(base):
+                            codes.append(c["code"])
+            if not codes:
+                print(f"Warning: identifier '{identifier}' matched no codes in region {original_region}")
+            return codes
+
+        # identify all codes that will move
+        for id_list in subregion_map.values():
+            for ident in id_list:
+                affected_codes.extend(_collect_codes(ident))
+
+        # build new regions
+        for new_region, identifiers in subregion_map.items():
+            new_subregions = {}
+            for ident in identifiers:
+                base = ident.rstrip("+")
+                if base in original_subregions:
+                    # reuse existing subregion
+                    new_subregions[base] = original_subregions[base]
+                else:
+                    for subkey, subdict in list(original_subregions.items()):
+                        matching = [c for c in subdict["codes"]
+                                    if isinstance(c["code"], str) and c["code"].startswith(base)]
+                        if matching:
+                            if base not in new_subregions:
+                                new_subregions[base] = {"name": matching[0]["text"], "codes": []}
+                            new_subregions[base]["codes"].extend(matching)
+            if new_subregions:
+                new_name = next(iter(new_subregions.values()))["name"]
+                self.edited_hierarchy[new_region] = {
+                    "name": new_name,
+                    "subregions": new_subregions
+                }
+
+        # remove moved codes from original region
+        for ident in sum(subregion_map.values(), []):
+            base = ident.rstrip("+")
+            if base in original_subregions:
+                del original_subregions[base]
+            else:
+                for subkey in list(original_subregions.keys()):
+                    remaining = [c for c in original_subregions[subkey]["codes"]
+                                 if not (isinstance(c["code"], str) and c["code"].startswith(base))]
+                    if remaining:
+                        original_subregions[subkey]["codes"] = remaining
+                    else:
+                        del original_subregions[subkey]
+
+        if not original_subregions:
+            del self.edited_hierarchy[original_region]
+
+        self._rebuild_code_to_region()
+        self._check_codes_preserved(affected_codes)
+    
     def list_main_regions(self, edited=False):
         """List only main regions with total number of codes in parentheses."""
         hierarchy = self.edited_hierarchy if edited else self.hierarchy
