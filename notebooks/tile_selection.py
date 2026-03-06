@@ -3,8 +3,8 @@ import numpy as np
 import pandas as pd
 from collections import Counter
 import matplotlib.pyplot as plt
-
 from wsidata import open_wsi
+import lazyslide as zs
 
 class TileSelector:
     def __init__(
@@ -147,6 +147,7 @@ class TileSelector:
         self.meta_df = meta_df
         self.features = features
         self.centroids = np.stack([cx, cy], axis=1)
+        # If multiple domain keys, use "domain" as the column name for consensus; otherwise use the single domain key
         self.domain_col = "domain" if len(self.domain_keys) > 1 else self.domain_keys[0]
 
         return meta_df, features
@@ -386,19 +387,12 @@ class TileSelector:
         return ax
     
     def zoom_to_selected(self, selected: pd.DataFrame):
+        raise NotImplementedError("Zooming to selected tiles is not implemented yet.")
         """ Visualize selected tiles with zoomed-in view. """
         # TODO: domain_consensus column added to the tile table 
         # TODO: zoom to selected tiles 
-        viewer = zs.pl.WSIViewer(wsi)
-        viewer.add_tiles(
-            key=tile_key,
-            feature_key=feature_key,
-            color_by='domain_consensus',
-            style='heatmap',
-            alpha=0.6
-        )
-        viewer.show()
-    
+        # viewer = zs.pl.WSIViewer(wsi)
+        # viewer.show()
  
 
 if __name__ == "__main__":
