@@ -387,7 +387,7 @@ class TileSelector:
         return ax
 
 if __name__ == "__main__":
-    import open_wsi
+    from wsidata import open_wsi
 
     slide_path = "path/to/slide.mrxs"
     zarr_path = "path/to/slide.zarr"
