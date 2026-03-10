@@ -1,3 +1,10 @@
+import torch
+import numpy as np
+import os
+import lazyslide as zs
+from wsidata import open_wsi
+import pandas as pd
+
 def view_slide_attention(model, dataset, slide_idx, feature_key, filename_col, zarr_dir, tile_key='tiles_224',
                          zoom_top_k: int = 5, zoom_margin: float = 0):
     """ Visualize a slide's attention heatmap and optionally zoom in on high-attention regions.
