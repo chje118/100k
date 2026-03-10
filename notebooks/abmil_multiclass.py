@@ -277,7 +277,25 @@ def confusion_matrix_report(all_labels, all_preds):
     plt.show()
 
 
-def view_slide_attention(model, dataset, slide_idx, feature_key, filename_col, zarr_dir, tile_key='tiles_224'):
+def view_slide_attention(model, dataset, slide_idx, feature_key, filename_col, zarr_dir, tile_key='tiles_224',
+                         zoom_top_k: int = 5, zoom_margin: float = 0, zoom_method="top_k"):
+    """ Visualize a slide's attention heatmap and optionally zoom in on high-attention regions.
+
+    Parameters:
+        model (ABMIL): trained attention-based MIL model
+        dataset: instance of ZarrSlideDataset or a Subset thereof
+        slide_idx (int): index of slide within the dataset to visualize
+        feature_key (str): key used to lookup features in the Zarr tables
+        filename_col (str): column name in dataframe containing slide paths
+        zarr_dir (str): directory where corresponding .zarr folders live
+        tile_key (str): tile key to display (default: 'tiles_224')
+        zoom_top_k (int): number of highest-attention tiles to bound for zooming.
+            Set to ``None`` or ``0`` to disable automatic zooming.
+        zoom_margin (float): extra padding (pixels) around computed bounding box.
+        zoom_method (str): method for zooming ('top_k' or 'top_concentration').
+            'top_k' zooms to the bounding box of the top K attention tiles.
+            'top_concentration' to be implemented
+    """
     model.eval()
     device = next(model.parameters()).device
 
@@ -339,12 +357,78 @@ def view_slide_attention(model, dataset, slide_idx, feature_key, filename_col, z
         cmap='hot',
         alpha=0.8
     )
+
+    # optionally add a zoom around the top attention tiles
+    if zoom_top_k and zoom_top_k > 0:
+        if zoom_method == "top_k":
+            add_top_k_zoom(viewer, adata, A_normalized, tile_key, wsi, zoom_top_k, zoom_margin)
+        else:
+            add_top_concentration_zoom(viewer, adata, A_normalized, tile_key, wsi, zoom_margin)
+
     viewer.show()
     
     print(f"Slide {slide_idx}: True Label={label}, Predicted Class={torch.argmax(logits).item()}")
     print(f"Attention weights - Min: {A_normalized.min():.4f}, Max: {A_normalized.max():.4f}, Mean: {A_normalized.mean():.4f}, Std: {A_normalized.std():.4f}")
     
     return A_normalized
+
+def add_top_k_zoom(viewer, adata, attention, tile_key, wsi, top_k, margin):
+    """ Add a zoom window around the highest-attention tiles.
+
+    Parameters:
+        viewer (zs.pl.WSIViewer): instance of the slide viewer
+        adata (anndata.AnnData): feature table with 'tile_id' column
+        attention (np.ndarray): attention weights, one per tile
+        tile_key (str): key for tile shapes in wsi.shapes
+        wsi: WSI object with tables
+        top_k (int): number of top tiles to include in the bounding box
+        margin (float or int): extra padding (in pixels) around the computed box
+    
+    Data Assumptions:
+    Attention weights in tables[feature_key].obs['attention'] with corresponding tile IDs in tables[feature_key].obs['tile_id']
+    Tile shapes in wsi.shapes[tile_key] with 'tile_id' column to match with feature table
+    Geometry of each tile in wsi.shapes[tile_key].obs['geometry'] as a Polygon
+    """
+
+    # select indices of top attention scores
+    if top_k >= len(attention):
+        top_idxs = np.arange(len(attention))
+    else:
+        top_idxs = np.argsort(attention)[-top_k:]
+
+    # get tile_ids for top attention tiles
+    top_tile_ids = adata.obs['tile_id'].iloc[top_idxs]
+
+    # get tile shapes
+    tile_adata = wsi.shapes[tile_key]
+    if 'tile_id' not in tile_adata.obs.columns:
+        print("add_top_k_zoom: 'tile_id' column not found in tile shapes; skipping zoom")
+        return
+
+    # find matching rows in tile table
+    tile_mask = tile_adata.obs['tile_id'].isin(top_tile_ids)
+    if not tile_mask.any():
+        print("add_top_k_zoom: no matching tiles found; skipping zoom")
+        return
+
+    tiles = tile_adata.obs[tile_mask]
+
+    # compute bounding box from tile geometries 
+    if 'geometry' in tiles.columns:
+        # Get bounds for each polygon: (minx, miny, maxx, maxy)
+        bounds = tiles['geometry'].apply(lambda p: p.bounds)
+        # bounds is a Series of tuples, unpack to find overall min/max
+        xmin = bounds.apply(lambda b: b[0]).min() - margin
+        ymin = bounds.apply(lambda b: b[1]).min() - margin
+        xmax = bounds.apply(lambda b: b[2]).max() + margin
+        ymax = bounds.apply(lambda b: b[3]).max() + margin
+        viewer.add_zoom(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax)
+    else:
+        print("add_top_k_zoom: 'geometry' column not found in tile shapes; skipping zoom")
+
+def add_top_concentration_zoom(viewer, adata, attention, tile_key, wsi, margin):
+    # to be implemented: compute zoom region based on attention concentration (e.g. using KDE or clustering)
+    raise NotImplementedError("Top concentration zoom method not implemented yet")
 
 
 def save_model(model, model_name):
@@ -412,14 +496,18 @@ if __name__ == "__main__":
         df=train_df, 
         filename_col=filename_col, 
         label_col=label_col, 
-        feature_key=feature_key
+        feature_key=feature_key,
+        tile_key="tiles_224",
+        zarr_dir=zarr_dir
     )
 
     val_dataset = ZarrSlideDataset(
         df=val_df,
         filename_col=filename_col,
         label_col=label_col,
-        feature_key=feature_key
+        feature_key=feature_key,
+        tile_key="tiles_224",
+        zarr_dir=zarr_dir
     )
 
     train_df = train_df.reset_index(drop=True)
@@ -429,4 +517,14 @@ if __name__ == "__main__":
     all_labels, all_preds = validate_ABMIL(model, val_dataset)
     confusion_matrix_report(all_labels, all_preds)
 
-    view_slide_attention(model, val_dataset, slide_idx=0, filename_col=filename_col, zarr_dir=zarr_dir)
+    # show attention heatmap and automatically zoom into top-k tiles
+    view_slide_attention(
+        model,
+        val_dataset,
+        slide_idx=0,
+        filename_col=filename_col,
+        zarr_dir=zarr_dir,
+        zoom_top_k=5,
+        zoom_margin=50,
+        zoom_kwargs={"edgecolor": "cyan", "alpha": 0.3}
+    )
