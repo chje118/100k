@@ -119,7 +119,7 @@ class SlideAttention:
         
         cols = 2
         rows = math.ceil(top_k / cols)
-        fig, axes = plt.subplots(rows, cols, figsize=(cols, rows))
+        fig, axes = plt.subplots(rows, cols, figsize=(6*cols, 4*rows))
 
         axes = axes.flatten()
         
