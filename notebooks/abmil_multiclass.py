@@ -16,7 +16,6 @@ import matplotlib.pyplot as plt
 import lazyslide as zs
 from tqdm import tqdm
 
-
 class ZarrSlideDataset(Dataset):
     def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir):
         self.df = df.reset_index(drop=True)
@@ -88,7 +87,7 @@ class ABMIL(nn.Module):
 
         return logits, A
     
-def train_ABMIL(train_df, train_dataset, label_col, n_epochs=10, class_weights=None):
+def train_ABMIL(train_df, train_dataset, label_col, n_epochs=10, class_weights = None):
     """
     Train ABMIL model with optional class weights for handling class imbalance.
     
@@ -101,6 +100,8 @@ def train_ABMIL(train_df, train_dataset, label_col, n_epochs=10, class_weights=N
                    Higher weights give more importance to that class during training.
                    Useful for handling class imbalance or emphasizing severe classes.
     """
+    # DataLoader: decides when items are loaded, handles shuffling and batching
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
 
     # Extract Feature Dimension and Number of Classes
     sample_feats, _, _ = train_dataset[0]
@@ -115,11 +116,10 @@ def train_ABMIL(train_df, train_dataset, label_col, n_epochs=10, class_weights=N
 
     # Create Optimizer and Loss Function
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    
+    # If class weights are provided, convert to tensor and use in CrossEntropyLoss
     if class_weights is not None:
-        if isinstance(class_weights, (list, np.ndarray)):
-            class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
-        elif isinstance(class_weights, torch.Tensor):
-            class_weights = class_weights.to(device)
+        class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
         loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights)
         print(f"Using class weights: {class_weights.cpu().numpy()}")
     else:
@@ -166,59 +166,6 @@ def train_ABMIL(train_df, train_dataset, label_col, n_epochs=10, class_weights=N
         print(f"Epoch {epoch+1}/{n_epochs} | Loss: {total_loss:.4f}")
 
     return model
-
-
-def compute_class_weights(train_df, label_col, method="balanced"):
-    """
-    Compute class weights for handling class imbalance in ABMIL training.
-    
-    Parameters:
-    - train_df: DataFrame with training data
-    - label_col: Column name for labels
-    - method: Weighting strategy
-        - "balanced": Inverse frequency weighting (sklearn-like)
-        - "severity": Custom weights for different severity levels
-        - "manual": Return template for manual specification
-    
-    Returns:
-    - torch.Tensor: Class weights tensor
-    """
-    labels = train_df[label_col].values
-    n_classes = len(np.unique(labels))
-    class_counts = np.bincount(labels, minlength=n_classes)
-    
-    if method == "balanced":
-        # Inverse frequency weighting (sklearn.utils.class_weight.compute_class_weight)
-        weights = len(labels) / (n_classes * class_counts)
-        weights = weights / weights.sum() * n_classes  # Normalize so mean weight = 1
-        
-    elif method == "severity":
-        # Example: Assume higher class indices are more severe
-        # Customize this based on your specific severity mapping
-        severity_weights = np.array([1.0, 2.0, 3.0, 4.0])  # Example for 4 classes
-        if len(severity_weights) != n_classes:
-            print(f"WARNING: Severity weights ({len(severity_weights)}) don't match n_classes ({n_classes})")
-            print("Using balanced weights instead")
-            weights = len(labels) / (n_classes * class_counts)
-        else:
-            weights = severity_weights
-            
-    elif method == "manual":
-        print("Manual class weights template:")
-        print(f"Number of classes: {n_classes}")
-        print(f"Class counts: {class_counts}")
-        print("Example weights (modify as needed):")
-        template_weights = np.ones(n_classes)
-        for i in range(n_classes):
-            print(f"  Class {i}: weight = {template_weights[i]:.2f} (count: {class_counts[i]})")
-        return None
-    
-    else:
-        raise ValueError(f"Unknown method: {method}. Use 'balanced', 'severity', or 'manual'")
-    
-    weights_tensor = torch.tensor(weights, dtype=torch.float)
-    print(f"Computed {method} class weights: {weights}")
-    return weights_tensor
 
 
 def validate_ABMIL(model, val_dataset):
@@ -278,7 +225,7 @@ def confusion_matrix_report(all_labels, all_preds):
 
 
 def view_slide_attention(model, dataset, slide_idx, feature_key, filename_col, zarr_dir, tile_key='tiles_224',
-                         zoom_top_k: int = 5, zoom_margin: float = 0, zoom_method="top_k"):
+                         zoom_top_k: int = 5, zoom_margin: float = 0):
     """ Visualize a slide's attention heatmap and optionally zoom in on high-attention regions.
 
     Parameters:
@@ -292,9 +239,6 @@ def view_slide_attention(model, dataset, slide_idx, feature_key, filename_col, z
         zoom_top_k (int): number of highest-attention tiles to bound for zooming.
             Set to ``None`` or ``0`` to disable automatic zooming.
         zoom_margin (float): extra padding (pixels) around computed bounding box.
-        zoom_method (str): method for zooming ('top_k' or 'top_concentration').
-            'top_k' zooms to the bounding box of the top K attention tiles.
-            'top_concentration' to be implemented
     """
     model.eval()
     device = next(model.parameters()).device
@@ -360,10 +304,7 @@ def view_slide_attention(model, dataset, slide_idx, feature_key, filename_col, z
 
     # optionally add a zoom around the top attention tiles
     if zoom_top_k and zoom_top_k > 0:
-        if zoom_method == "top_k":
-            add_top_k_zoom(viewer, adata, A_normalized, tile_key, wsi, zoom_top_k, zoom_margin)
-        else:
-            add_top_concentration_zoom(viewer, adata, A_normalized, tile_key, wsi, zoom_margin)
+        add_top_k_zoom(viewer, adata, A_normalized, tile_key, wsi, zoom_top_k, zoom_margin)
 
     viewer.show()
     
@@ -425,10 +366,6 @@ def add_top_k_zoom(viewer, adata, attention, tile_key, wsi, top_k, margin):
         viewer.add_zoom(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax)
     else:
         print("add_top_k_zoom: 'geometry' column not found in tile shapes; skipping zoom")
-
-def add_top_concentration_zoom(viewer, adata, attention, tile_key, wsi, margin):
-    # to be implemented: compute zoom region based on attention concentration (e.g. using KDE or clustering)
-    raise NotImplementedError("Top concentration zoom method not implemented yet")
 
 
 def save_model(model, model_name):
@@ -576,7 +513,7 @@ if __name__ == "__main__":
     train_df = train_df.reset_index(drop=True)
     val_df = val_df.reset_index(drop=True)
     
-    model = train_ABMIL(train_df, train_dataset, label_col, n_epochs=10)
+    model = train_ABMIL(train_df, train_dataset, label_col, n_epochs=10, class_weights=[1.0, 2.0, 3.0])
     all_labels, all_preds = validate_ABMIL(model, val_dataset)
     confusion_matrix_report(all_labels, all_preds)
 
