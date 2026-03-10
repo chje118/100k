@@ -4,6 +4,8 @@ import os
 import lazyslide as zs
 from wsidata import open_wsi
 import pandas as pd
+import matplotlib.pyplot as plt
+import math
 
 
 class SlideAttention:
@@ -79,7 +81,7 @@ class SlideAttention:
         if 'tile_id' not in tile_adata.columns or 'geometry' not in tile_adata.columns:
             raise ValueError("Tile shapes must have 'tile_id' and 'geometry' columns")
         
-        tile_df = tile_adata.obs[['tile_id', 'geometry']].copy()
+        tile_df = tile_adata[['tile_id', 'geometry']].copy()
 
         return tile_df
     
@@ -95,8 +97,8 @@ class SlideAttention:
         )
         viewer.show()
     
-    def select_top_tiles(self, n_tiles=10, min_distance_px=500.0):    
-       # Merge attention scores with tile geometries
+    def select_top_tiles(self, n_tiles=10):   
+        # Merge attention scores with tile geometries
         attention_df = self._get_attention_df()
         tile_df = self._get_tile_df()        
         merged = pd.merge(attention_df, tile_df, on='tile_id', how='inner')
@@ -106,41 +108,22 @@ class SlideAttention:
 
         # Sort by attention descending
         merged = merged.sort_values('attention', ascending=False)
-
-        # Compute centroids for distance calculations
-        merged['centroid'] = merged['geometry'].apply(lambda p: p.centroid)
-
-        selected_tiles = []
-        for _, row in merged.iterrows():
-            if len(selected_tiles) >= n_tiles:
-                break
-            if not selected_tiles:
-                selected_tiles.append(row)
-            else:
-                # Check distance to already selected tiles
-                distances = [row['centroid'].distance(sel['centroid']) for sel in selected_tiles]
-                if all(dist > min_distance_px for dist in distances):
-                    selected_tiles.append(row)
-
+        
+        # Select top N tiles
+        selected_tiles = merged.head(n_tiles)
+        
         return pd.DataFrame(selected_tiles)
                 
-    def attention_top_k_zoom(self, top_k=5, margin=100):
+    def top_k_zoom(self, top_k=5, margin=0):
         selected_tiles = self.select_top_tiles(n_tiles=top_k)
         
-        viewer = zs.pl.WSIViewer(self.wsi)
+        cols = 2
+        rows = math.ceil(top_k / cols)
+        fig, axes = plt.subplots(rows, cols, figsize=(cols, rows))
 
-        viewer.add_tiles(
-            key=self.tile_key,
-            feature_key=self.feature_key,
-            color_by='attention',
-            style='heatmap',
-            cmap='hot',
-            alpha=0.8
-        )
-
-        for _, row in selected_tiles.iterrows():
-            print(f"Selected Tile ID: {row['tile_id']}, Attention: {row['attention']:.4f}")
-
+        axes = axes.flatten()
+        
+        for i, (_, row) in enumerate(selected_tiles.iterrows()):
             if 'geometry' not in row:
                 continue
 
@@ -157,6 +140,10 @@ class SlideAttention:
             xmax = maxx + margin
             ymax = maxy + margin
 
-            viewer.add_zoom(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax)
-        
-        viewer.show()
+            zs.pl.tiles(self.wsi, tile_key=self.tile_key, zoom = (xmin, xmax, ymin, ymax), ax=axes[i])
+
+        for j in range(i + 1, len(axes)):
+            axes[j].axis("off")
+    
+        plt.tight_layout()
+        plt.show()
