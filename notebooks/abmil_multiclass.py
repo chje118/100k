@@ -473,6 +473,69 @@ def load_model(model_path, in_dim, n_classes, hidden_dim=256):
     print(f"Model successfully loaded")
     return model
 
+class ABMILTileSelector:
+    def __init__(self, wsi, feature_key, tile_key='tiles_224', n_tiles=10, min_distance_px=500.0):
+        self.wsi = wsi
+        self.tile_key = tile_key
+        self.feature_key = feature_key
+        self.n_tiles = n_tiles
+        self.min_distance_px = min_distance_px
+
+    def _get_attention_df(self):
+        feature_adata = self.wsi.tables[self.feature_key]
+        if 'attention' not in feature_adata.obs.columns or 'tile_id' not in feature_adata.obs.columns:
+            raise ValueError("Feature table must have 'attention' and 'tile_id' columns")
+
+        attention_df = feature_adata.obs[['tile_id', 'attention']].copy()
+
+        return attention_df
+    
+    def _get_tile_df(self):
+        tile_adata = self.wsi.shapes[self.tile_key]
+        if 'tile_id' not in tile_adata.columns or 'geometry' not in tile_adata.columns:
+            raise ValueError("Tile shapes must have 'tile_id' and 'geometry' columns")
+        
+        tile_df = tile_adata.obs[['tile_id', 'geometry']].copy()
+
+        return tile_df
+    
+    def select_tiles(self):
+        """Select n tiles based on ABMIL attention scores with spatial diversity constraint.
+
+        Returns:
+            pd.DataFrame: Selected tiles with their metadata
+        """
+        # Merge attention scores with tile geometries
+        attention_df = self._get_attention_df()
+        tile_df = self._get_tile_df()        
+        merged = pd.merge(attention_df, tile_df, on='tile_id', how='inner')
+
+        if merged.empty:
+            return pd.DataFrame()
+
+        # Sort by attention descending
+        merged = merged.sort_values('attention', ascending=False)
+
+        # Compute centroids for distance calculations
+        merged['centroid'] = merged['geometry'].apply(lambda p: p.centroid)
+
+        selected = []
+        for _, row in merged.iterrows():
+            if len(selected) >= self.n_tiles:
+                break
+            
+            # Check distance to already selected tiles
+            for sel_row in selected:
+                dist = row['centroid'].distance(sel_row['centroid'])
+                if dist < self.min_distance_px:
+                    break
+            else:
+                selected.append(row)
+
+        if selected:
+            return pd.DataFrame(selected).drop(columns=['centroid'])
+        else:
+            return pd.DataFrame()
 
 # Example Usage
 if __name__ == "__main__":
