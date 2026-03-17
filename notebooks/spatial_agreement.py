@@ -25,15 +25,14 @@ class SpatialAgreement:
         gdf = wsi.shapes[self.tile_key]
         return gdf
 
-    def contingency_tabels(self, gdf):
+    def contingency_tables(self, gdf):
         """
         Build contingency tables using the first model as reference.
 
         Expects `gdf` to contain one column per model named `domain_{model}`.
         Returns a dict mapping each non-reference model -> crosstab DataFrame.
         """
-        dom_cols = [f"domain_{m}" for m in self.models]
-        missing = [c for c in dom_cols if c not in gdf.columns]
+        missing = [c for c in self.dom_cols if c not in gdf.columns]
         if missing:
             raise KeyError(f"Missing expected domain columns in gdf: {missing}")
 
@@ -102,6 +101,9 @@ class SpatialAgreement:
 
         Produces `agreement_level` = number of agreeing pairs among models.
         """
+        if len(self.dom_cols) < 2:
+            raise ValueError("Need at least 2 models to compute agreement.")
+
         agree = np.zeros(len(gdf_aligned), dtype=int)
         for i in range(len(self.dom_cols)):
             a = gdf_aligned[self.dom_cols[i]]
@@ -124,20 +126,37 @@ class SpatialAgreement:
             gdf_aligned = self.agreement_level(gdf_aligned)
             agreement_dict[i] = gdf_aligned
 
-        return agreement_dict
+        self.agreement_dict = agreement_dict
+        return self.agreement_dict
 
     def slide_level_agreement(self, slide_idx):
         gdf_aligned = self.agreement_dict[slide_idx]
-        
+
         n_tiles = len(gdf_aligned)
         n_models = len(self.models)
+        if n_models < 2:
+            raise ValueError("Need at least 2 models to compute agreement.")
 
+        out = {}
         for i in range(n_models):
-            for j in range(i+1, n_models):
+            for j in range(i + 1, n_models):
                 m1, m2 = self.models[i], self.models[j]
-                agreement = (gdf_aligned[m1] == gdf_aligned[m2]).sum()
-                print(f"{m1} vs {m2}: {agreement/n_tiles:.3%}")
+                c1, c2 = f"domain_{m1}", f"domain_{m2}"
+                rate = float((gdf_aligned[c1] == gdf_aligned[c2]).mean())
+                out[f"{m1}_vs_{m2}"] = rate
 
+        # fraction of tiles where *all* models agree
+        if n_models == 2:
+            full_rate = float((gdf_aligned[self.dom_cols[0]] == gdf_aligned[self.dom_cols[1]]).mean())
+        else:
+            base = gdf_aligned[self.dom_cols[0]]
+            all_equal = np.ones(n_tiles, dtype=bool)
+            for col in self.dom_cols[1:]:
+                all_equal &= (gdf_aligned[col] == base).to_numpy()
+            full_rate = float(all_equal.mean())
+
+        out["full_agreement"] = full_rate
+        return out
 
     def plot_agreement_map(self, slide_idx):
         """
@@ -147,7 +166,7 @@ class SpatialAgreement:
         - otherwise -> "Moderate"
         """
         gdf_aligned = self.agreement_dict[slide_idx]
-
+        
         n_models = len(self.models)
         if n_models < 2:
             raise ValueError("Need at least 2 models to compute agreement.")
@@ -173,12 +192,14 @@ class SpatialAgreement:
 
         legend_patches = [
             mpatches.Patch(color=colors["strong"], label=f"Strong ({max_pairs}/{max_pairs})"),
-            mpatches.Patch(color=colors["moderate"], label=f"Moderate (1..{max_pairs-1}/{max_pairs})"),
             mpatches.Patch(color=colors["disagreement"], label=f"Disagreement (0/{max_pairs})"),
         ]
+        if max_pairs > 1:
+            legend_patches.insert(
+                1, mpatches.Patch(color=colors["moderate"], label=f"Moderate (1..{max_pairs-1}/{max_pairs})")
+            )
         ax.legend(handles=legend_patches, title="Agreement (pairwise)", loc="center left")
         ax.set_title("Spatial Agreement Across Models")
         ax.set_axis_off()
         plt.tight_layout()
         plt.show()
-
