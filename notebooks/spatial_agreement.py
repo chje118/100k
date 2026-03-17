@@ -282,5 +282,3 @@ class SpatialAgreement:
         if show:
             plt.show()
         return fig, ax, df
-
-# UPSET PLOT MISSING
