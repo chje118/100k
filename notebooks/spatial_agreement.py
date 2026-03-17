@@ -3,6 +3,8 @@ from wsidata import open_wsi
 import pandas as pd
 from scipy.optimize import linear_sum_assignment
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
 
 class SpatialAgreement:
@@ -12,6 +14,7 @@ class SpatialAgreement:
         self.models = models
         self.tile_key = tile_key
         self.dom_cols = [f"domain_{m}" for m in self.models]
+        self.agreement_dict = self.get_agreement_dict()
 
     def load_slide(self, path):
         zarr_path = os.path.join(self.zarr_dir, os.path.basename(path).replace(".mrxs", ".zarr"))
@@ -110,10 +113,7 @@ class SpatialAgreement:
         gdf["agreement_level"] = agree
         return gdf
 
-    def agreement_map(self, slide_idx):
-        raise NotImplementedError("agreement_map is not implemented yet.")
-
-    def agreement_dict(self):
+    def get_agreement_dict(self):
         agreement_dict = {}
 
         for i, path in enumerate(self.filenames):
@@ -125,3 +125,48 @@ class SpatialAgreement:
             agreement_dict[i] = gdf_aligned
 
         return agreement_dict
+
+
+    def agreement_map(self, slide_idx):
+        """
+        Plot spatial agreement, with generalized coloring for any number of models:
+        - 0 agreeing pairs -> "Disagreement"
+        - max agreeing pairs -> "Strong"
+        - otherwise -> "Moderate"
+        """
+        gdf_aligned = self.agreement_dict[slide_idx]
+
+        n_models = len(self.models)
+        if n_models < 2:
+            raise ValueError("Need at least 2 models to compute agreement.")
+        max_pairs = n_models * (n_models - 1) // 2
+
+        colors = {
+            "strong": "#1a9850",
+            "moderate": "#fee08b",
+            "disagreement": "#d73027",
+        }
+
+        level = gdf_aligned["agreement_level"]
+        agreement_class = np.where(level == max_pairs, "strong", 
+            np.where(level == 0, "disagreement", "moderate"),
+        )
+        plot_df = gdf_aligned.copy()
+        plot_df["agreement_class"] = agreement_class
+        plot_df["agreement_color"] = plot_df["agreement_class"].map(colors)
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        
+        plot_df.plot(color=plot_df["agreement_color"], linewidth=0, ax=ax)
+
+        legend_patches = [
+            mpatches.Patch(color=colors["strong"], label=f"Strong ({max_pairs}/{max_pairs})"),
+            mpatches.Patch(color=colors["moderate"], label=f"Moderate (1..{max_pairs-1}/{max_pairs})"),
+            mpatches.Patch(color=colors["disagreement"], label=f"Disagreement (0/{max_pairs})"),
+        ]
+        ax.legend(handles=legend_patches, title="Agreement (pairwise)", loc="center left")
+        ax.set_title("Spatial Agreement Across Models")
+        ax.set_axis_off()
+        plt.tight_layout()
+        plt.show()
+
