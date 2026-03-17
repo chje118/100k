@@ -126,8 +126,20 @@ class SpatialAgreement:
 
         return agreement_dict
 
+    def slide_level_agreement(self, slide_idx):
+        gdf_aligned = self.agreement_dict[slide_idx]
+        
+        n_tiles = len(gdf_aligned)
+        n_models = len(self.models)
 
-    def agreement_map(self, slide_idx):
+        for i in range(n_models):
+            for j in range(i+1, n_models):
+                m1, m2 = self.models[i], self.models[j]
+                agreement = (gdf_aligned[m1] == gdf_aligned[m2]).sum()
+                print(f"{m1} vs {m2}: {agreement/n_tiles:.3%}")
+
+
+    def plot_agreement_map(self, slide_idx):
         """
         Plot spatial agreement, with generalized coloring for any number of models:
         - 0 agreeing pairs -> "Disagreement"
