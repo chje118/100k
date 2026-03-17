@@ -1,6 +1,8 @@
 import os
 from wsidata import open_wsi
 import pandas as pd
+from scipy.optimize import linear_sum_assignment
+import numpy as np
 
 
 class SpatialAgreement:
@@ -41,8 +43,55 @@ class SpatialAgreement:
             cont_tables[model] = tab
 
         return cont_tables
-    
+
+    def domain_alignment(self, gdf, cont_tables):
+        """
+        Align domain labels across models by remapping each non-reference model's
+        domain IDs onto the reference model's domain IDs.
+
+        - Reference model is `self.models[0]`.
+        - Uses a max-overlap one-to-one assignment (Hungarian algorithm) on the
+          contingency table.
+        - Any remaining (unassigned) target labels are mapped to the reference
+          label with the largest overlap (many-to-one fallback).
+
+        Returns a `gdf_aligned` where each `domain_{model}` column has been
+        remapped to the reference domain ID space.
+        """
+        ref_model = self.models[0]
+        ref_col = f"domain_{ref_model}"
+
+        gdf_aligned = gdf.copy()
+        for model in self.models[1:]:
+            tab = cont_tables.get(model)
+            if tab is None:
+                raise KeyError(f"Missing contingency table for model '{model}'.")
+
+            # tab rows are reference labels, columns are target labels
+            cost = -tab.to_numpy(dtype=float)
+            row_ind, col_ind = linear_sum_assignment(cost)
+            mapping = {tab.columns[c]: tab.index[r] for r, c in zip(row_ind, col_ind)}
+
+            # fallback for any target labels not covered by the 1:1 assignment
+            for target_label in tab.columns:
+                if target_label in mapping:
+                    continue
+                col_counts = tab[target_label]
+                if col_counts.sum() == 0: # no overlap -> NaN
+                    mapping[target_label] = np.nan
+                else: # assign to best match
+                    mapping[target_label] = col_counts.idxmax()
+
+            target_col = f"domain_{model}"
+            gdf_aligned[target_col] = gdf_aligned[target_col].map(mapping)
+
+        gdf_aligned[ref_col] = gdf_aligned[ref_col]
+        return gdf_aligned
+
     def run(self):
         for path in self.filenames:
             wsi = self.load_slide(path)
             gdf = self.get_shapes(wsi)
+            cont_tables = self.contingency_tabels(gdf)
+
+
