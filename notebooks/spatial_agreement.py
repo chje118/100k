@@ -11,6 +11,7 @@ class SpatialAgreement:
         self.zarr_dir = zarr_dir
         self.models = models
         self.tile_key = tile_key
+        self.dom_cols = [f"domain_{m}" for m in self.models]
 
     def load_slide(self, path):
         zarr_path = os.path.join(self.zarr_dir, os.path.basename(path).replace(".mrxs", ".zarr"))
@@ -88,10 +89,39 @@ class SpatialAgreement:
         gdf_aligned[ref_col] = gdf_aligned[ref_col]
         return gdf_aligned
 
-    def run(self):
-        for path in self.filenames:
+    def agreement_level(self, gdf_aligned):
+        """
+        Compute per-tile agreement across aligned domain columns.
+
+        Expects `gdf_aligned` to contain `domain_{model}` for each model in
+        `self.models`, where all non-reference columns have already been remapped
+        into the reference model's label space.
+
+        Produces `agreement_level` = number of agreeing pairs among models.
+        """
+        agree = np.zeros(len(gdf_aligned), dtype=int)
+        for i in range(len(self.dom_cols)):
+            a = gdf_aligned[self.dom_cols[i]]
+            for j in range(i + 1, len(self.dom_cols)):
+                b = gdf_aligned[self.dom_cols[j]]
+                agree += (a == b).astype(int).to_numpy()
+
+        gdf = gdf_aligned.copy()
+        gdf["agreement_level"] = agree
+        return gdf
+
+    def agreement_map(self, slide_idx):
+        raise NotImplementedError("agreement_map is not implemented yet.")
+
+    def agreement_dict(self):
+        agreement_dict = {}
+
+        for i, path in enumerate(self.filenames):
             wsi = self.load_slide(path)
             gdf = self.get_shapes(wsi)
             cont_tables = self.contingency_tabels(gdf)
+            gdf_aligned = self.domain_alignment(gdf, cont_tables)
+            gdf_aligned = self.agreement_level(gdf_aligned)
+            agreement_dict[i] = gdf_aligned
 
-
+        return agreement_dict
