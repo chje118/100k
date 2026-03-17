@@ -5,6 +5,8 @@ from scipy.optimize import linear_sum_assignment
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from upsetplot import from_contents, UpSet
+import seaborn as sns
 
 
 class SpatialAgreement:
@@ -158,7 +160,7 @@ class SpatialAgreement:
         out["full_agreement"] = full_rate
         return out
 
-    def plot_agreement_map(self, slide_idx):
+    def plot_agreement_map(self, slide_idx, show=True):
         """
         Plot spatial agreement, with generalized coloring for any number of models:
         - 0 agreeing pairs -> "Disagreement"
@@ -187,7 +189,7 @@ class SpatialAgreement:
         plot_df["agreement_color"] = plot_df["agreement_class"].map(colors)
 
         fig, ax = plt.subplots(figsize=(6, 6))
-        
+
         plot_df.plot(color=plot_df["agreement_color"], linewidth=0, ax=ax)
 
         legend_patches = [
@@ -202,4 +204,83 @@ class SpatialAgreement:
         ax.set_title("Spatial Agreement Across Models")
         ax.set_axis_off()
         plt.tight_layout()
-        plt.show()
+        if show:
+            plt.show()
+        return fig, ax, plot_df
+
+    def overall_slide_agreement(self):
+        """
+        Slide-level agreement for all slides, to use for boxplots and stripplots:
+        - x: comparison (pair name or "all_agree")
+        - y: agreement_rate (0..1)
+        """
+        rows = []
+        # change d, k and v to understable variable names
+        for slide_idx in range(len(self.filenames)):
+            d = self.slide_level_agreement(slide_idx)
+            for k, v in d.items():
+                rows.append(
+                    {
+                        "slide_idx": slide_idx,
+                        "comparison": "all_agree" if k == "full_agreement" else k,
+                        "agreement_rate": float(v),
+                    }
+                )
+        return pd.DataFrame(rows)
+
+    def boxplot_slide_agreement(self, show=True, percent=True):
+        """
+        Boxplot of slide-level agreement rates across slides.
+        """
+        df = self.overall_slide_agreement()
+        
+        if percent:
+            df = df.copy()
+            df["agreement_rate"] = 100.0 * df["agreement_rate"]
+            ylab = "Agreement (%)"
+        else:
+            ylab = "Agreement"
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+        
+        sns.boxplot(data=df, x="comparison", y="agreement_rate")
+        ax.set_xlabel("")
+        ax.set_ylabel(ylab)
+        ax.tick_params(axis="x", rotation=45)
+        plt.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax, df
+
+    def stripplot_slide_agreement(self, show=True, percent=True):
+        """
+        Stripplot of slide-level agreement rates (one point per slide per comparison).
+        """
+        df = self.overall_slide_agreement()
+        if percent:
+            df = df.copy()
+            df["agreement_rate"] = 100.0 * df["agreement_rate"]
+            ylab = "Agreement (%)"
+        else:
+            ylab = "Agreement"
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+        
+        sns.stripplot(
+            data=df,
+            x="comparison",
+            y="agreement_rate",
+            jitter=True,
+            size=3,
+            alpha=0.7,
+            ax=ax,
+        )
+        ax.set_xlabel("")
+        ax.set_ylabel(ylab)
+        ax.tick_params(axis="x", rotation=45)
+        plt.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax, df
+
+# UPSET PLOT MISSING
