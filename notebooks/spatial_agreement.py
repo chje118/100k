@@ -242,7 +242,7 @@ class SpatialAgreement:
         else:
             ylab = "Agreement"
 
-        fig, ax = plt.subplots(figsize=(6, 4))
+        fig, ax = plt.subplots(figsize=(6, 5))
         
         sns.boxplot(data=df, x="comparison", y="agreement_rate")
         ax.set_xlabel("")
@@ -263,7 +263,7 @@ class SpatialAgreement:
         else:
             ylab = "Agreement"
 
-        fig, ax = plt.subplots(figsize=(6, 4))
+        fig, ax = plt.subplots(figsize=(6, 5))
         
         sns.boxplot(
             data=df,
@@ -276,8 +276,8 @@ class SpatialAgreement:
             data=df,
             x="comparison",
             y="agreement_rate",
-            jitter=True,
-            size=3,
+            jitter=False,
+            size=5,
             alpha=0.7,
             ax=ax,
         )
