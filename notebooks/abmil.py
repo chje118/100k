@@ -332,6 +332,39 @@ def load_model(model_path):
     print(f"Model successfully loaded")
     return model, {"in_dim": in_dim, "n_classes": n_classes, "hidden_dim": hidden_dim}
 
+def auc_score(all_labels, all_preds):
+    """
+    Compute AUC score for multi-class classification.
+    
+    Parameters:
+    - all_labels: list of true labels
+    - all_preds: list of predicted labels (class indices)
+    
+    Returns:
+    - AUC score (float)
+    """
+    # Convert to one-hot encoding for AUC calculation
+    n_classes = len(set(all_labels))
+    y_true = np.eye(n_classes)[all_labels]
+    y_scores = np.eye(n_classes)[all_preds]
+
+    return roc_auc_score(y_true, y_scores, average="macro")
+
+def plot_roc_curve(all_labels, all_preds):
+    """
+    Plot ROC curve for multi-class classification.
+    
+    Parameters:
+    - all_labels: list of true labels
+    - all_preds: list of predicted labels (class indices)
+    """
+    n_classes = len(set(all_labels))
+    y_true = np.eye(n_classes)[all_labels]
+    y_scores = np.eye(n_classes)[all_preds]
+
+    RocCurveDisplay.from_predictions(y_true, y_scores, average="macro")
+    plt.title("ROC Curve")
+    plt.show()
 
 # Example usage
 if __name__ == "__main__":
