@@ -4,6 +4,15 @@ Assumes binary or multi-class, single-label classification.
 
 Evaluation includes confusion matrix and classification report, AUC and ROC curves.
 Model saving and loading functions are included, with auto-generated filenames containing model dimensions for easy tracking.
+
+AUC Metric for Pathology Benchmark:
+-----------------------------------
+This module uses macro AUC (unweighted mean of one-vs-rest AUC) for multi-class pathology classification.
+Macro AUC is class-balanced and appropriate when all diagnostic categories are equally important.
+For each class i, one-vs-rest AUC is computed as the ROC AUC treating class i vs. all others.
+Then macro AUC = mean(AUC_i for all classes i).
+
+This provides a single interpretable metric for multi-class problems without requiring per-class weights.
 """
 
 import os
@@ -416,20 +425,28 @@ def load_model(model_path):
 
 def auc_score(all_labels, all_probs):
     """
-    Compute AUC score for multi-class classification.
+    Compute macro AUC score for multi-class classification (pathology benchmark).
+    
+    For the pathology benchmark, macro AUC is computed as the unweighted mean of 
+    one-vs-rest AUC scores across all classes. This metric is class-balanced and 
+    appropriate for multi-class problems where all classes are equally important.
+    
+    Formula: macro AUC = mean(AUC_class_i for i in 1..n_classes)
+    where each AUC_class_i is computed using the one-vs-rest approach.
     
     Parameters:
-    - all_labels: list of true labels
+    - all_labels: list of true labels (class indices)
     - all_probs: array of predicted probabilities (shape: [n_samples, n_classes])
     
     Returns:
-    - AUC score (float)
+    - macro AUC score (float, range [0, 1])
     """
-    # Convert true labels to one-hot encoding
+    # Convert true labels to one-hot encoding for multi-class AUC computation
     n_classes = all_probs.shape[1]
     y_true = np.eye(n_classes)[all_labels]
 
-    return roc_auc_score(y_true, all_probs, average="macro")
+    # Compute macro AUC: unweighted mean of one-vs-rest AUC for each class
+    return roc_auc_score(y_true, all_probs, average="macro", multi_class="ovr")
 
 def plot_roc_curve(all_labels, all_probs):
     """
@@ -467,6 +484,10 @@ def kfold_cross_validation(
     """
     Perform K-fold cross-validation for ABMIL model with early stopping for best AUC comparability.
     
+    For the pathology benchmark, this function evaluates using macro AUC (unweighted mean of 
+    one-vs-rest AUC scores across all classes). This metric is class-balanced and appropriate 
+    for multi-class pathology classification where all diagnostic categories are equally important.
+    
     For fair AUC comparison across folds, this function uses early stopping on each fold's internal
     validation set. This ensures each fold trains until it reaches peak performance, enabling 
     meaningful comparison of model performance across different data splits.
@@ -496,7 +517,8 @@ def kfold_cross_validation(
     
     Returns:
     - results_dict: Dictionary with fold results and aggregated metrics
-        Keys: 'fold_auc_scores', 'mean_auc', 'std_auc', 'fold_accuracies', 'mean_accuracy', 'std_accuracy'
+        Keys: 'fold_auc_scores' (macro AUC per fold), 'mean_auc', 'std_auc', 
+              'fold_accuracies', 'mean_accuracy', 'std_accuracy', 'n_splits'
     """
     # Set global seed at the start for reproducibility
     set_seed(random_state)
