@@ -408,5 +408,5 @@ if __name__ == "__main__":
     val_df = val_df.reset_index(drop=True)
     
     model = train_ABMIL(train_df, train_dataset, label_col, n_epochs=10, class_weights=[1.0, 2.0, 3.0])
-    all_labels, all_preds = validate_ABMIL(model, val_dataset)
+    all_labels, all_preds, all_probs = validate_ABMIL(model, val_dataset)
     confusion_matrix_report(all_labels, all_preds)
