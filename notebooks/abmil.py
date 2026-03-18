@@ -20,6 +20,25 @@ import matplotlib.pyplot as plt
 import lazyslide as zs
 from tqdm import tqdm
 import re
+import random
+
+
+def set_seed(seed):
+    """
+    Set seeds for reproducibility across numpy, torch, and python random.
+    
+    Parameters:
+    - seed: Random seed value (integer)
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    # Ensure deterministic behavior (may impact performance)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 class ZarrSlideDataset(Dataset):
     def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir):
@@ -105,7 +124,8 @@ def train_ABMIL(
     use_amp=True,
     amp_dtype=torch.bfloat16,
     compile_model=False,
-    early_stopping_patience=None
+    early_stopping_patience=None,
+    seed=None
 ):
     """
     Train ABMIL model with optional early stopping for best AUC comparability.
@@ -125,18 +145,31 @@ def train_ABMIL(
     - compile_model: If True and torch.compile is available, compile the model for extra speed.
     - early_stopping_patience: Number of epochs with no improvement to wait before stopping.
                               If None, trains for all n_epochs (no early stopping).
+    - seed: Random seed for reproducibility. If None, uses current random state.
     
     Returns:
     - model: Trained ABMIL model
     - best_model_state: Best model state dict (for restoring best model when using early stopping)
     """
+    # Set seed for reproducibility
+    if seed is not None:
+        set_seed(seed)
     # Decide device
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
     # DataLoader: decides when items are loaded, handles shuffling and batching
-    default_loader_kwargs = {"batch_size": 1, "shuffle": True,}
+    # Use worker_init_fn to ensure reproducibility with multiple workers
+    def worker_init_fn(worker_id):
+        if seed is not None:
+            set_seed(seed + worker_id)
+    
+    default_loader_kwargs = {
+        "batch_size": 1, 
+        "shuffle": True,
+        "worker_init_fn": worker_init_fn if seed is not None else None
+    }
     if device.startswith("cuda"):
         default_loader_kwargs["pin_memory"] = True
     train_loader = DataLoader(train_dataset, **default_loader_kwargs)
@@ -438,6 +471,9 @@ def kfold_cross_validation(
     validation set. This ensures each fold trains until it reaches peak performance, enabling 
     meaningful comparison of model performance across different data splits.
     
+    All randomness (fold splitting, model initialization, training) is controlled by random_state
+    to ensure fully reproducible AUC results.
+    
     Parameters:
     - df: DataFrame with all data
     - filename_col: Column name for file paths
@@ -455,12 +491,17 @@ def kfold_cross_validation(
     - use_amp: Use mixed precision training
     - amp_dtype: Autocast dtype for mixed precision
     - compile_model: Whether to compile model with torch.compile
-    - random_state: Random seed for reproducibility
+    - random_state: Random seed for reproducibility (default: 42). Controls fold splitting and 
+                   all training randomness for fully reproducible AUC.
     
     Returns:
     - results_dict: Dictionary with fold results and aggregated metrics
         Keys: 'fold_auc_scores', 'mean_auc', 'std_auc', 'fold_accuracies', 'mean_accuracy', 'std_accuracy'
     """
+    # Set global seed at the start for reproducibility
+    set_seed(random_state)
+    print(f"Random seed set to {random_state} for reproducibility")
+    
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     
     fold_auc_scores = []
@@ -497,6 +538,8 @@ def kfold_cross_validation(
         )
         
         # Train model on this fold with early stopping
+        # Use fold-specific seed derived from random_state for reproducibility
+        fold_seed = random_state + fold_idx + 1
         model, _ = train_ABMIL(
             train_df=train_df,
             train_dataset=train_dataset,
@@ -508,7 +551,8 @@ def kfold_cross_validation(
             use_amp=use_amp,
             amp_dtype=amp_dtype,
             compile_model=compile_model,
-            early_stopping_patience=early_stopping_patience
+            early_stopping_patience=early_stopping_patience,
+            seed=fold_seed
         )
         
         # Validate on this fold
@@ -567,7 +611,8 @@ if __name__ == "__main__":
     
     # K-fold cross-validation with early stopping (RECOMMENDED)
     # Early stopping ensures each fold trains until validation AUC plateaus, for fair AUC comparability.
-    # The patience parameter controls how many epochs to wait without improvement before stopping.
+    # random_state parameter ensures fully reproducible results (fold splitting, model init, training randomness).
+    # Use the same random_state to reproduce the exact same AUC values.
     results = kfold_cross_validation(
         df=df,
         filename_col=filename_col,
@@ -578,7 +623,7 @@ if __name__ == "__main__":
         n_splits=5,
         n_epochs=100,               # Maximum epochs
         early_stopping_patience=3,  # Stop after 3 epochs with no AUC improvement
-        random_state=42
+        random_state=42             # Fixed seed for reproducibility: use same value to get identical results
     )
     print(f"\nFinal Results: AUC = {results['mean_auc']:.4f} +- {results['std_auc']:.4f}")
     
@@ -593,7 +638,7 @@ if __name__ == "__main__":
     #     n_splits=5,
     #     n_epochs=20,
     #     early_stopping_patience=None,  # Disable early stopping
-    #     random_state=42
+    #     random_state=42                # Fixed seed for reproducibility
     # )
     
     # Alternative: Single train/val split (faster, less robust)
@@ -613,7 +658,7 @@ if __name__ == "__main__":
     #     feature_key=feature_key, tile_key="tiles_224", zarr_dir=zarr_dir
     # )
     # model, _ = train_ABMIL(train_df, train_dataset, val_dataset, label_col, 
-    #                         n_epochs=100, early_stopping_patience=3)
+    #                         n_epochs=100, early_stopping_patience=3, seed=42)
     # all_labels, all_preds, all_probs = validate_ABMIL(model, val_dataset)
     # auc = auc_score(all_labels, all_probs)
     # print(f"Validation AUC: {auc:.4f}")
