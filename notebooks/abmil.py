@@ -16,7 +16,6 @@ import matplotlib.pyplot as plt
 import lazyslide as zs
 from tqdm import tqdm
 
-
 class ZarrSlideDataset(Dataset):
     def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir):
         self.df = df.reset_index(drop=True)
@@ -88,24 +87,92 @@ class ABMIL(nn.Module):
 
         return logits, A
     
-def train_ABMIL(train_df, train_dataset, label_col, n_epochs=10):
+def train_ABMIL(
+    train_df,
+    train_dataset,
+    label_col,
+    n_epochs=10,
+    class_weights=None,
+    device=None,
+    use_amp=True,
+    amp_dtype=torch.bfloat16,
+    compile_model=False,
+    train_loader_kwargs=None,
+):
+    """
+    Train ABMIL model with optional class weights for handling class imbalance.
+    
+    Parameters:
+    - train_df: DataFrame with training data
+    - train_dataset: ZarrSlideDataset instance
+    - label_col: Column name for labels
+    - n_epochs: Number of training epochs
+    - class_weights: Optional tensor of class weights (shape: [n_classes])
+                   Higher weights give more importance to that class during training.
+                   Useful for handling class imbalance or emphasizing severe classes.
+    - device: Torch device string, e.g. "cuda" or "cpu". Defaults to "cuda" if available.
+    - use_amp: If True and running on CUDA, use autocast mixed precision (optimized for H100).
+    - amp_dtype: Autocast dtype when use_amp is True (default: torch.bfloat16, good for H100).
+    - compile_model: If True and torch.compile is available, compile the model for extra speed.
+    - train_loader_kwargs: Optional dict of extra DataLoader kwargs (e.g. num_workers, pin_memory).
+    """
+    # Decide device
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
     # DataLoader: decides when items are loaded, handles shuffling and batching
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+    default_loader_kwargs = {
+        "batch_size": 1,
+        "shuffle": True,
+    }
+
+    # On GPU we generally benefit from pinned memory
+    if device.startswith("cuda"):
+        default_loader_kwargs["pin_memory"] = True
+
+    if train_loader_kwargs is not None:
+        default_loader_kwargs.update(train_loader_kwargs)
+
+    train_loader = DataLoader(train_dataset, **default_loader_kwargs)
 
     # Extract Feature Dimension and Number of Classes
     sample_feats, _, _ = train_dataset[0]
     feat_dim = sample_feats.shape[1]
     n_classes = train_df[label_col].nunique()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu" 
-    print(f"Using device: {device}")
-
     # Create the ABMIL Model
     model = ABMIL(feat_dim, n_classes).to(device)
 
+    # Enable TF32 / high matmul precision on modern GPUs (e.g. H100) when available
+    if device.startswith("cuda"):
+        try:
+            torch.set_float32_matmul_precision("high")
+        except AttributeError:
+            pass
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            if hasattr(torch.backends.cuda, "cudnn"):
+                torch.backends.cuda.cudnn.allow_tf32 = True
+
+    # Optionally compile model for additional speed (PyTorch 2.x+)
+    if compile_model and hasattr(torch, "compile") and device.startswith("cuda"):
+        try:
+            model = torch.compile(model)
+            print("Model compiled with torch.compile()")
+        except Exception as e:
+            print(f"torch.compile failed, continuing without compilation: {e}")
+
     # Create Optimizer and Loss Function
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    loss_fn = torch.nn.CrossEntropyLoss()
+    
+    # If class weights are provided, convert to tensor and use in CrossEntropyLoss
+    if class_weights is not None:
+        class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
+        loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights)
+        print(f"Using class weights: {class_weights.cpu().numpy()}")
+    else:
+        loss_fn = torch.nn.CrossEntropyLoss()
 
     # Training Loop
     for epoch in tqdm(range(n_epochs), desc="Epochs"):
@@ -118,8 +185,8 @@ def train_ABMIL(train_df, train_dataset, label_col, n_epochs=10):
                 feats = feats.squeeze(0)
             if tile_ids.ndim == 2:
                 tile_ids = tile_ids.squeeze(0)
-            feats = feats.to(device)
-            label = label.to(device)
+            feats = feats.to(device, non_blocking=True)
+            label = label.to(device, non_blocking=True)
         
             if feats.shape[0] == 0:
                 continue
@@ -127,11 +194,14 @@ def train_ABMIL(train_df, train_dataset, label_col, n_epochs=10):
             # Normalize features per slide
             feats = (feats - feats.mean(0)) / (feats.std(0) + 1e-6)
 
-            # Forward pass
-            logits, _ = model(feats)
-            
-            # Compute loss
-            loss = loss_fn(logits.unsqueeze(0), label)
+            # Forward pass (optionally with mixed precision on CUDA)
+            if device.startswith("cuda") and use_amp and torch.cuda.is_available():
+                with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                    logits, _ = model(feats)
+                    loss = loss_fn(logits.unsqueeze(0), label)
+            else:
+                logits, _ = model(feats)
+                loss = loss_fn(logits.unsqueeze(0), label)
 
             # Clear gradients
             optimizer.zero_grad()
@@ -150,11 +220,29 @@ def train_ABMIL(train_df, train_dataset, label_col, n_epochs=10):
     return model
 
 
-def validate_ABMIL(model, val_dataset):
-    device = next(model.parameters()).device
+def validate_ABMIL(
+    model,
+    val_dataset,
+    device=None,
+    use_amp=True,
+    amp_dtype=torch.bfloat16,
+    val_loader_kwargs=None,
+):
+    if device is None:
+        device = next(model.parameters()).device
 
     # Validation DataLoader
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
+    default_loader_kwargs = {
+        "batch_size": 1,
+        "shuffle": False,
+    }
+    if isinstance(device, str) and device.startswith("cuda"):
+        default_loader_kwargs["pin_memory"] = True
+
+    if val_loader_kwargs is not None:
+        default_loader_kwargs.update(val_loader_kwargs)
+
+    val_loader = DataLoader(val_dataset, **default_loader_kwargs)
 
     # Validation Loop
     model.eval()   # Disables training behaviors (dropout etc.)
@@ -168,8 +256,8 @@ def validate_ABMIL(model, val_dataset):
                 feats = feats.squeeze(0)
             if tile_ids.ndim == 2:
                 tile_ids = tile_ids.squeeze(0)
-            feats = feats.to(device)
-            label = label.to(device)
+            feats = feats.to(device, non_blocking=True)
+            label = label.to(device, non_blocking=True)
 
             if feats.shape[0] == 0:
                 continue
@@ -177,7 +265,12 @@ def validate_ABMIL(model, val_dataset):
             # Normalize features per slide
             feats = (feats - feats.mean(0)) / (feats.std(0) + 1e-6)
 
-            logits, _ = model(feats)
+            if (isinstance(device, str) and device.startswith("cuda")
+                    and use_amp and torch.cuda.is_available()):
+                with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                    logits, _ = model(feats)
+            else:
+                logits, _ = model(feats)
 
             # Compute predicted class
             pred = torch.argmax(logits, dim=0).item()
@@ -205,77 +298,6 @@ def confusion_matrix_report(all_labels, all_preds):
     plt.ylabel("True")
     plt.show()
 
-
-def view_slide_attention(model, dataset, slide_idx, feature_key, filename_col, zarr_dir, tile_key='tiles_224'):
-    model.eval()
-    device = next(model.parameters()).device
-
-    # Load slide features and tile IDs
-    feats, tile_ids, label = dataset[slide_idx]
-    if feats.shape[0] == 0:
-        print("Slide has no tiles!")
-        return None
-    feats = feats.to(device)
-
-    # Normalize features
-    feats = (feats - feats.mean(0)) / (feats.std(0) + 1e-6)
-
-    # Forward pass to get attention
-    with torch.no_grad():
-        logits, A = model(feats)
-
-    A = A.squeeze(1).cpu().numpy()
-    print(f"DEBUG: Raw attention before normalization - shape: {A.shape}, min: {A.min():.6f}, max: {A.max():.6f}, std: {A.std():.6f}")
-    
-    # Normalize to [0,1] - only if there's variation
-    if A.max() > A.min():
-        A_normalized = (A - A.min()) / (A.max() - A.min() + 1e-8)
-        print(f"DEBUG: Attention after normalization - shape: {A_normalized.shape}, min: {A_normalized.min():.6f}, max: {A_normalized.max():.6f}, std: {A_normalized.std():.6f}")
-    else:
-        print("WARNING: All attention weights are identical! Model may not be learning attention.")
-        A_normalized = A  # Keep original uniform values for debugging
-
-    # Handle both Subset and direct ZarrSlideDataset
-    if hasattr(dataset, 'dataset'):
-        base_dataset = dataset.dataset
-        actual_idx = dataset.indices[slide_idx]
-    else:  
-        base_dataset = dataset
-        actual_idx = slide_idx
-
-    # Open the WSI
-    slide_path = base_dataset.df.iloc[actual_idx][filename_col]
-    zarr_path = os.path.join(zarr_dir, os.path.basename(slide_path).replace(".mrxs", ".zarr"))
-    wsi = open_wsi(slide_path, zarr_path)
-
-    # Add attention to feature table
-    adata = wsi.tables[feature_key]
-    print(f"DEBUG: adata.obs shape: {adata.obs.shape}, adata.X shape: {adata.X.shape}, attention shape: {A_normalized.shape}")
-    
-    if len(A_normalized) != adata.n_obs:
-        print(f"ERROR: Attention weights ({len(A_normalized)}) don't match observations ({adata.n_obs})!")
-        return A_normalized
-    
-    adata.obs['attention'] = A_normalized
-
-    # Plot with WSIViewer
-    viewer = zs.pl.WSIViewer(wsi)
-    viewer.add_tiles(
-        key=tile_key,
-        feature_key=feature_key,
-        color_by='attention',
-        style='heatmap',
-        cmap='hot',
-        alpha=0.8
-    )
-    viewer.show()
-    
-    print(f"Slide {slide_idx}: True Label={label}, Predicted Class={torch.argmax(logits).item()}")
-    print(f"Attention weights - Min: {A_normalized.min():.4f}, Max: {A_normalized.max():.4f}, Mean: {A_normalized.mean():.4f}, Std: {A_normalized.std():.4f}")
-    
-    return A_normalized
-
-
 def save_model(model, model_name):
     """
     Save the trained ABMIL model to disk with auto-generated filename including model parameters.
@@ -294,7 +316,6 @@ def save_model(model, model_name):
     os.makedirs("models/", exist_ok=True)
     torch.save(model.state_dict(), save_path)
     print(f"Model saved to {save_path}")
-
 
 def load_model(model_path, in_dim, n_classes, hidden_dim=256):
     """
@@ -341,21 +362,23 @@ if __name__ == "__main__":
         df=train_df, 
         filename_col=filename_col, 
         label_col=label_col, 
-        feature_key=feature_key
+        feature_key=feature_key,
+        tile_key="tiles_224",
+        zarr_dir=zarr_dir
     )
 
     val_dataset = ZarrSlideDataset(
         df=val_df,
         filename_col=filename_col,
         label_col=label_col,
-        feature_key=feature_key
+        feature_key=feature_key,
+        tile_key="tiles_224",
+        zarr_dir=zarr_dir
     )
 
     train_df = train_df.reset_index(drop=True)
     val_df = val_df.reset_index(drop=True)
     
-    model = train_ABMIL(train_df, train_dataset, label_col, n_epochs=10)
+    model = train_ABMIL(train_df, train_dataset, label_col, n_epochs=10, class_weights=[1.0, 2.0, 3.0])
     all_labels, all_preds = validate_ABMIL(model, val_dataset)
     confusion_matrix_report(all_labels, all_preds)
-
-    view_slide_attention(model, val_dataset, slide_idx=0, filename_col=filename_col, zarr_dir=zarr_dir)
