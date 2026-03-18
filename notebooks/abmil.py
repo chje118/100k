@@ -90,7 +90,9 @@ class ABMIL(nn.Module):
         logits = self.classifier(M)
 
         return logits, A
-    
+
+# TODO: consider adding dataset-level feature normalization (PathBench)
+
 def train_ABMIL(
     train_df,
     train_dataset,
@@ -182,9 +184,6 @@ def train_ABMIL(
         
             if feats.shape[0] == 0:
                 continue
-            
-            # Normalize features per slide
-            feats = (feats - feats.mean(0)) / (feats.std(0) + 1e-6)
 
             # Forward pass (optionally with mixed precision on CUDA)
             if device.startswith("cuda") and use_amp and torch.cuda.is_available():
@@ -246,9 +245,6 @@ def validate_ABMIL(
 
             if feats.shape[0] == 0:
                 continue
-            
-            # Normalize features per slide
-            feats = (feats - feats.mean(0)) / (feats.std(0) + 1e-6)
 
             # Forward pass (optionally with mixed precision on CUDA)
             if (isinstance(device, str) and device.startswith("cuda")
