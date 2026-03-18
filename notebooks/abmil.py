@@ -14,6 +14,7 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from wsidata import open_wsi
 from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score, RocCurveDisplay
+from sklearn.model_selection import StratifiedKFold
 import seaborn as sns
 import matplotlib.pyplot as plt
 import lazyslide as zs
@@ -364,45 +365,178 @@ def plot_roc_curve(all_labels, all_probs):
     plt.title("ROC Curve")
     plt.show()
 
+def kfold_cross_validation(
+    df,
+    filename_col,
+    label_col,
+    feature_key,
+    tile_key,
+    zarr_dir,
+    n_splits=5,
+    n_epochs=10,
+    class_weights=None,
+    device=None,
+    use_amp=True,
+    amp_dtype=torch.bfloat16,
+    compile_model=False,
+    random_state=42
+):
+    """
+    Perform K-fold cross-validation for ABMIL model and report mean +- std AUC.
+    
+    Parameters:
+    - df: DataFrame with all data
+    - filename_col: Column name for file paths
+    - label_col: Column name for labels
+    - feature_key: Key for accessing features in zarr
+    - tile_key: Key for accessing tiles in zarr
+    - zarr_dir: Directory containing zarr files
+    - n_splits: Number of folds (default: 5)
+    - n_epochs: Number of training epochs per fold
+    - class_weights: Optional tensor of class weights
+    - device: Torch device (default: cuda if available else cpu)
+    - use_amp: Use mixed precision training
+    - amp_dtype: Autocast dtype for mixed precision
+    - compile_model: Whether to compile model with torch.compile
+    - random_state: Random seed for reproducibility
+    
+    Returns:
+    - results_dict: Dictionary with fold results and aggregated metrics
+        Keys: 'fold_auc_scores', 'mean_auc', 'std_auc', 'fold_accuracies', 'mean_accuracy', 'std_accuracy'
+    """
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    
+    fold_auc_scores = []
+    fold_accuracies = []
+    
+    print(f"Starting {n_splits}-fold cross-validation...")
+    
+    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(df, df[label_col])):
+        print(f"\n{'='*60}")
+        print(f"Fold {fold_idx + 1}/{n_splits}")
+        print(f"{'='*60}")
+        
+        # Split data by fold indices
+        train_df = df.iloc[train_idx].reset_index(drop=True)
+        val_df = df.iloc[val_idx].reset_index(drop=True)
+        
+        # Create datasets for this fold
+        train_dataset = ZarrSlideDataset(
+            df=train_df,
+            filename_col=filename_col,
+            label_col=label_col,
+            feature_key=feature_key,
+            tile_key=tile_key,
+            zarr_dir=zarr_dir
+        )
+        
+        val_dataset = ZarrSlideDataset(
+            df=val_df,
+            filename_col=filename_col,
+            label_col=label_col,
+            feature_key=feature_key,
+            tile_key=tile_key,
+            zarr_dir=zarr_dir
+        )
+        
+        # Train model on this fold
+        model = train_ABMIL(
+            train_df=train_df,
+            train_dataset=train_dataset,
+            label_col=label_col,
+            n_epochs=n_epochs,
+            class_weights=class_weights,
+            device=device,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            compile_model=compile_model
+        )
+        
+        # Validate on this fold
+        all_labels, all_preds, all_probs = validate_ABMIL(
+            model=model,
+            val_dataset=val_dataset,
+            device=device,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype
+        )
+        
+        # Compute AUC and accuracy for this fold
+        fold_auc = auc_score(all_labels, all_probs)
+        fold_accuracy = np.mean(np.array(all_labels) == np.array(all_preds))
+        
+        fold_auc_scores.append(fold_auc)
+        fold_accuracies.append(fold_accuracy)
+        
+        print(f"Fold {fold_idx + 1} - AUC: {fold_auc:.4f}, Accuracy: {fold_accuracy:.4f}")
+    
+    # Compute mean and std across folds
+    mean_auc = np.mean(fold_auc_scores)
+    std_auc = np.std(fold_auc_scores)
+    mean_accuracy = np.mean(fold_accuracies)
+    std_accuracy = np.std(fold_accuracies)
+    
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"K-Fold Cross-Validation Results ({n_splits} folds)")
+    print(f"{'='*60}")
+    print(f"Mean AUC: {mean_auc:.4f} +- {std_auc:.4f}")
+    print(f"Mean Accuracy: {mean_accuracy:.4f} +- {std_accuracy:.4f}")
+    print(f"Individual fold AUC scores: {[f'{auc:.4f}' for auc in fold_auc_scores]}")
+    print(f"Individual fold accuracies: {[f'{acc:.4f}' for acc in fold_accuracies]}")
+    
+    results_dict = {
+        'fold_auc_scores': fold_auc_scores,
+        'mean_auc': mean_auc,
+        'std_auc': std_auc,
+        'fold_accuracies': fold_accuracies,
+        'mean_accuracy': mean_accuracy,
+        'std_accuracy': std_accuracy,
+        'n_splits': n_splits
+    }    
+    return results_dict
+
+
 # Example usage
 if __name__ == "__main__":
-    from sklearn.model_selection import train_test_split
-
-    df = pd.DataFrame()
-    label_col = "label"
-    filename_col = "filename"
-    feature_key = "features"
-    zarr_dir = "zarr_dir"
-
-    # Splitting Data into Training and Validation Sets
-    train_df, val_df = train_test_split(
-        df,
-        test_size=0.2,      # 20% of slides for validation
-        stratify=df[label_col],  # preserve class distribution
-        random_state=42
-    )
-
-    train_dataset = ZarrSlideDataset(
-        df=train_df, 
-        filename_col=filename_col, 
-        label_col=label_col, 
-        feature_key=feature_key,
-        tile_key="tiles_224",
-        zarr_dir=zarr_dir
-    )
-
-    val_dataset = ZarrSlideDataset(
-        df=val_df,
+    # Load your data
+    df = pd.read_csv("slides_metadata.csv")  # DataFrame with slide info
+    label_col = "diagnosis"
+    filename_col = "slide_path"
+    feature_key = "features_h-optimus-0"  # or your desired feature key
+    zarr_dir = "/path/to/zarr/cache"
+    
+    # Option 1: K-fold cross-validation (recommended for robust AUC estimation)
+    results = kfold_cross_validation(
+        df=df,
         filename_col=filename_col,
         label_col=label_col,
         feature_key=feature_key,
         tile_key="tiles_224",
-        zarr_dir=zarr_dir
+        zarr_dir=zarr_dir,
+        n_splits=5,
+        n_epochs=20,
+        random_state=42
     )
-
-    train_df = train_df.reset_index(drop=True)
-    val_df = val_df.reset_index(drop=True)
+    print(f"\nFinal Results: AUC = {results['mean_auc']:.4f} +- {results['std_auc']:.4f}")
     
-    model = train_ABMIL(train_df, train_dataset, label_col, n_epochs=10, class_weights=[1.0, 2.0, 3.0])
-    all_labels, all_preds, all_probs = validate_ABMIL(model, val_dataset)
-    confusion_matrix_report(all_labels, all_preds)
+    # Option 2: Single train/val split (faster, less robust)
+    # from sklearn.model_selection import train_test_split
+    # train_df, val_df = train_test_split(
+    #     df,
+    #     test_size=0.2,
+    #     stratify=df[label_col],
+    #     random_state=42
+    # )
+    # train_dataset = ZarrSlideDataset(
+    #     df=train_df, filename_col=filename_col, label_col=label_col,
+    #     feature_key=feature_key, tile_key="tiles_224", zarr_dir=zarr_dir
+    # )
+    # val_dataset = ZarrSlideDataset(
+    #     df=val_df, filename_col=filename_col, label_col=label_col,
+    #     feature_key=feature_key, tile_key="tiles_224", zarr_dir=zarr_dir
+    # )
+    # model = train_ABMIL(train_df, train_dataset, label_col, n_epochs=20)
+    # all_labels, all_preds, all_probs = validate_ABMIL(model, val_dataset)
+    # auc = auc_score(all_labels, all_probs)
+    # print(f"Validation AUC: {auc:.4f}")
