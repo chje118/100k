@@ -194,9 +194,14 @@ class SpatialAgreement:
             mpatches.Patch(color=colors["strong"], label=f"Strong ({max_pairs}/{max_pairs})"),
             mpatches.Patch(color=colors["disagreement"], label=f"Disagreement (0/{max_pairs})"),
         ]
-        if max_pairs > 1:
+        if max_pairs > 2:
+            # Moderate agreement: need at least 2 agreeing pairs
+            if max_pairs == 3:
+                mod_label = f"Moderate ({max_pairs-1}/{max_pairs})"
+            else:
+                mod_label = f"Moderate (2..{max_pairs-1}/{max_pairs})"
             legend_patches.insert(
-                1, mpatches.Patch(color=colors["moderate"], label=f"Moderate (1..{max_pairs-1}/{max_pairs})")
+                1, mpatches.Patch(color=colors["moderate"], label=mod_label)
             )
         ax.legend(handles=legend_patches, title="Agreement (pairwise)", loc="upper left", bbox_to_anchor=(1, 1))
         ax.set_title("Spatial Agreement Across Models")
