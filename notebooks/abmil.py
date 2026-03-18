@@ -100,8 +100,7 @@ def train_ABMIL(
     device=None,
     use_amp=True,
     amp_dtype=torch.bfloat16,
-    compile_model=False,
-    train_loader_kwargs=None,
+    compile_model=False
 ):
     """
     Train ABMIL model with optional class weights for handling class imbalance.
@@ -112,13 +111,11 @@ def train_ABMIL(
     - label_col: Column name for labels
     - n_epochs: Number of training epochs
     - class_weights: Optional tensor of class weights (shape: [n_classes])
-                   Higher weights give more importance to that class during training.
-                   Useful for handling class imbalance or emphasizing severe classes.
+            Higher weights give more importance to that class during training.
     - device: Torch device string, e.g. "cuda" or "cpu". Defaults to "cuda" if available.
     - use_amp: If True and running on CUDA, use autocast mixed precision (optimized for H100).
     - amp_dtype: Autocast dtype when use_amp is True (default: torch.bfloat16, good for H100).
     - compile_model: If True and torch.compile is available, compile the model for extra speed.
-    - train_loader_kwargs: Optional dict of extra DataLoader kwargs (e.g. num_workers, pin_memory).
     """
     # Decide device
     if device is None:
@@ -126,18 +123,9 @@ def train_ABMIL(
     print(f"Using device: {device}")
 
     # DataLoader: decides when items are loaded, handles shuffling and batching
-    default_loader_kwargs = {
-        "batch_size": 1,
-        "shuffle": True,
-    }
-
-    # On GPU we generally benefit from pinned memory
+    default_loader_kwargs = {"batch_size": 1, "shuffle": True,}
     if device.startswith("cuda"):
         default_loader_kwargs["pin_memory"] = True
-
-    if train_loader_kwargs is not None:
-        default_loader_kwargs.update(train_loader_kwargs)
-
     train_loader = DataLoader(train_dataset, **default_loader_kwargs)
 
     # Extract Feature Dimension and Number of Classes
@@ -148,7 +136,7 @@ def train_ABMIL(
     # Create the ABMIL Model
     model = ABMIL(feat_dim, n_classes).to(device)
 
-    # Enable TF32 / high matmul precision on modern GPUs (e.g. H100) when available
+    # Enable TF32 / high matmul precision on modern GPUs (e.g. H100)
     if device.startswith("cuda"):
         try:
             torch.set_float32_matmul_precision("high")
@@ -159,7 +147,7 @@ def train_ABMIL(
             if hasattr(torch.backends.cuda, "cudnn"):
                 torch.backends.cuda.cudnn.allow_tf32 = True
 
-    # Optionally compile model for additional speed (PyTorch 2.x+)
+    # Ccompile model for additional speed (PyTorch 2.x+)
     if compile_model and hasattr(torch, "compile") and device.startswith("cuda"):
         try:
             model = torch.compile(model)
@@ -230,22 +218,14 @@ def validate_ABMIL(
     device=None,
     use_amp=True,
     amp_dtype=torch.bfloat16,
-    val_loader_kwargs=None,
-):
+    ):
     if device is None:
         device = next(model.parameters()).device
 
     # Validation DataLoader
-    default_loader_kwargs = {
-        "batch_size": 1,
-        "shuffle": False,
-    }
+    default_loader_kwargs = {"batch_size": 1, "shuffle": False,}
     if isinstance(device, str) and device.startswith("cuda"):
         default_loader_kwargs["pin_memory"] = True
-
-    if val_loader_kwargs is not None:
-        default_loader_kwargs.update(val_loader_kwargs)
-
     val_loader = DataLoader(val_dataset, **default_loader_kwargs)
 
     # Validation Loop
@@ -269,6 +249,7 @@ def validate_ABMIL(
             # Normalize features per slide
             feats = (feats - feats.mean(0)) / (feats.std(0) + 1e-6)
 
+            # Forward pass (optionally with mixed precision on CUDA)
             if (isinstance(device, str) and device.startswith("cuda")
                     and use_amp and torch.cuda.is_available()):
                 with torch.autocast(device_type="cuda", dtype=amp_dtype):
@@ -289,6 +270,7 @@ def validate_ABMIL(
 
 def confusion_matrix_report(all_labels, all_preds):
     """
+    Generate a confusion matrix report.
     Parameters:
     - all_labels: list of true labels
     - all_preds: list of predicted labels
@@ -321,7 +303,7 @@ def save_model(model, model_name):
     torch.save(model.state_dict(), save_path)
     print(f"Model saved to {save_path}")
 
-def _parse_dims_from_model_path(model_path):
+def _parse_model_dimensions(model_path):
     """ Parse dimensions from model filename: `..._<in_dim>_<n_classes>_<hidden_dim>.pth`. """
     base = os.path.basename(model_path)
     parsed = re.search(r"_(\d+)_(\d+)_(\d+)\.pth$", base)
@@ -335,10 +317,10 @@ def _parse_dims_from_model_path(model_path):
 
 def load_model(model_path):
     """
-    Load a trained ABMIL model from disk. 
-    Expects filename to contain dimensions in format: `..._<in_dim>_<n_classes>_<hidden_dim>.pth`.
+    Load a trained ABMIL model. 
+    Expects filename in format: `..._<in_dim>_<n_classes>_<hidden_dim>.pth`.
     """
-    in_dim, n_classes, hidden_dim = _parse_dims_from_model_path(model_path)
+    in_dim, n_classes, hidden_dim = _parse_model_dimensions(model_path)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Loading model from {model_path} on device: {device}")
@@ -350,41 +332,6 @@ def load_model(model_path):
     print(f"Model successfully loaded")
     return model, {"in_dim": in_dim, "n_classes": n_classes, "hidden_dim": hidden_dim}
 
-
-def auc_summary(y_true, y_proba):
-    """
-    Compute ROC AUC.
-    - Binary: returns auc_roc (class 1 vs rest)
-    - Multiclass: macro OVR AUC
-    """
-    n_classes = y_proba.shape[1]
-    if n_classes == 2:
-        auc = float(roc_auc_score(y_true, y_proba[:, 1]))
-        return {"auc_roc": auc, "n_classes": 2}
-
-    auc = float(roc_auc_score(y_true, y_proba, multi_class="ovr", average="macro"))
-    return {"auc_roc_ovr_macro": auc, "n_classes": int(n_classes)}
-
-def plot_roc_curves(runs_results, title="ABMIL ROC curves"):
-    """ Plot ROC curves for multiple runs.
-    
-    Parameters:
-    - runs_results: List of (run_name, y_true, y_proba) tuples
-    - title: Plot title
-    
-    Binary ROC only. For multiclass, use summary AUCs.
-    """
-    fig, ax = plt.subplots(figsize=(6, 6))
-    
-    for name, y_true, y_proba in runs_results:
-        if y_proba.shape[1] != 2:
-            continue
-        RocCurveDisplay.from_predictions(y_true, y_proba[:, 1], name=name, ax=ax)
-
-    ax.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=1)
-    ax.set_title(title)
-    ax.grid(True, alpha=0.2)
-    plt.show()
 
 # Example usage
 if __name__ == "__main__":
