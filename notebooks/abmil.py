@@ -15,6 +15,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import lazyslide as zs
 from tqdm import tqdm
+import re
 
 class ZarrSlideDataset(Dataset):
     def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir):
@@ -317,27 +318,34 @@ def save_model(model, model_name):
     torch.save(model.state_dict(), save_path)
     print(f"Model saved to {save_path}")
 
-def load_model(model_path, in_dim, n_classes, hidden_dim=256):
+def _parse_dims_from_model_path(model_path):
+    """ Parse dimensions from model filename: `..._<in_dim>_<n_classes>_<hidden_dim>.pth`. """
+    base = os.path.basename(model_path)
+    parsed = re.search(r"_(\d+)_(\d+)_(\d+)\.pth$", base)
+    if not parsed:
+        raise ValueError(
+            f"Could not parse dims from model filename '{base}'. "
+            "Expected suffix like '_<in_dim>_<n_classes>_<hidden_dim>.pth'."
+        )
+    return int(parsed.group(1)), int(parsed.group(2)), int(parsed.group(3))
+
+
+def load_model(model_path):
     """
-    Load a trained ABMIL model from disk.
-    
-    Parameters:
-    - model_path (str): Path to the saved model
-    - in_dim (int): Feature size per tile (must match training)
-    - n_classes (int): Number of output classes (must match training)
-    - hidden_dim (int): Size of attention hidden layer (must match training)
-    
-    Returns:
-        ABMIL: Loaded model ready for inference
+    Load a trained ABMIL model from disk. 
+    Expects filename to contain dimensions in format: `..._<in_dim>_<n_classes>_<hidden_dim>.pth`.
     """
+    in_dim, n_classes, hidden_dim = _parse_dims_from_model_path(model_path)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Loading model from {model_path} on device: {device}")
 
+    # Initialize model and load state dict
     model = ABMIL(in_dim, n_classes, hidden_dim).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()  # Set to evaluation mode
     print(f"Model successfully loaded")
-    return model
+    return model, {"in_dim": in_dim, "n_classes": n_classes, "hidden_dim": hidden_dim}
 
 
 # Example Usage
