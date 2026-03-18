@@ -90,7 +90,6 @@ class SpatialAgreement:
             target_col = f"domain_{model}"
             gdf_aligned[target_col] = gdf_aligned[target_col].map(mapping)
 
-        gdf_aligned[ref_col] = gdf_aligned[ref_col]
         return gdf_aligned
 
     def agreement_level(self, gdf_aligned):
@@ -192,7 +191,6 @@ class SpatialAgreement:
 
         plot_df.plot(color=plot_df["agreement_color"], linewidth=0, ax=ax)
 
-        # TODO: move legend outside image, to top right corner
         legend_patches = [
             mpatches.Patch(color=colors["strong"], label=f"Strong ({max_pairs}/{max_pairs})"),
             mpatches.Patch(color=colors["disagreement"], label=f"Disagreement (0/{max_pairs})"),
@@ -201,7 +199,7 @@ class SpatialAgreement:
             legend_patches.insert(
                 1, mpatches.Patch(color=colors["moderate"], label=f"Moderate (1..{max_pairs-1}/{max_pairs})")
             )
-        ax.legend(handles=legend_patches, title="Agreement (pairwise)", loc="center left")
+        ax.legend(handles=legend_patches, title="Agreement (pairwise)", loc="upper left", bbox_to_anchor=(1, 1))
         ax.set_title("Spatial Agreement Across Models")
         ax.set_axis_off()
         plt.tight_layout()
@@ -216,13 +214,13 @@ class SpatialAgreement:
         rows = []
         # change d, k and v to understable variable names
         for slide_idx in range(len(self.filenames)):
-            d = self.slide_level_agreement(slide_idx)
-            for k, v in d.items():
+            agree_metrics = self.slide_level_agreement(slide_idx)
+            for comp_key, agree_value in agree_metrics.items():
                 rows.append(
                     {
                         "slide_idx": slide_idx,
-                        "comparison": "all_agree" if k == "full_agreement" else k,
-                        "agreement_rate": float(v),
+                        "comparison": "all_agree" if comp_key == "full_agreement" else comp_key,
+                        "agreement_rate": float(agree_value),
                     }
                 )
         return pd.DataFrame(rows)
@@ -263,7 +261,13 @@ class SpatialAgreement:
 
         fig, ax = plt.subplots(figsize=(6, 4))
         
-        # TODO: boxplot behind, with strip inside, so I can see the actual points if I want
+        sns.boxplot(
+            data=df,
+            x="comparison",
+            y="agreement_rate",
+            ax=ax,
+            width=0.5,
+        )
         sns.stripplot(
             data=df,
             x="comparison",
