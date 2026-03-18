@@ -147,7 +147,7 @@ def train_ABMIL(
             if hasattr(torch.backends.cuda, "cudnn"):
                 torch.backends.cuda.cudnn.allow_tf32 = True
 
-    # Ccompile model for additional speed (PyTorch 2.x+)
+    # Compile model for additional speed (PyTorch 2.x+)
     if compile_model and hasattr(torch, "compile") and device.startswith("cuda"):
         try:
             model = torch.compile(model)
@@ -233,6 +233,7 @@ def validate_ABMIL(
 
     all_labels = []
     all_preds = []
+    all_probs = []
 
     with torch.no_grad():   # Disables gradient computation (save memory)
         for feats, tile_ids, label in tqdm(val_loader, desc="Validation", leave=False):
@@ -257,16 +258,19 @@ def validate_ABMIL(
             else:
                 logits, _ = model(feats)
 
-            # Compute predicted class
+            # Compute predicted class and probabilities
+            probs = torch.softmax(logits, dim=0).cpu().numpy()
             pred = torch.argmax(logits, dim=0).item()
             
             all_labels.append(label.item())
             all_preds.append(pred)
+            all_probs.append(probs)
 
+    all_probs = np.array(all_probs)
     accuracy = np.mean(np.array(all_labels) == np.array(all_preds))
     print(f"Validation Accuracy: {accuracy:.4f}")
 
-    return all_labels, all_preds
+    return all_labels, all_preds, all_probs
 
 def confusion_matrix_report(all_labels, all_preds):
     """
@@ -332,37 +336,35 @@ def load_model(model_path):
     print(f"Model successfully loaded")
     return model, {"in_dim": in_dim, "n_classes": n_classes, "hidden_dim": hidden_dim}
 
-def auc_score(all_labels, all_preds):
+def auc_score(all_labels, all_probs):
     """
     Compute AUC score for multi-class classification.
     
     Parameters:
     - all_labels: list of true labels
-    - all_preds: list of predicted labels (class indices)
+    - all_probs: array of predicted probabilities (shape: [n_samples, n_classes])
     
     Returns:
     - AUC score (float)
     """
-    # Convert to one-hot encoding for AUC calculation
-    n_classes = len(set(all_labels))
+    # Convert true labels to one-hot encoding
+    n_classes = all_probs.shape[1]
     y_true = np.eye(n_classes)[all_labels]
-    y_scores = np.eye(n_classes)[all_preds]
 
-    return roc_auc_score(y_true, y_scores, average="macro")
+    return roc_auc_score(y_true, all_probs, average="macro")
 
-def plot_roc_curve(all_labels, all_preds):
+def plot_roc_curve(all_labels, all_probs):
     """
     Plot ROC curve for multi-class classification.
     
     Parameters:
     - all_labels: list of true labels
-    - all_preds: list of predicted labels (class indices)
+    - all_probs: array of predicted probabilities (shape: [n_samples, n_classes])
     """
-    n_classes = len(set(all_labels))
+    n_classes = all_probs.shape[1]
     y_true = np.eye(n_classes)[all_labels]
-    y_scores = np.eye(n_classes)[all_preds]
 
-    RocCurveDisplay.from_predictions(y_true, y_scores, average="macro")
+    RocCurveDisplay.from_predictions(y_true, all_probs, average="macro")
     plt.title("ROC Curve")
     plt.show()
 
