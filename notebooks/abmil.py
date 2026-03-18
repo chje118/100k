@@ -365,6 +365,7 @@ def plot_roc_curve(all_labels, all_probs):
     plt.title("ROC Curve")
     plt.show()
 
+# No weights for FM benchmark
 def kfold_cross_validation(
     df,
     filename_col,
