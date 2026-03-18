@@ -123,7 +123,7 @@ class SpatialAgreement:
         for i, path in enumerate(self.filenames):
             wsi = self.load_slide(path)
             gdf = self.get_shapes(wsi)
-            cont_tables = self.contingency_tabels(gdf)
+            cont_tables = self.contingency_tables(gdf)
             gdf_aligned = self.domain_alignment(gdf, cont_tables)
             gdf_aligned = self.agreement_level(gdf_aligned)
             agreement_dict[i] = gdf_aligned
@@ -175,9 +175,9 @@ class SpatialAgreement:
         max_pairs = n_models * (n_models - 1) // 2
 
         colors = {
-            "strong": "#1a9850",
+            "strong": "#19b95e",
             "moderate": "#fee08b",
-            "disagreement": "#d73027",
+            "disagreement": "#ed4138",
         }
 
         level = gdf_aligned["agreement_level"]
@@ -188,10 +188,11 @@ class SpatialAgreement:
         plot_df["agreement_class"] = agreement_class
         plot_df["agreement_color"] = plot_df["agreement_class"].map(colors)
 
-        fig, ax = plt.subplots(figsize=(6, 6))
+        fig, ax = plt.subplots(figsize=(5, 5))
 
         plot_df.plot(color=plot_df["agreement_color"], linewidth=0, ax=ax)
 
+        # TODO: move legend outside image, to top right corner
         legend_patches = [
             mpatches.Patch(color=colors["strong"], label=f"Strong ({max_pairs}/{max_pairs})"),
             mpatches.Patch(color=colors["disagreement"], label=f"Disagreement (0/{max_pairs})"),
@@ -241,7 +242,7 @@ class SpatialAgreement:
         else:
             ylab = "Agreement"
 
-        fig, ax = plt.subplots(figsize=(10, 4))
+        fig, ax = plt.subplots(figsize=(6, 4))
         
         sns.boxplot(data=df, x="comparison", y="agreement_rate")
         ax.set_xlabel("")
@@ -264,8 +265,9 @@ class SpatialAgreement:
         else:
             ylab = "Agreement"
 
-        fig, ax = plt.subplots(figsize=(10, 4))
+        fig, ax = plt.subplots(figsize=(6, 4))
         
+        # TODO: boxplot behind, with strip inside, so I can see the actual points if I want
         sns.stripplot(
             data=df,
             x="comparison",
