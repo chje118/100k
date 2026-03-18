@@ -97,28 +97,38 @@ class ABMIL(nn.Module):
 def train_ABMIL(
     train_df,
     train_dataset,
-    label_col,
+    val_dataset=None,
+    label_col=None,
     n_epochs=10,
     class_weights=None,
     device=None,
     use_amp=True,
     amp_dtype=torch.bfloat16,
-    compile_model=False
+    compile_model=False,
+    early_stopping_patience=None
 ):
     """
-    Train ABMIL model with optional class weights for handling class imbalance.
+    Train ABMIL model with optional early stopping for best AUC comparability.
     
     Parameters:
     - train_df: DataFrame with training data
     - train_dataset: ZarrSlideDataset instance
-    - label_col: Column name for labels
-    - n_epochs: Number of training epochs
+    - val_dataset: Optional ZarrSlideDataset for early stopping. If provided, trains until 
+                   validation AUC plateaus, ensuring fair comparison across folds.
+    - label_col: Column name for labels (required if using early stopping)
+    - n_epochs: Maximum number of training epochs
     - class_weights: Optional tensor of class weights (shape: [n_classes])
             Higher weights give more importance to that class during training.
     - device: Torch device string, e.g. "cuda" or "cpu". Defaults to "cuda" if available.
     - use_amp: If True and running on CUDA, use autocast mixed precision (optimized for H100).
     - amp_dtype: Autocast dtype when use_amp is True (default: torch.bfloat16, good for H100).
     - compile_model: If True and torch.compile is available, compile the model for extra speed.
+    - early_stopping_patience: Number of epochs with no improvement to wait before stopping.
+                              If None, trains for all n_epochs (no early stopping).
+    
+    Returns:
+    - model: Trained ABMIL model
+    - best_model_state: Best model state dict (for restoring best model when using early stopping)
     """
     # Decide device
     if device is None:
@@ -169,6 +179,11 @@ def train_ABMIL(
     else:
         loss_fn = torch.nn.CrossEntropyLoss()
 
+    # Early stopping setup
+    best_auc = -1.0
+    epochs_no_improve = 0
+    best_model_state = None
+    
     # Training Loop
     for epoch in tqdm(range(n_epochs), desc="Epochs"):
         model.train()
@@ -207,9 +222,40 @@ def train_ABMIL(
             # Accumulate loss
             total_loss += loss.item()
 
-        print(f"Epoch {epoch+1}/{n_epochs} | Loss: {total_loss:.4f}")
+        print(f"Epoch {epoch+1}/{n_epochs} | Loss: {total_loss:.4f}", end="")
+        
+        # Early stopping: evaluate on validation set if provided
+        if val_dataset is not None and early_stopping_patience is not None:
+            all_labels, all_preds, all_probs = validate_ABMIL(
+                model=model,
+                val_dataset=val_dataset,
+                device=device,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                verbose=False
+            )
+            val_auc = auc_score(all_labels, all_probs)
+            print(f" | Val AUC: {val_auc:.4f}", end="")
+            
+            # Check if validation AUC improved
+            if val_auc > best_auc:
+                best_auc = val_auc
+                epochs_no_improve = 0
+                best_model_state = model.state_dict().copy()
+                print(" (improved)", end="")
+            else:
+                epochs_no_improve += 1
+                print(f" (no improve: {epochs_no_improve}/{early_stopping_patience})", end="")
+            
+            # Early stopping
+            if epochs_no_improve >= early_stopping_patience:
+                print(f"\nEarly stopping at epoch {epoch+1}")
+                model.load_state_dict(best_model_state)
+                break
+        
+        print()
 
-    return model
+    return model, best_model_state
 
 
 def validate_ABMIL(
@@ -218,6 +264,7 @@ def validate_ABMIL(
     device=None,
     use_amp=True,
     amp_dtype=torch.bfloat16,
+    verbose=True,
     ):
     if device is None:
         device = next(model.parameters()).device
@@ -236,7 +283,7 @@ def validate_ABMIL(
     all_probs = []
 
     with torch.no_grad():   # Disables gradient computation (save memory)
-        for feats, tile_ids, label in tqdm(val_loader, desc="Validation", leave=False):
+        for feats, tile_ids, label in tqdm(val_loader, desc="Validation", leave=False, disable=not verbose):
             if feats.dim() == 3:
                 feats = feats.squeeze(0)
             if tile_ids.ndim == 2:
@@ -265,7 +312,8 @@ def validate_ABMIL(
 
     all_probs = np.array(all_probs)
     accuracy = np.mean(np.array(all_labels) == np.array(all_preds))
-    print(f"Validation Accuracy: {accuracy:.4f}")
+    if verbose:
+        print(f"Validation Accuracy: {accuracy:.4f}")
 
     return all_labels, all_preds, all_probs
 
@@ -375,6 +423,7 @@ def kfold_cross_validation(
     zarr_dir,
     n_splits=5,
     n_epochs=10,
+    early_stopping_patience=3,
     class_weights=None,
     device=None,
     use_amp=True,
@@ -383,7 +432,11 @@ def kfold_cross_validation(
     random_state=42
 ):
     """
-    Perform K-fold cross-validation for ABMIL model and report mean +- std AUC.
+    Perform K-fold cross-validation for ABMIL model with early stopping for best AUC comparability.
+    
+    For fair AUC comparison across folds, this function uses early stopping on each fold's internal
+    validation set. This ensures each fold trains until it reaches peak performance, enabling 
+    meaningful comparison of model performance across different data splits.
     
     Parameters:
     - df: DataFrame with all data
@@ -393,7 +446,10 @@ def kfold_cross_validation(
     - tile_key: Key for accessing tiles in zarr
     - zarr_dir: Directory containing zarr files
     - n_splits: Number of folds (default: 5)
-    - n_epochs: Number of training epochs per fold
+    - n_epochs: Maximum number of training epochs per fold
+    - early_stopping_patience: Number of epochs with no validation AUC improvement to wait before
+                              stopping (default: 3). Set to None to disable early stopping and train 
+                              for exactly n_epochs.
     - class_weights: Optional tensor of class weights
     - device: Torch device (default: cuda if available else cpu)
     - use_amp: Use mixed precision training
@@ -410,7 +466,7 @@ def kfold_cross_validation(
     fold_auc_scores = []
     fold_accuracies = []
     
-    print(f"Starting {n_splits}-fold cross-validation...")
+    print(f"Starting {n_splits}-fold cross-validation with early stopping (patience={early_stopping_patience})...")
     
     for fold_idx, (train_idx, val_idx) in enumerate(skf.split(df, df[label_col])):
         print(f"\n{'='*60}")
@@ -440,17 +496,19 @@ def kfold_cross_validation(
             zarr_dir=zarr_dir
         )
         
-        # Train model on this fold
-        model = train_ABMIL(
+        # Train model on this fold with early stopping
+        model, _ = train_ABMIL(
             train_df=train_df,
             train_dataset=train_dataset,
+            val_dataset=val_dataset,
             label_col=label_col,
             n_epochs=n_epochs,
             class_weights=class_weights,
             device=device,
             use_amp=use_amp,
             amp_dtype=amp_dtype,
-            compile_model=compile_model
+            compile_model=compile_model,
+            early_stopping_patience=early_stopping_patience
         )
         
         # Validate on this fold
@@ -507,7 +565,9 @@ if __name__ == "__main__":
     feature_key = "features_h-optimus-0"  # or your desired feature key
     zarr_dir = "/path/to/zarr/cache"
     
-    # Option 1: K-fold cross-validation (recommended for robust AUC estimation)
+    # K-fold cross-validation with early stopping (RECOMMENDED)
+    # Early stopping ensures each fold trains until validation AUC plateaus, for fair AUC comparability.
+    # The patience parameter controls how many epochs to wait without improvement before stopping.
     results = kfold_cross_validation(
         df=df,
         filename_col=filename_col,
@@ -516,12 +576,27 @@ if __name__ == "__main__":
         tile_key="tiles_224",
         zarr_dir=zarr_dir,
         n_splits=5,
-        n_epochs=20,
+        n_epochs=100,               # Maximum epochs
+        early_stopping_patience=3,  # Stop after 3 epochs with no AUC improvement
         random_state=42
     )
     print(f"\nFinal Results: AUC = {results['mean_auc']:.4f} +- {results['std_auc']:.4f}")
     
-    # Option 2: Single train/val split (faster, less robust)
+    # Alternative: K-fold without early stopping (train for exactly n_epochs)
+    # results_no_es = kfold_cross_validation(
+    #     df=df,
+    #     filename_col=filename_col,
+    #     label_col=label_col,
+    #     feature_key=feature_key,
+    #     tile_key="tiles_224",
+    #     zarr_dir=zarr_dir,
+    #     n_splits=5,
+    #     n_epochs=20,
+    #     early_stopping_patience=None,  # Disable early stopping
+    #     random_state=42
+    # )
+    
+    # Alternative: Single train/val split (faster, less robust)
     # from sklearn.model_selection import train_test_split
     # train_df, val_df = train_test_split(
     #     df,
@@ -537,7 +612,8 @@ if __name__ == "__main__":
     #     df=val_df, filename_col=filename_col, label_col=label_col,
     #     feature_key=feature_key, tile_key="tiles_224", zarr_dir=zarr_dir
     # )
-    # model = train_ABMIL(train_df, train_dataset, label_col, n_epochs=20)
+    # model, _ = train_ABMIL(train_df, train_dataset, val_dataset, label_col, 
+    #                         n_epochs=100, early_stopping_patience=3)
     # all_labels, all_preds, all_probs = validate_ABMIL(model, val_dataset)
     # auc = auc_score(all_labels, all_probs)
     # print(f"Validation AUC: {auc:.4f}")
