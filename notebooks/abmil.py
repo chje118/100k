@@ -1,6 +1,9 @@
 """
 Attention-Based Multiple Instance Learning (ABMIL) for Whole Slide Image Classification.
-Assumes multi-class, single-label classification.
+Assumes binary or multi-class, single-label classification.
+
+Evaluation includes confusion matrix and classification report, AUC and ROC curves.
+Model saving and loading functions are included, with auto-generated filenames containing model dimensions for easy tracking.
 """
 
 import os
@@ -10,7 +13,7 @@ import pandas as pd
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from wsidata import open_wsi
-from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score, RocCurveDisplay
 import seaborn as sns
 import matplotlib.pyplot as plt
 import lazyslide as zs
@@ -348,7 +351,42 @@ def load_model(model_path):
     return model, {"in_dim": in_dim, "n_classes": n_classes, "hidden_dim": hidden_dim}
 
 
-# Example Usage
+def auc_summary(y_true, y_proba):
+    """
+    Compute ROC AUC.
+    - Binary: returns auc_roc (class 1 vs rest)
+    - Multiclass: macro OVR AUC
+    """
+    n_classes = y_proba.shape[1]
+    if n_classes == 2:
+        auc = float(roc_auc_score(y_true, y_proba[:, 1]))
+        return {"auc_roc": auc, "n_classes": 2}
+
+    auc = float(roc_auc_score(y_true, y_proba, multi_class="ovr", average="macro"))
+    return {"auc_roc_ovr_macro": auc, "n_classes": int(n_classes)}
+
+def plot_roc_curves(runs_results, title="ABMIL ROC curves"):
+    """ Plot ROC curves for multiple runs.
+    
+    Parameters:
+    - runs_results: List of (run_name, y_true, y_proba) tuples
+    - title: Plot title
+    
+    Binary ROC only. For multiclass, use summary AUCs.
+    """
+    fig, ax = plt.subplots(figsize=(6, 6))
+    
+    for name, y_true, y_proba in runs_results:
+        if y_proba.shape[1] != 2:
+            continue
+        RocCurveDisplay.from_predictions(y_true, y_proba[:, 1], name=name, ax=ax)
+
+    ax.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=1)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.2)
+    plt.show()
+
+# Example usage
 if __name__ == "__main__":
     from sklearn.model_selection import train_test_split
 
