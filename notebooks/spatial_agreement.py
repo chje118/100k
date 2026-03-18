@@ -160,7 +160,7 @@ class SpatialAgreement:
         out["full_agreement"] = full_rate
         return out
 
-    def plot_agreement_map(self, slide_idx, show=True):
+    def plot_agreement_map(self, slide_idx):
         """
         Plot spatial agreement, with generalized coloring for any number of models:
         - 0 agreeing pairs -> "Disagreement"
@@ -205,9 +205,7 @@ class SpatialAgreement:
         ax.set_title("Spatial Agreement Across Models")
         ax.set_axis_off()
         plt.tight_layout()
-        if show:
-            plt.show()
-        return fig, ax, plot_df
+        plt.show()
 
     def overall_slide_agreement(self):
         """
@@ -229,7 +227,7 @@ class SpatialAgreement:
                 )
         return pd.DataFrame(rows)
 
-    def boxplot_slide_agreement(self, show=True, percent=True):
+    def boxplot_slide_agreement(self, percent=True):
         """
         Boxplot of slide-level agreement rates across slides.
         """
@@ -249,11 +247,9 @@ class SpatialAgreement:
         ax.set_ylabel(ylab)
         ax.tick_params(axis="x", rotation=45)
         plt.tight_layout()
-        if show:
-            plt.show()
-        return fig, ax, df
-
-    def stripplot_slide_agreement(self, show=True, percent=True):
+        plt.show()
+        
+    def stripplot_slide_agreement(self, percent=True):
         """
         Stripplot of slide-level agreement rates (one point per slide per comparison).
         """
@@ -281,6 +277,4 @@ class SpatialAgreement:
         ax.set_ylabel(ylab)
         ax.tick_params(axis="x", rotation=45)
         plt.tight_layout()
-        if show:
-            plt.show()
-        return fig, ax, df
+        plt.show()
