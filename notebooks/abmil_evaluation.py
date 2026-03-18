@@ -1,6 +1,5 @@
 """
-ABMIL evaluation utilities: AUC + plots.
-
+ABMIL evaluation utilities: AUC + ROC plot.
 Designed to compare ABMIL runs trained on features from different foundation models.
 """
 
@@ -19,17 +18,18 @@ import matplotlib.pyplot as plt
 
 try:
     # when repository root is on PYTHONPATH
-    from notebooks.abmil import ABMIL, ZarrSlideDataset  # type: ignore
+    from notebooks.abmil import ABMIL, ZarrSlideDataset 
 except Exception:
     # when running from inside `notebooks/` directory
-    from abmil import ABMIL, ZarrSlideDataset  # type: ignore
+    from abmil import ABMIL, ZarrSlideDataset
 
 
+# For each ABMIL checkpoint we want to evaluate, define an ABMILRun with the necessary info to load the model and dataset.
 @dataclass(frozen=True)
 class ABMILRun:
-    name: str
-    model_path: str
-    feature_key: str
+    name: str # name of run
+    model_path: str # path to saved model .pth file
+    feature_key: str 
     tile_key: str = "tiles_224"
     hidden_dim: int = 256
 
@@ -39,29 +39,34 @@ def _parse_dims_from_model_path(model_path: str) -> Tuple[int, int, int]:
     Parse `..._<in_dim>_<n_classes>_<hidden_dim>.pth` from `save_model` naming.
     """
     base = os.path.basename(model_path)
-    m = re.search(r"_(\d+)_(\d+)_(\d+)\.pth$", base)
-    if not m:
+    parsed = re.search(r"_(\d+)_(\d+)_(\d+)\.pth$", base)
+    if not parsed:
         raise ValueError(
             f"Could not parse dims from model filename '{base}'. "
             "Expected suffix like '_<in_dim>_<n_classes>_<hidden_dim>.pth'."
         )
-    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    return int(parsed.group(1)), int(parsed.group(2)), int(parsed.group(3))
 
 
-def load_abmil_from_checkpoint(model_path: str, device: Optional[str] = None) -> Tuple[ABMIL, Dict[str, int]]:
+def load_abmil_from_checkpoint(model_path: str) -> Tuple[ABMIL, Dict[str, int]]:
     in_dim, n_classes, hidden_dim = _parse_dims_from_model_path(model_path)
 
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # Initialize model
     model = ABMIL(in_dim=in_dim, n_classes=n_classes, hidden_dim=hidden_dim).to(device)
+    
+    # Load state dict
     state = torch.load(model_path, map_location=device)
     model.load_state_dict(state)
+    
+    # Set to eval mode (no dropout, etc.)
     model.eval()
+
     return model, {"in_dim": in_dim, "n_classes": n_classes, "hidden_dim": hidden_dim}
 
 
-@torch.no_grad()
+@torch.no_grad() # disable gradient computation (faster, less memory)
 def predict_proba_abmil(
     model: ABMIL,
     dataset: ZarrSlideDataset,
