@@ -1,19 +1,11 @@
 """
 Attention-Based Multiple Instance Learning (ABMIL) for Whole Slide Image Classification.
-Includes methods for training, validation, and evaluation of ABMIL models on pathology datasets, 
-as well as method for saving and loading trained models.
 
-ABMIL Classification: 
-- Assumes binary or multi-class, single-label classification.
-
-ABMIL Evaluation:
-- Confusion matrix, classification report (precision, recall, F1).
-- AUC and ROC curve for binary classification.
-- Macro AUC (unweighted mean of one-vs-rest AUC) for multi-class pathology classification.
-    
-Macro AUC is class-balanced and appropriate when all diagnostic categories are equally important.
-For each class i, one-vs-rest AUC is computed as the ROC AUC treating class i vs. all others.
-Then macro AUC = mean(AUC_i for all classes i).
+ABMIL Architecture: Attention-based MIL pooling on tile embeddings for slide-level predictions.
+Classification: Binary or multi-class, single-label classification on pathology slides.
+Evaluation: Macro AUC (class-balanced, appropriate for pathology benchmark).
+    - For each class i: one-vs-rest AUC treating class i vs. all others
+    - Macro AUC = mean(AUC_i for all classes i)
 """
 
 import os
@@ -27,7 +19,6 @@ from sklearn.metrics import confusion_matrix, classification_report, roc_auc_sco
 from sklearn.model_selection import StratifiedKFold
 import seaborn as sns
 import matplotlib.pyplot as plt
-import lazyslide as zs
 from tqdm import tqdm
 import re
 import random
@@ -49,7 +40,62 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-# ==================== INTERNAL HELPER FUNCTIONS ====================
+def _create_dataloader(dataset, batch_size=1, shuffle=False, device=None, worker_init_fn=None):
+    """Create DataLoader with standard configuration."""
+    kwargs = {"batch_size": batch_size, "shuffle": shuffle}
+    if worker_init_fn is not None:
+        kwargs["worker_init_fn"] = worker_init_fn
+    if isinstance(device, str) and device.startswith("cuda"):
+        kwargs["pin_memory"] = True
+    return DataLoader(dataset, **kwargs)
+
+def _configure_gpu_optimization():
+    """Configure GPU for modern CUDA GPUs."""
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.set_float32_matmul_precision("high")
+    except AttributeError:
+        pass
+    if hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+    if hasattr(torch.backends.cuda, "cudnn"):
+        torch.backends.cuda.cudnn.allow_tf32 = True
+
+def _preprocess_batch(feats, tile_ids, label, device):
+    """Preprocess batch tensors before forward pass."""
+    if feats.dim() == 3:
+        feats = feats.squeeze(0)
+    if tile_ids.ndim == 2:
+        tile_ids = tile_ids.squeeze(0)
+    feats = feats.to(device, non_blocking=True)
+    label = label.to(device, non_blocking=True)
+    return feats, tile_ids, label
+
+def _should_use_amp(device, use_amp):
+    """Check if AMP should be enabled."""
+    return (isinstance(device, str) and device.startswith("cuda") and 
+            use_amp and torch.cuda.is_available())
+
+def _extract_model_dims(model):
+    """Extract dimensions from ABMIL model."""
+    return {
+        'in_dim': model.classifier.in_features,
+        'n_classes': model.classifier.out_features,
+        'hidden_dim': model.attn[0].out_features
+    }
+
+def _compute_metrics(all_labels, all_preds, all_probs):
+    """Compute accuracy and AUC metrics."""
+    accuracy = np.mean(np.array(all_labels) == np.array(all_preds))
+    auc = auc_score(all_labels, all_probs)
+    return {
+        'labels': all_labels,
+        'preds': all_preds,
+        'probs': all_probs,
+        'accuracy': accuracy,
+        'auc': auc
+    }
 
 def _create_dataloader(dataset, batch_size=1, shuffle=False, device=None, worker_init_fn=None):
     """Create DataLoader with standard configuration."""
@@ -109,8 +155,6 @@ def _compute_metrics(all_labels, all_preds, all_probs):
         'accuracy': accuracy,
         'auc': auc
     }
-
-# ==================== END INTERNAL HELPERS ====================
 
 class ZarrSlideDataset(Dataset):
     def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir, max_tiles=None, seed=None):
@@ -280,6 +324,19 @@ class ABMILPipeline:
         
         return self.validated_df
     
+    def _create_dataset(self, df, max_tiles=None, seed=None):
+        """Helper to create ZarrSlideDataset with pipeline config."""
+        return ZarrSlideDataset(
+            df=df,
+            filename_col=self.filename_col,
+            label_col=self.label_col,
+            feature_key=self.feature_key,
+            tile_key=self.tile_key,
+            zarr_dir=self.zarr_dir,
+            max_tiles=max_tiles,
+            seed=seed
+        )
+    
     def run_k_fold_validation(self, n_splits=5, n_epochs=10, early_stopping_patience=5, 
                               max_tiles=None, random_state=42, class_weights=None, 
                               use_amp=True, compile_model=False):
@@ -338,15 +395,7 @@ class ABMILPipeline:
         df_to_use = self.validated_df if self.validated_df is not None else self.df
         
         print(f"\nTraining final model on {len(df_to_use)} slides...")
-        
-        train_dataset = ZarrSlideDataset(
-            df=df_to_use,
-            filename_col=self.filename_col,
-            label_col=self.label_col,
-            feature_key=self.feature_key,
-            tile_key=self.tile_key,
-            zarr_dir=self.zarr_dir
-        )
+        train_dataset = self._create_dataset(df_to_use)
         
         model, _ = train_ABMIL(
             train_df=df_to_use,
@@ -413,15 +462,7 @@ class ABMILPipeline:
             model = self.model
         
         df_to_use = self.validated_df if self.validated_df is not None else self.df
-        
-        val_dataset = ZarrSlideDataset(
-            df=df_to_use,
-            filename_col=self.filename_col,
-            label_col=self.label_col,
-            feature_key=self.feature_key,
-            tile_key=self.tile_key,
-            zarr_dir=self.zarr_dir
-        )
+        val_dataset = self._create_dataset(df_to_use)
         
         all_labels, all_preds, all_probs = validate_ABMIL(
             model=model,
@@ -994,119 +1035,3 @@ def kfold_cross_validation(
         'n_splits': n_splits
     }    
     return results_dict
-
-
-# Example usage
-if __name__ == "__main__":
-    # Load your data
-    df = pd.read_csv("slides_metadata.csv")  # DataFrame with slide info
-    label_col = "diagnosis"
-    filename_col = "slide_path"
-    feature_key = "features_h-optimus-0"  # or your desired feature key
-    zarr_dir = "/path/to/zarr/cache"
-    
-    # K-fold cross-validation with proper train/internal-val/test split (RECOMMENDED)
-    # Prevents data leakage by using strict three-way split for each fold:
-    # - Train subset (90%): For model training
-    # - Internal validation (10%): For early stopping only
-    # - Test set (20%): For final evaluation only
-    # 
-    # random_state parameter ensures fully reproducible results including:
-    # - Fold splitting
-    # - Model initialization
-    # - Training randomness
-    # - Tile sampling (deterministic per-slide when max_tiles is used)
-    #
-    # Use the same random_state to reproduce exact same AUC values across runs.
-    results = kfold_cross_validation(
-        df=df,
-        filename_col=filename_col,
-        label_col=label_col,
-        feature_key=feature_key,
-        tile_key="tiles_224",
-        zarr_dir=zarr_dir,
-        n_splits=5,
-        n_epochs=100,               # Maximum epochs
-        early_stopping_patience=5,  # Stop after 5 epochs with no AUC improvement on internal val
-        max_tiles=5000,             # Limit to 5000 tiles per slide (None = no limit)
-        random_state=42             # Fixed seed for reproducibility (controls ALL randomness including tile sampling)
-    )
-    print(f"\nFinal Results: Test AUC = {results['mean_auc']:.4f} +- {results['std_auc']:.4f}")
-    
-    # Alternative: K-fold without early stopping (train for exactly n_epochs)
-    # results_no_es = kfold_cross_validation(
-    #     df=df,
-    #     filename_col=filename_col,
-    #     label_col=label_col,
-    #     feature_key=feature_key,
-    #     tile_key="tiles_224",
-    #     zarr_dir=zarr_dir,
-    #     n_splits=5,
-    #     n_epochs=20,
-    #     early_stopping_patience=None,  # Disable early stopping
-    #     max_tiles=None,                # No tile limit
-    #     random_state=42                # Fixed seed for reproducibility
-    # )
-    
-    # Alternative: Single train/internal-val/test split (faster, less robust)
-    # from sklearn.model_selection import train_test_split
-    # # First split: 80% train, 20% test
-    # train_df, test_df = train_test_split(
-    #     df,
-    #     test_size=0.2,
-    #     stratify=df[label_col],
-    #     random_state=42
-    # )
-    # # Second split: split train into 90% train_subset, 10% internal_val
-    # train_subset_df, internal_val_df = train_test_split(
-    #     train_df,
-    #     test_size=1/9,  # 10% of train_df
-    #     stratify=train_df[label_col],
-    #     random_state=42
-    # )
-    # train_dataset = ZarrSlideDataset(
-    #     df=train_subset_df, filename_col=filename_col, label_col=label_col,
-    #     feature_key=feature_key, tile_key="tiles_224", zarr_dir=zarr_dir, max_tiles=5000
-    # )
-    # internal_val_dataset = ZarrSlideDataset(
-    #     df=internal_val_df, filename_col=filename_col, label_col=label_col,
-    #     feature_key=feature_key, tile_key="tiles_224", zarr_dir=zarr_dir, max_tiles=5000
-    # )
-    # test_dataset = ZarrSlideDataset(
-    #     df=test_df, filename_col=filename_col, label_col=label_col,
-    #     feature_key=feature_key, tile_key="tiles_224", zarr_dir=zarr_dir, max_tiles=5000
-    # )
-    # # Train with early stopping on internal_val, evaluate on test_df
-    # model, _ = train_ABMIL(train_subset_df, train_dataset, internal_val_dataset, label_col, 
-    #                         n_epochs=100, early_stopping_patience=5, seed=42)
-    # all_labels, all_preds, all_probs = validate_ABMIL(model, test_dataset)
-    # auc = auc_score(all_labels, all_probs)
-    # print(f"Test AUC: {auc:.4f}")
-
-
-"""   Usage:
-    ```python
-    pipeline = ABMILPipeline(
-        df=df,
-        filename_col='path',
-        label_col='diagnosis',
-        feature_key='features_h-optimus-0',
-        tile_key='tiles_224',
-        zarr_dir='zarr_cache'
-    )
-    
-    # Step 1: Validate slides (optional, removes invalid slides)
-    valid_df = pipeline.validate_slides()
-    
-    # Step 2: Run k-fold cross-validation
-    results = pipeline.run_k_fold_validation(
-        n_splits=5,
-        n_epochs=100,
-        early_stopping_patience=5
-    )
-    
-    # Step 3: Train final model on all data and save
-    model = pipeline.train_final_model(n_epochs=100)
-    pipeline.save_model(model, 'my_model')
-    ```
- """
