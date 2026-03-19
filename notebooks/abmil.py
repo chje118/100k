@@ -72,8 +72,7 @@ def _preprocess_batch(feats, tile_ids, label, device):
     label = label.to(device, non_blocking=True)
     return feats, tile_ids, label
 
-# TODO: remove this function, call logic inline
-def _should_use_amp(device, use_amp):
+def _should_use_amp(device, use_amp, amp_dtype=torch.float16):
     """Check if AMP should be enabled."""
     return (isinstance(device, str) and device.startswith("cuda") and 
             use_amp and torch.cuda.is_available())
@@ -269,7 +268,6 @@ class KFoldPipeline:
         
         return self.df
     
-    # TODO: use_amp and compile_models should be set at configuration level
     def kfold_cross_validation(self, n_splits=5, n_epochs=10, early_stopping_patience=5, max_tiles=None, 
             random_state=42, use_amp=True, compile_model=False):
         """
@@ -443,10 +441,7 @@ class KFoldPipeline:
         plt.tight_layout()
         plt.show()
 
-    # TODO save best model for later usage and interpretability (e.g. attention visualization)
 
-
-# TODO add gpu config here
 def train_ABMIL(
     train_df,
     train_dataset,
@@ -454,7 +449,9 @@ def train_ABMIL(
     label_col=None,
     n_epochs=10,
     early_stopping_patience=None,
-    seed=None
+    seed=None,
+    use_amp=False,
+    compile_model=False
 ):
     """
     Train ABMIL model with optional early stopping for best AUC comparability.
@@ -467,6 +464,8 @@ def train_ABMIL(
     - n_epochs: Maximum number of training epochs
     - early_stopping_patience: Number of epochs with no improvement to wait before stopping.
     - seed: Random seed for reproducibility. If None, uses current random state.
+    - use_amp: Enable automatic mixed precision (AMP) for faster training on CUDA
+    - compile_model: Compile model with torch.compile() for additional speed (PyTorch 2.x+)
     
     Returns:
     - model: Trained ABMIL model
@@ -475,8 +474,7 @@ def train_ABMIL(
     if seed is not None:
         set_seed(seed)
     
-    # HERTIL
-
+    amp_dtype = torch.float16
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # DataLoader: decides when items are loaded, handles shuffling and batching
@@ -493,7 +491,6 @@ def train_ABMIL(
         worker_init_fn=worker_init_fn if seed is not None else None
     )
 
-    # TODO: use helper functions instead
     # Extract Feature Dimension and Number of Classes
     sample_feats, _, _ = train_dataset[0]
     feat_dim = sample_feats.shape[1]
@@ -505,7 +502,6 @@ def train_ABMIL(
     # Enable TF32 / high matmul precision on modern GPUs (e.g. H100)
     _configure_gpu_optimization()
     
-    # Why not just always compile
     # Compile model for additional speed (PyTorch 2.x+)
     if compile_model and hasattr(torch, "compile") and device.startswith("cuda"):
         try:
@@ -537,7 +533,6 @@ def train_ABMIL(
             if feats.shape[0] == 0:
                 continue
 
-            # As much config as possible shoudl be outside (or simplified with helper functions) to maximize readability 
             # Forward pass
             if _should_use_amp(device, use_amp):
                 with torch.autocast(device_type="cuda", dtype=amp_dtype):
@@ -595,20 +590,23 @@ def train_ABMIL(
 def validate_ABMIL(
     model,
     val_dataset,
-    ):
+    use_amp=False,
+    verbose=True
+):
     device = next(model.parameters()).device
+    amp_dtype = torch.float16
 
     # Validation DataLoader
     val_loader = _create_dataloader(val_dataset, batch_size=1, shuffle=False, device=device)
 
-    # Validation Loop
-    model.eval()   # Disables training behaviors (dropout etc.)
+    # Set model to evaluation mode (disables dropout, batch norm updates)
+    model.eval()
 
     all_labels = []
     all_preds = []
     all_probs = []
 
-    with torch.no_grad():   # Disables gradient computation (save memory)
+    with torch.no_grad():
         for feats, tile_ids, label in tqdm(val_loader, desc="Validation", leave=False, disable=not verbose):
             feats, tile_ids, label = _preprocess_batch(feats, tile_ids, label, device)
 
@@ -616,7 +614,7 @@ def validate_ABMIL(
                 continue
 
             # Forward pass (optionally with mixed precision on CUDA)
-            if _should_use_amp(device, use_amp):
+            if _should_use_amp(device, use_amp, amp_dtype):
                 with torch.autocast(device_type="cuda", dtype=amp_dtype):
                     logits, _ = model(feats)
             else:
