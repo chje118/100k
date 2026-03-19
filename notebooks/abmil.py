@@ -1,11 +1,9 @@
 """
-Attention-Based Multiple Instance Learning (ABMIL) for Whole Slide Image Classification.
+ABMIL (Attention-Based Multiple Instance Learning) for WSI Classification.
 
-ABMIL Architecture: Attention-based MIL pooling on tile embeddings for slide-level predictions.
-Classification: Binary or multi-class, single-label classification on pathology slides.
-Evaluation: Macro AUC (class-balanced, appropriate for pathology benchmark).
-    - For each class i: one-vs-rest AUC treating class i vs. all others
-    - Macro AUC = mean(AUC_i for all classes i)
+ABMIL pipeline for pathology benchmarking:
+Stratified k-fold cross validation with proper train/internal-val/test split
+Computes macro AUC (one-vs-rest, class-balanced)
 """
 
 import os
@@ -16,7 +14,7 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from wsidata import open_wsi
 from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score, RocCurveDisplay
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
 import seaborn as sns
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -24,6 +22,8 @@ import re
 import random
 import copy
 
+
+# ========== Helper Functions ==========
 
 def set_seed(seed):
     """ Set seeds for reproducibility.
@@ -72,6 +72,7 @@ def _preprocess_batch(feats, tile_ids, label, device):
     label = label.to(device, non_blocking=True)
     return feats, tile_ids, label
 
+# TODO: remove this function, call logic inline
 def _should_use_amp(device, use_amp):
     """Check if AMP should be enabled."""
     return (isinstance(device, str) and device.startswith("cuda") and 
@@ -97,64 +98,35 @@ def _compute_metrics(all_labels, all_preds, all_probs):
         'auc': auc
     }
 
-def _create_dataloader(dataset, batch_size=1, shuffle=False, device=None, worker_init_fn=None):
-    """Create DataLoader with standard configuration."""
-    kwargs = {"batch_size": batch_size, "shuffle": shuffle}
-    if worker_init_fn is not None:
-        kwargs["worker_init_fn"] = worker_init_fn
-    if isinstance(device, str) and device.startswith("cuda"):
-        kwargs["pin_memory"] = True
-    return DataLoader(dataset, **kwargs)
+def validate_dataset(dataset, verbose=True):
+    """
+    Filter out invalid slides from dataset.
+    
+    Parameters:
+    - dataset: PyTorch Dataset instance to validate
+    - verbose: If True, print validation progress
+    
+    Returns:
+    - filtered_dataset: torch.utils.data.Subset with only valid slides
+    - valid_indices: List of valid slide indices
+    """
+    valid_indices = []
+    
+    for i in range(len(dataset)):
+        try:
+            _ = dataset[i]
+            valid_indices.append(i)
+        except Exception as e:
+            if verbose:
+                print(f"Invalid slide at index {i}: {type(e).__name__}")
+    
+    filtered_dataset = torch.utils.data.Subset(dataset, valid_indices)
+    if verbose:
+        print(f"Dataset validation complete: {len(valid_indices)}/{len(dataset)} valid slides")
+    
+    return filtered_dataset, valid_indices
 
-def _configure_gpu_optimization():
-    """Configure GPU for modern CUDA GPUs (H100, etc.)."""
-    if not torch.cuda.is_available():
-        return
-    try:
-        torch.set_float32_matmul_precision("high")
-    except AttributeError:
-        pass
-    if hasattr(torch.backends.cuda, "matmul"):
-        torch.backends.cuda.matmul.allow_tf32 = True
-    if hasattr(torch.backends.cuda, "cudnn"):
-        torch.backends.cuda.cudnn.allow_tf32 = True
-
-def _preprocess_batch(feats, tile_ids, label, device):
-    """Preprocess batch tensors before forward pass."""
-    if feats.dim() == 3:
-        feats = feats.squeeze(0)
-    if tile_ids.ndim == 2:
-        tile_ids = tile_ids.squeeze(0)
-    feats = feats.to(device, non_blocking=True)
-    label = label.to(device, non_blocking=True)
-    return feats, tile_ids, label
-
-def _should_use_amp(device, use_amp):
-    """Check if AMP should be enabled."""
-    return (isinstance(device, str) and 
-            device.startswith("cuda") and 
-            use_amp and 
-            torch.cuda.is_available())
-
-def _extract_model_dims(model):
-    """Extract dimensions from ABMIL model."""
-    return {
-        'in_dim': model.classifier.in_features,
-        'n_classes': model.classifier.out_features,
-        'hidden_dim': model.attn[0].out_features
-    }
-
-def _compute_metrics(all_labels, all_preds, all_probs):
-    """Compute accuracy and AUC metrics."""
-    accuracy = np.mean(np.array(all_labels) == np.array(all_preds))
-    auc = auc_score(all_labels, all_probs)
-    return {
-        'labels': all_labels,
-        'preds': all_preds,
-        'probs': all_probs,
-        'accuracy': accuracy,
-        'auc': auc
-    }
+# ========== Dataset and Model Definitions ==========
 
 class ZarrSlideDataset(Dataset):
     def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir, max_tiles=None, seed=None):
@@ -241,45 +213,28 @@ class ABMIL(nn.Module):
 
         return logits, A
 
-def validate_dataset(dataset, verbose=True):
-    """
-    Filter out invalid slides from dataset.
-    
-    Parameters:
-    - dataset: PyTorch Dataset instance to validate
-    - verbose: If True, print validation progress
-    
-    Returns:
-    - filtered_dataset: torch.utils.data.Subset with only valid slides
-    - valid_indices: List of valid slide indices
-    """
-    valid_indices = []
-    
-    for i in range(len(dataset)):
-        try:
-            _ = dataset[i]
-            valid_indices.append(i)
-        except Exception as e:
-            if verbose:
-                print(f"Invalid slide at index {i}: {type(e).__name__}")
-    
-    filtered_dataset = torch.utils.data.Subset(dataset, valid_indices)
-    if verbose:
-        print(f"Dataset validation complete: {len(valid_indices)}/{len(dataset)} valid slides")
-    
-    return filtered_dataset, valid_indices
 
-class ABMILPipeline:
+# ========== Training and Evaluation Pipelines ==========
+
+class KFoldPipeline:
+    """
+    K-fold cross-validation pipeline for ABMIL model evaluation.
+    
+    Usage:
+        pipeline = KFoldPipeline(df, 'path_col', 'label_col', 'features_key', 'tiles_key', 'zarr_dir')
+        results = pipeline.run(n_splits=5, n_epochs=100)
+        pipeline.print_results()
+        pipeline.plot_fold_distribution()
+    """
+    
     def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir):
         """
-        ABMIL training pipeline for WSI classification. 
-
         Parameters:
         - df: DataFrame with slide metadata
-        - filename_col: Column name for slide filenames
+        - filename_col: Column name for slide paths
         - label_col: Column name for class labels
-        - feature_key: Key for features in zarr tables (e.g., 'features_h-optimus-0')
-        - tile_key: Key for tiles in zarr tables (e.g., 'tiles_224')
+        - feature_key: Key for features in zarr (e.g., 'features_h-optimus-0')
+        - tile_key: Key for tiles in zarr (e.g., 'tiles_224')
         - zarr_dir: Directory containing zarr files
         """
         self.df = df.copy()
@@ -288,24 +243,17 @@ class ABMILPipeline:
         self.feature_key = feature_key
         self.tile_key = tile_key
         self.zarr_dir = zarr_dir
-        self.validated_df = None
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"ABMILPipeline initialized on device: {self.device}")
+        self.validate_slides()
+        self.results = None
+        print(f"KFoldPipeline initialized on device: {self.device}")
     
-    def validate_slides(self, verbose=True):
+    def validate_slides(self):
         """
-        Validate all slides and filter out invalid ones.
-        Uses PyTorch dataset validation.
-        
-        Parameters:
-        - verbose: If True, print validation progress
-
-        Returns:
-        - validated_df: DataFrame with only valid slides
+        Filter out invalid slides (those that cause errors during loading).
         """
         print(f"\nValidating {len(self.df)} slides...")
         
-        # Create temporary dataset for validation
         temp_dataset = ZarrSlideDataset(
             df=self.df,
             filename_col=self.filename_col,
@@ -315,31 +263,15 @@ class ABMILPipeline:
             zarr_dir=self.zarr_dir
         )
         
-        # Validate using the PyTorch dataset method
-        filtered_dataset, valid_indices = validate_dataset(temp_dataset, verbose=verbose)
+        filtered_dataset, valid_indices = validate_dataset(temp_dataset, verbose=True)
+        self.df = self.df.iloc[valid_indices].reset_index(drop=True)
+        print(f"Validation complete: {len(self.df)} valid slides")
         
-        # Filter dataframe to keep only valid slides
-        self.validated_df = self.df.iloc[valid_indices].reset_index(drop=True)
-        print(f"Validation complete: {len(self.validated_df)}/{len(self.df)} valid slides")
-        
-        return self.validated_df
+        return self.df
     
-    def _create_dataset(self, df, max_tiles=None, seed=None):
-        """Helper to create ZarrSlideDataset with pipeline config."""
-        return ZarrSlideDataset(
-            df=df,
-            filename_col=self.filename_col,
-            label_col=self.label_col,
-            feature_key=self.feature_key,
-            tile_key=self.tile_key,
-            zarr_dir=self.zarr_dir,
-            max_tiles=max_tiles,
-            seed=seed
-        )
-    
-    def run_k_fold_validation(self, n_splits=5, n_epochs=10, early_stopping_patience=5, 
-                              max_tiles=None, random_state=42, class_weights=None, 
-                              use_amp=True, compile_model=False):
+    # TODO: use_amp and compile_models should be set at configuration level
+    def kfold_cross_validation(self, n_splits=5, n_epochs=10, early_stopping_patience=5, max_tiles=None, 
+            random_state=42, use_amp=True, compile_model=False):
         """
         Run k-fold cross-validation.
         
@@ -349,147 +281,178 @@ class ABMILPipeline:
         - early_stopping_patience: Patience for early stopping
         - max_tiles: Maximum tiles per slide (None = no limit)
         - random_state: Random seed for reproducibility
-        - class_weights: Optional class weights tensor
-        - use_amp: Use mixed precision training
-        - compile_model: Use torch.compile
         
         Returns:
-        - results_dict: Dictionary with cross-validation results
+        - Dictionary with cross-validation results
         """
-        df_to_use = self.validated_df if self.validated_df is not None else self.df
-        
-        results = kfold_cross_validation(
-            df=df_to_use,
-            filename_col=self.filename_col,
-            label_col=self.label_col,
-            feature_key=self.feature_key,
-            tile_key=self.tile_key,
-            zarr_dir=self.zarr_dir,
-            n_splits=n_splits,
-            n_epochs=n_epochs,
-            early_stopping_patience=early_stopping_patience,
-            max_tiles=max_tiles,
-            random_state=random_state,
-            class_weights=class_weights,
-            device=self.device,
-            use_amp=use_amp,
-            compile_model=compile_model
-        )
-        
-        return results
+        set_seed(random_state)
+        print(f"Random seed set to {random_state} for reproducibility")
     
-    def train_final_model(self, n_epochs=10, class_weights=None, use_amp=True, compile_model=False, seed=42):
-        """
-        Train a final model on all data (no train/test split).
-        
-        Parameters:
-        - n_epochs: Number of epochs
-        - class_weights: Optional class weights
-        - use_amp: Use mixed precision training
-        - compile_model: Use torch.compile
-        - seed: Random seed
-        
-        Returns:
-        - model: Trained ABMIL model
-        """
-        df_to_use = self.validated_df if self.validated_df is not None else self.df
-        
-        print(f"\nTraining final model on {len(df_to_use)} slides...")
-        train_dataset = self._create_dataset(df_to_use)
-        
-        model, _ = train_ABMIL(
-            train_df=df_to_use,
-            train_dataset=train_dataset,
-            val_dataset=None,  # No validation for final model
-            label_col=self.label_col,
-            n_epochs=n_epochs,
-            class_weights=class_weights,
-            device=self.device,
-            use_amp=use_amp,
-            compile_model=compile_model,
-            early_stopping_patience=None,
-            seed=seed
-        )
-        
-        self.model = model
-        return model
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     
-    def save_model(self, model, model_name):
-        """
-        Save model to disk.
-        
-        Parameters:
-        - model: ABMIL model to save
-        - model_name: Name for the model file
-        """
-        dims = _extract_model_dims(model)
-        filename = f"{model_name}_{dims['in_dim']}_{dims['n_classes']}_{dims['hidden_dim']}.pth"
-        save_path = os.path.join("models/", filename)
-        
-        os.makedirs("models/", exist_ok=True)
-        torch.save(model.state_dict(), save_path)
-        print(f"Model saved to {save_path}")
+        fold_auc_scores = []
+        fold_accuracies = []
     
-    def load_model(self, model_path):
-        """
-        Load a trained model from disk.
-        
-        Parameters:
-        - model_path: Path to saved model
-        
-        Returns:
-        - model: Loaded ABMIL model
-        - model_config: Dictionary with model configuration
-        """
-        model, config = load_model(model_path)
-        self.model = model
-        return model, config
+        print(f"Starting {n_splits}-fold cross-validation with early stopping (patience={early_stopping_patience})...")
+        print(f"Data leakage prevention: Train (80%) (90% Training | 10% Internal Val → Early stopping) | Test (20%) → Final evaluation")
     
-    def evaluate_model(self, model=None, use_amp=True):
-        """
-        Evaluate a model on the data.
+        for fold_idx, (train_idx, test_idx) in enumerate(skf.split(self.df, self.df[self.label_col])):
+            print(f"\n{'='*60}")
+            print(f"Fold {fold_idx + 1}/{n_splits}")
+            print(f"{'='*60}")
         
-        Parameters:
-        - model: Model to evaluate (uses self.model if None)
-        - use_amp: Use mixed precision during evaluation
+            # Split fold into 80% train + 20% test
+            fold_df = self.df.iloc[train_idx].reset_index(drop=True)
+            test_df = self.df.iloc[test_idx].reset_index(drop=True)
         
-        Returns:
-        - results: Dictionary with evaluation results
-        """
-        if model is None:
-            if not hasattr(self, 'model'):
-                raise ValueError("No model loaded or trained. Use train_final_model() or load_model() first.")
-            model = self.model
+            # Further split train into 90% train_subset + 10% internal_val
+            # Use fold-specific seed for this split
+            split_seed = random_state + fold_idx + 1
+            train_subset_df, internal_val_df = train_test_split(
+                fold_df,
+                test_size=1/9, 
+                stratify=fold_df[self.label_col],
+            random_state=split_seed
+            )
         
-        df_to_use = self.validated_df if self.validated_df is not None else self.df
-        val_dataset = self._create_dataset(df_to_use)
+            print(f"Train subset: {len(train_subset_df)} samples")
+            print(f"Internal val: {len(internal_val_df)} samples")
+            print(f"Test set: {len(test_df)} samples")
+            
+            # Use fold-specific seed for deterministic tile sampling
+            fold_seed = random_state + fold_idx + 1
         
-        all_labels, all_preds, all_probs = validate_ABMIL(
-            model=model,
-            val_dataset=val_dataset,
-            device=self.device,
-            use_amp=use_amp,
-            verbose=True
-        )
+            # Create datasets with deterministic tile sampling
+            train_dataset = ZarrSlideDataset(
+                df=train_subset_df,
+                filename_col=self.filename_col,
+                label_col=self.label_col,
+                feature_key=self.feature_key,
+                tile_key=self.tile_key,
+                zarr_dir=self.zarr_dir,
+                max_tiles=max_tiles,
+                seed=fold_seed
+            )
         
-        results = _compute_metrics(all_labels, all_preds, all_probs)
+            internal_val_dataset = ZarrSlideDataset(
+                df=internal_val_df,
+                filename_col=self.filename_col,
+                label_col=self.label_col,
+                feature_key=self.feature_key,
+                tile_key=self.tile_key,
+                zarr_dir=self.zarr_dir,
+                max_tiles=max_tiles,
+                seed=fold_seed
+            )
         
-        print(f"Evaluation Accuracy: {results['accuracy']:.4f}")
-        print(f"Evaluation AUC: {results['auc']:.4f}")
+            test_dataset = ZarrSlideDataset(
+                df=test_df,
+                filename_col=self.filename_col,
+                label_col=self.label_col,
+                feature_key=self.feature_key,
+                tile_key=self.tile_key,
+                zarr_dir=self.zarr_dir,
+                max_tiles=max_tiles,
+                seed=fold_seed
+            )
         
-        return results
+            # Train model on train_subset with early stopping on internal_val
+            # Use fold-specific seed derived from random_state for reproducibility
+            model, _ = train_ABMIL(
+                train_df=train_subset_df,
+                train_dataset=train_dataset,
+                val_dataset=internal_val_dataset, 
+                label_col=self.label_col,
+                n_epochs=n_epochs,
+                early_stopping_patience=early_stopping_patience,
+                seed=fold_seed
+            )
+        
+            all_labels, all_preds, all_probs = validate_ABMIL(
+                model=model,
+                val_dataset=test_dataset,
+            )
+        
+            # Compute AUC and accuracy for this fold
+            fold_auc = auc_score(all_labels, all_probs)
+            fold_accuracy = np.mean(np.array(all_labels) == np.array(all_preds))
+        
+            fold_auc_scores.append(fold_auc)
+            fold_accuracies.append(fold_accuracy)
+        
+            print(f"Fold {fold_idx + 1} - Test AUC: {fold_auc:.4f}, Test Accuracy: {fold_accuracy:.4f}")
 
+        # Compute mean and std across folds
+        mean_auc = np.mean(fold_auc_scores)
+        std_auc = np.std(fold_auc_scores)
+        mean_accuracy = np.mean(fold_accuracies)
+        std_accuracy = np.std(fold_accuracies)
+    
+        results_dict = {
+            'fold_auc_scores': fold_auc_scores,
+            'mean_auc': mean_auc,
+            'std_auc': std_auc,
+            'fold_accuracies': fold_accuracies,
+            'mean_accuracy': mean_accuracy,
+            'std_accuracy': std_accuracy,
+            'n_splits': n_splits
+        }    
+        self.results = results_dict
+        return self.results
+    
+    def print_results(self):
+        """ Print cross-validation results summary."""
+        if self.results is None:
+            print("No results available. Run the pipeline first with .run_kfold_cross_validation()")
+            return
+        
+        print(f"\n{'='*60}")
+        print(f"K-Fold Cross-Validation Results ({self.results['n_splits']} folds)")
+        print(f"{'='*60}")
+        print(f"Mean AUC: {self.results['mean_auc']:.4f} ± {self.results['std_auc']:.4f}")
+        print(f"Mean Accuracy: {self.results['mean_accuracy']:.4f} ± {self.results['std_accuracy']:.4f}")
+        print(f"\nPer-fold AUC: {[f'{auc:.4f}' for auc in self.results['fold_auc_scores']]}")
+        print(f"Per-fold Accuracy: {[f'{acc:.4f}' for acc in self.results['fold_accuracies']]}")
+    
+    def plot_fold_distribution(self):
+        """Plot fold AUC and accuracy distribution."""
+        if self.results is None:
+            print("No results available. Run the pipeline first with .run_kfold_cross_validation()")
+            return
+        
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        
+        # AUC plot
+        axes[0].bar(range(len(self.results['fold_auc_scores'])), self.results['fold_auc_scores'], alpha=0.7)
+        axes[0].axhline(self.results['mean_auc'], color='r', linestyle='--', label=f"Mean: {self.results['mean_auc']:.4f}")
+        axes[0].set_xlabel("Fold")
+        axes[0].set_ylabel("AUC")
+        axes[0].set_title("AUC per Fold")
+        axes[0].legend()
+        axes[0].set_ylim([0, 1])
+        
+        # Accuracy plot
+        axes[1].bar(range(len(self.results['fold_accuracies'])), self.results['fold_accuracies'], alpha=0.7)
+        axes[1].axhline(self.results['mean_accuracy'], color='r', linestyle='--', label=f"Mean: {self.results['mean_accuracy']:.4f}")
+        axes[1].set_xlabel("Fold")
+        axes[1].set_ylabel("Accuracy")
+        axes[1].set_title("Accuracy per Fold")
+        axes[1].legend()
+        axes[1].set_ylim([0, 1])
+        
+        plt.tight_layout()
+        plt.show()
+
+    # TODO save best model for later usage and interpretability (e.g. attention visualization)
+
+
+# TODO add gpu config here
 def train_ABMIL(
     train_df,
     train_dataset,
     val_dataset=None,
     label_col=None,
     n_epochs=10,
-    class_weights=None,
-    device=None,
-    use_amp=True,
-    amp_dtype=torch.bfloat16,
-    compile_model=False,
     early_stopping_patience=None,
     seed=None
 ):
@@ -499,47 +462,23 @@ def train_ABMIL(
     Parameters:
     - train_df: DataFrame with training data
     - train_dataset: ZarrSlideDataset instance
-    - val_dataset: Optional ZarrSlideDataset for early stopping. If provided, trains until 
-                   validation AUC plateaus, ensuring fair comparison across folds.
+    - val_dataset: Optional ZarrSlideDataset for early stopping.
     - label_col: Column name for labels (required if using early stopping)
     - n_epochs: Maximum number of training epochs
-    - class_weights: Optional tensor of class weights (shape: [n_classes])
-            Higher weights give more importance to that class during training.
-    - device: Torch device string, e.g. "cuda" or "cpu". Defaults to "cuda" if available.
-    - use_amp: If True and running on CUDA, use autocast mixed precision (optimized for H100).
-    - amp_dtype: Autocast dtype when use_amp is True (default: torch.bfloat16, good for H100).
-    - compile_model: If True and torch.compile is available, compile the model for extra speed.
     - early_stopping_patience: Number of epochs with no improvement to wait before stopping.
-                              If None, trains for all n_epochs (no early stopping).
     - seed: Random seed for reproducibility. If None, uses current random state.
     
     Returns:
     - model: Trained ABMIL model
     - best_model_state: Best model state dict (for restoring best model when using early stopping)
     """
-    # Set seed for reproducibility
     if seed is not None:
         set_seed(seed)
-    # Decide device
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-
-    # Validate training dataset and filter out invalid slides
-    print("Validating training dataset...")
-    train_dataset, valid_indices = validate_dataset(train_dataset, verbose=True)
-    if len(valid_indices) == 0:
-        raise RuntimeError("No valid slides found in training dataset")
-    print(f"Using {len(valid_indices)} valid slides for training")
     
-    # Validate validation dataset if provided
-    if val_dataset is not None:
-        print("Validating validation dataset...")
-        val_dataset, _ = validate_dataset(val_dataset, verbose=True)
-        if len(_) == 0:
-            print("Warning: No valid slides in validation dataset; disabling early stopping")
-            val_dataset = None
+    # HERTIL
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
     # DataLoader: decides when items are loaded, handles shuffling and batching
     # Use worker_init_fn to ensure reproducibility with multiple workers
     def worker_init_fn(worker_id):
@@ -554,6 +493,7 @@ def train_ABMIL(
         worker_init_fn=worker_init_fn if seed is not None else None
     )
 
+    # TODO: use helper functions instead
     # Extract Feature Dimension and Number of Classes
     sample_feats, _, _ = train_dataset[0]
     feat_dim = sample_feats.shape[1]
@@ -564,7 +504,8 @@ def train_ABMIL(
 
     # Enable TF32 / high matmul precision on modern GPUs (e.g. H100)
     _configure_gpu_optimization()
-
+    
+    # Why not just always compile
     # Compile model for additional speed (PyTorch 2.x+)
     if compile_model and hasattr(torch, "compile") and device.startswith("cuda"):
         try:
@@ -576,13 +517,8 @@ def train_ABMIL(
     # Create Optimizer and Loss Function
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     
-    # If class weights are provided, convert to tensor and use in CrossEntropyLoss
-    if class_weights is not None:
-        class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
-        loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights)
-        print(f"Using class weights: {class_weights.cpu().numpy()}")
-    else:
-        loss_fn = torch.nn.CrossEntropyLoss()
+    # Loss function: CrossEntropyLoss for multi-class classification
+    loss_fn = torch.nn.CrossEntropyLoss()
 
     # Early stopping setup
     best_auc = -1.0
@@ -601,7 +537,8 @@ def train_ABMIL(
             if feats.shape[0] == 0:
                 continue
 
-            # Forward pass (optionally with mixed precision on CUDA)
+            # As much config as possible shoudl be outside (or simplified with helper functions) to maximize readability 
+            # Forward pass
             if _should_use_amp(device, use_amp):
                 with torch.autocast(device_type="cuda", dtype=amp_dtype):
                     logits, _ = model(feats)
@@ -629,11 +566,7 @@ def train_ABMIL(
             all_labels, all_preds, all_probs = validate_ABMIL(
                 model=model,
                 val_dataset=val_dataset,
-                device=device,
-                use_amp=use_amp,
-                amp_dtype=amp_dtype,
-                verbose=False
-            )
+                )
             val_auc = auc_score(all_labels, all_probs)
             print(f" | Val AUC: {val_auc:.4f}", end="")
             
@@ -662,13 +595,8 @@ def train_ABMIL(
 def validate_ABMIL(
     model,
     val_dataset,
-    device=None,
-    use_amp=True,
-    amp_dtype=torch.bfloat16,
-    verbose=True,
     ):
-    if device is None:
-        device = next(model.parameters()).device
+    device = next(model.parameters()).device
 
     # Validation DataLoader
     val_loader = _create_dataloader(val_dataset, batch_size=1, shuffle=False, device=device)
@@ -704,9 +632,7 @@ def validate_ABMIL(
 
     all_probs = np.array(all_probs)
     accuracy = np.mean(np.array(all_labels) == np.array(all_preds))
-    if verbose:
-        print(f"Validation Accuracy: {accuracy:.4f}")
-
+    
     return all_labels, all_preds, all_probs
 
 def confusion_matrix_report(all_labels, all_preds):
@@ -751,7 +677,6 @@ def _parse_model_dimensions(model_path):
             "Expected suffix like '_<in_dim>_<n_classes>_<hidden_dim>.pth'."
         )
     return int(parsed.group(1)), int(parsed.group(2)), int(parsed.group(3))
-
 
 def load_model(model_path):
     """
@@ -820,218 +745,3 @@ def plot_roc_curve(all_labels, all_probs):
     plt.title("ROC Curve (Binary Classification)")
     plt.show()
 
-# No weights for FM benchmark
-def kfold_cross_validation(
-    df,
-    filename_col,
-    label_col,
-    feature_key,
-    tile_key,
-    zarr_dir,
-    n_splits=5,
-    n_epochs=10,
-    early_stopping_patience=5,
-    class_weights=None,
-    device=None,
-    use_amp=True,
-    amp_dtype=torch.bfloat16,
-    compile_model=False,
-    max_tiles=None,
-    random_state=42
-):
-    """
-    Perform K-fold cross-validation for ABMIL model with proper train/internal-val/test split.
-    
-    Prevents data leakage by using a strict three-way split for each fold:
-    - Train subset (90%): For model training
-    - Internal validation (10%): For early stopping only (NOT seen during evaluation)
-    - Test set (20%): For final evaluation only (NEVER seen during training/early stopping)
-    
-    For the pathology benchmark, this function evaluates using macro AUC (unweighted mean of 
-    one-vs-rest AUC scores across all classes). This metric is class-balanced and appropriate 
-    for multi-class pathology classification where all diagnostic categories are equally important.
-    
-    For fair AUC comparison across folds, this function uses early stopping on each fold's internal
-    validation set. This ensures each fold trains until it reaches peak performance, enabling 
-    meaningful comparison of model performance across different data splits.
-    
-    All randomness (fold splitting, model initialization, training) is controlled by random_state
-    to ensure fully reproducible AUC results.
-    
-    Parameters:
-    - df: DataFrame with all data
-    - filename_col: Column name for file paths
-    - label_col: Column name for labels
-    - feature_key: Key for accessing features in zarr
-    - tile_key: Key for accessing tiles in zarr
-    - zarr_dir: Directory containing zarr files
-    - n_splits: Number of folds (default: 5)
-    - n_epochs: Maximum number of training epochs per fold
-    - early_stopping_patience: Number of epochs with no validation AUC improvement to wait before
-                              stopping (default: 5). Set to None to disable early stopping and train 
-                              for exactly n_epochs.
-    - class_weights: Optional tensor of class weights
-    - device: Torch device (default: cuda if available else cpu)
-    - use_amp: Use mixed precision training
-    - amp_dtype: Autocast dtype for mixed precision
-    - compile_model: Whether to compile model with torch.compile
-    - max_tiles: Maximum number of tiles per slide (default: None = no limit). If set, slides with
-                more tiles will have tiles randomly sampled down to this limit. Useful for preventing
-                extremely large bags from skewing the learning.
-    - random_state: Random seed for reproducibility (default: 42). Controls fold splitting and 
-                   all training randomness for fully reproducible AUC.
-    
-    Returns:
-    - results_dict: Dictionary with fold results and aggregated metrics
-        Keys: 'fold_auc_scores' (macro AUC per fold), 'mean_auc', 'std_auc', (primary metric for pathology benchmark)
-              'fold_accuracies', 'mean_accuracy', 'std_accuracy', 'n_splits'
-    """
-    from sklearn.model_selection import train_test_split
-    
-    # Set global seed at the start for reproducibility
-    set_seed(random_state)
-    print(f"Random seed set to {random_state} for reproducibility")
-    
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-    
-    fold_auc_scores = []
-    fold_accuracies = []
-    
-    print(f"Starting {n_splits}-fold cross-validation with early stopping (patience={early_stopping_patience})...")
-    print(f"Data leakage prevention: Train(90%) → Training | Internal Val(10%) → Early stopping | Test(20%) → Final evaluation only")
-    
-    for fold_idx, (train_idx, test_idx) in enumerate(skf.split(df, df[label_col])):
-        print(f"\n{'='*60}")
-        print(f"Fold {fold_idx + 1}/{n_splits}")
-        print(f"{'='*60}")
-        
-        # Split fold into 80% train + 20% test
-        fold_df = df.iloc[train_idx].reset_index(drop=True)
-        test_df = df.iloc[test_idx].reset_index(drop=True)
-        
-        # Further split train into 90% train_subset + 10% internal_val
-        # Use fold-specific seed for this split
-        split_seed = random_state + fold_idx + 1
-        train_subset_df, internal_val_df = train_test_split(
-            fold_df,
-            test_size=1/9,  # 10% of fold_df (which is 80%), so 10%/90% split
-            stratify=fold_df[label_col],
-            random_state=split_seed
-        )
-        
-        print(f"Train subset: {len(train_subset_df)} samples")
-        print(f"Internal val: {len(internal_val_df)} samples")
-        print(f"Test set: {len(test_df)} samples")
-        print(f"Total before validation: {len(train_subset_df) + len(internal_val_df) + len(test_df)} samples")
-        # Use fold-specific seed for deterministic tile sampling
-        fold_seed = random_state + fold_idx + 1
-        
-        # Create datasets with deterministic tile sampling
-        train_dataset = ZarrSlideDataset(
-            df=train_subset_df,
-            filename_col=filename_col,
-            label_col=label_col,
-            feature_key=feature_key,
-            tile_key=tile_key,
-            zarr_dir=zarr_dir,
-            max_tiles=max_tiles,
-            seed=fold_seed
-        )
-        
-        internal_val_dataset = ZarrSlideDataset(
-            df=internal_val_df,
-            filename_col=filename_col,
-            label_col=label_col,
-            feature_key=feature_key,
-            tile_key=tile_key,
-            zarr_dir=zarr_dir,
-            max_tiles=max_tiles,
-            seed=fold_seed
-        )
-        
-        test_dataset = ZarrSlideDataset(
-            df=test_df,
-            filename_col=filename_col,
-            label_col=label_col,
-            feature_key=feature_key,
-            tile_key=tile_key,
-            zarr_dir=zarr_dir,
-            max_tiles=max_tiles,
-            seed=fold_seed
-        )
-        
-        # Validate all datasets before training to filter out invalid slides
-        print("Validating datasets...")
-        train_dataset, train_valid_indices = validate_dataset(train_dataset, verbose=False)
-        internal_val_dataset, val_valid_indices = validate_dataset(internal_val_dataset, verbose=False)
-        test_dataset, test_valid_indices = validate_dataset(test_dataset, verbose=False)
-        print(f"After validation: Train {len(train_valid_indices)}, Internal Val {len(val_valid_indices)}, Test {len(test_valid_indices)} valid slides")
-        
-        if len(train_valid_indices) == 0:
-            print(f"Warning: No valid slides in train subset for fold {fold_idx + 1}, skipping fold")
-            continue
-        
-        # Train model on train_subset with early stopping on internal_val
-        # Use fold-specific seed derived from random_state for reproducibility
-        model, _ = train_ABMIL(
-            train_df=train_subset_df,
-            train_dataset=train_dataset,
-            val_dataset=internal_val_dataset,  # Early stopping uses INTERNAL val only
-            label_col=label_col,
-            n_epochs=n_epochs,
-            class_weights=class_weights,
-            device=device,
-            use_amp=use_amp,
-            amp_dtype=amp_dtype,
-            compile_model=compile_model,
-            early_stopping_patience=early_stopping_patience,
-            seed=fold_seed
-        )
-        
-        # Evaluate on TEST set ONLY (never seen during training or early stopping)
-        all_labels, all_preds, all_probs = validate_ABMIL(
-            model=model,
-            val_dataset=test_dataset,
-            device=device,
-            use_amp=use_amp,
-            amp_dtype=amp_dtype
-        )
-        
-        # Compute AUC and accuracy for this fold
-        fold_auc = auc_score(all_labels, all_probs)
-        fold_accuracy = np.mean(np.array(all_labels) == np.array(all_preds))
-        
-        fold_auc_scores.append(fold_auc)
-        fold_accuracies.append(fold_accuracy)
-        
-        print(f"Fold {fold_idx + 1} - Test AUC: {fold_auc:.4f}, Test Accuracy: {fold_accuracy:.4f}")
-    
-    # Compute mean and std across folds
-    mean_auc = np.mean(fold_auc_scores)
-    std_auc = np.std(fold_auc_scores)
-    mean_accuracy = np.mean(fold_accuracies)
-    std_accuracy = np.std(fold_accuracies)
-    
-    # Print summary
-    print(f"\n{'='*60}")
-    print(f"K-Fold Cross-Validation Results ({n_splits} folds)")
-    print(f"{'='*60}")
-    print(f"Mean Test AUC: {mean_auc:.4f} +- {std_auc:.4f}")
-    print(f"Mean Test Accuracy: {mean_accuracy:.4f} +- {std_accuracy:.4f}")
-    print(f"Individual fold Test AUC scores: {[f'{auc:.4f}' for auc in fold_auc_scores]}")
-    print(f"Individual fold Test accuracies: {[f'{acc:.4f}' for acc in fold_accuracies]}")
-    print(f"\nData leakage prevention verified:")
-    print(f"  ✓ Train subset used for model training")
-    print(f"  ✓ Internal validation used for early stopping only")
-    print(f"  ✓ Test set used for final evaluation only (no leakage)")
-    
-    results_dict = {
-        'fold_auc_scores': fold_auc_scores,
-        'mean_auc': mean_auc,
-        'std_auc': std_auc,
-        'fold_accuracies': fold_accuracies,
-        'mean_accuracy': mean_accuracy,
-        'std_accuracy': std_accuracy,
-        'n_splits': n_splits
-    }    
-    return results_dict
