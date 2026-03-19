@@ -408,7 +408,7 @@ def validate_ABMIL(
                 logits, _ = model(feats)
 
             # Compute predicted class and probabilities
-            probs = torch.softmax(logits, dim=0).cpu().numpy()
+            probs = torch.softmax(logits.float(), dim=0).cpu().numpy()
             pred = torch.argmax(logits, dim=0).item()
             
             all_labels.append(label.item())
