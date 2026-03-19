@@ -50,6 +50,37 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+def validate_dataset(dataset, verbose=True):
+    """
+    Filter out invalid slides from dataset by attempting to load each one.
+    
+    Some slides may have missing features or corrupted data. This function
+    validates the entire dataset and returns a Subset containing only valid slides.
+    
+    Parameters:
+    - dataset: PyTorch Dataset instance to validate
+    - verbose: If True, print validation progress
+    
+    Returns:
+    - filtered_dataset: torch.utils.data.Subset with only valid slides
+    - valid_indices: List of valid slide indices
+    """
+    valid_indices = []
+    
+    for i in range(len(dataset)):
+        try:
+            _ = dataset[i]
+            valid_indices.append(i)
+        except Exception as e:
+            if verbose:
+                print(f"Invalid slide at index {i}: {type(e).__name__}")
+    
+    filtered_dataset = torch.utils.data.Subset(dataset, valid_indices)
+    if verbose:
+        print(f"Dataset validation complete: {len(valid_indices)}/{len(dataset)} valid slides")
+    
+    return filtered_dataset, valid_indices
+
 class ZarrSlideDataset(Dataset):
     def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir, max_tiles=None, seed=None):
         self.df = df.reset_index(drop=True)
@@ -183,6 +214,21 @@ def train_ABMIL(
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
+
+    # Validate training dataset and filter out invalid slides
+    print("Validating training dataset...")
+    train_dataset, valid_indices = validate_dataset(train_dataset, verbose=True)
+    if len(valid_indices) == 0:
+        raise RuntimeError("No valid slides found in training dataset")
+    print(f"Using {len(valid_indices)} valid slides for training")
+    
+    # Validate validation dataset if provided
+    if val_dataset is not None:
+        print("Validating validation dataset...")
+        val_dataset, _ = validate_dataset(val_dataset, verbose=True)
+        if len(_) == 0:
+            print("Warning: No valid slides in validation dataset; disabling early stopping")
+            val_dataset = None
 
     # DataLoader: decides when items are loaded, handles shuffling and batching
     # Use worker_init_fn to ensure reproducibility with multiple workers
@@ -592,6 +638,7 @@ def kfold_cross_validation(
         print(f"Train subset: {len(train_subset_df)} samples")
         print(f"Internal val: {len(internal_val_df)} samples")
         print(f"Test set: {len(test_df)} samples")
+        print(f"Total before validation: {len(train_subset_df) + len(internal_val_df) + len(test_df)} samples")
         # Use fold-specific seed for deterministic tile sampling
         fold_seed = random_state + fold_idx + 1
         
@@ -628,6 +675,17 @@ def kfold_cross_validation(
             max_tiles=max_tiles,
             seed=fold_seed
         )
+        
+        # Validate all datasets before training to filter out invalid slides
+        print("Validating datasets...")
+        train_dataset, train_valid_indices = validate_dataset(train_dataset, verbose=False)
+        internal_val_dataset, val_valid_indices = validate_dataset(internal_val_dataset, verbose=False)
+        test_dataset, test_valid_indices = validate_dataset(test_dataset, verbose=False)
+        print(f"After validation: Train {len(train_valid_indices)}, Internal Val {len(val_valid_indices)}, Test {len(test_valid_indices)} valid slides")
+        
+        if len(train_valid_indices) == 0:
+            print(f"Warning: No valid slides in train subset for fold {fold_idx + 1}, skipping fold")
+            continue
         
         # Train model on train_subset with early stopping on internal_val
         # Use fold-specific seed derived from random_state for reproducibility
