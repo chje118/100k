@@ -482,7 +482,12 @@ def kfold_cross_validation(
     random_state=42
 ):
     """
-    Perform K-fold cross-validation for ABMIL model with early stopping for best AUC comparability.
+    Perform K-fold cross-validation for ABMIL model with proper train/internal-val/test split.
+    
+    Prevents data leakage by using a strict three-way split for each fold:
+    - Train subset (90%): For model training
+    - Internal validation (10%): For early stopping only (NOT seen during evaluation)
+    - Test set (20%): For final evaluation only (NEVER seen during training/early stopping)
     
     For the pathology benchmark, this function evaluates using macro AUC (unweighted mean of 
     one-vs-rest AUC scores across all classes). This metric is class-balanced and appropriate 
@@ -520,6 +525,8 @@ def kfold_cross_validation(
         Keys: 'fold_auc_scores' (macro AUC per fold), 'mean_auc', 'std_auc', 
               'fold_accuracies', 'mean_accuracy', 'std_accuracy', 'n_splits'
     """
+    from sklearn.model_selection import train_test_split
+    
     # Set global seed at the start for reproducibility
     set_seed(random_state)
     print(f"Random seed set to {random_state} for reproducibility")
@@ -530,19 +537,34 @@ def kfold_cross_validation(
     fold_accuracies = []
     
     print(f"Starting {n_splits}-fold cross-validation with early stopping (patience={early_stopping_patience})...")
+    print(f"Data leakage prevention: Train(90%) → Training | Internal Val(10%) → Early stopping | Test(20%) → Final evaluation only")
     
-    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(df, df[label_col])):
+    for fold_idx, (train_idx, test_idx) in enumerate(skf.split(df, df[label_col])):
         print(f"\n{'='*60}")
         print(f"Fold {fold_idx + 1}/{n_splits}")
         print(f"{'='*60}")
         
-        # Split data by fold indices
-        train_df = df.iloc[train_idx].reset_index(drop=True)
-        val_df = df.iloc[val_idx].reset_index(drop=True)
+        # Split fold into 80% train + 20% test
+        fold_df = df.iloc[train_idx].reset_index(drop=True)
+        test_df = df.iloc[test_idx].reset_index(drop=True)
         
-        # Create datasets for this fold
+        # Further split train into 90% train_subset + 10% internal_val
+        # Use fold-specific seed for this split
+        split_seed = random_state + fold_idx + 1
+        train_subset_df, internal_val_df = train_test_split(
+            fold_df,
+            test_size=1/9,  # 10% of fold_df (which is 80%), so 10%/90% split
+            stratify=fold_df[label_col],
+            random_state=split_seed
+        )
+        
+        print(f"Train subset: {len(train_subset_df)} samples")
+        print(f"Internal val: {len(internal_val_df)} samples")
+        print(f"Test set: {len(test_df)} samples")
+        
+        # Create datasets
         train_dataset = ZarrSlideDataset(
-            df=train_df,
+            df=train_subset_df,
             filename_col=filename_col,
             label_col=label_col,
             feature_key=feature_key,
@@ -550,8 +572,8 @@ def kfold_cross_validation(
             zarr_dir=zarr_dir
         )
         
-        val_dataset = ZarrSlideDataset(
-            df=val_df,
+        internal_val_dataset = ZarrSlideDataset(
+            df=internal_val_df,
             filename_col=filename_col,
             label_col=label_col,
             feature_key=feature_key,
@@ -559,13 +581,22 @@ def kfold_cross_validation(
             zarr_dir=zarr_dir
         )
         
-        # Train model on this fold with early stopping
+        test_dataset = ZarrSlideDataset(
+            df=test_df,
+            filename_col=filename_col,
+            label_col=label_col,
+            feature_key=feature_key,
+            tile_key=tile_key,
+            zarr_dir=zarr_dir
+        )
+        
+        # Train model on train_subset with early stopping on internal_val
         # Use fold-specific seed derived from random_state for reproducibility
         fold_seed = random_state + fold_idx + 1
         model, _ = train_ABMIL(
-            train_df=train_df,
+            train_df=train_subset_df,
             train_dataset=train_dataset,
-            val_dataset=val_dataset,
+            val_dataset=internal_val_dataset,  # Early stopping uses INTERNAL val only
             label_col=label_col,
             n_epochs=n_epochs,
             class_weights=class_weights,
@@ -577,10 +608,10 @@ def kfold_cross_validation(
             seed=fold_seed
         )
         
-        # Validate on this fold
+        # Evaluate on TEST set ONLY (never seen during training or early stopping)
         all_labels, all_preds, all_probs = validate_ABMIL(
             model=model,
-            val_dataset=val_dataset,
+            val_dataset=test_dataset,
             device=device,
             use_amp=use_amp,
             amp_dtype=amp_dtype
@@ -593,7 +624,7 @@ def kfold_cross_validation(
         fold_auc_scores.append(fold_auc)
         fold_accuracies.append(fold_accuracy)
         
-        print(f"Fold {fold_idx + 1} - AUC: {fold_auc:.4f}, Accuracy: {fold_accuracy:.4f}")
+        print(f"Fold {fold_idx + 1} - Test AUC: {fold_auc:.4f}, Test Accuracy: {fold_accuracy:.4f}")
     
     # Compute mean and std across folds
     mean_auc = np.mean(fold_auc_scores)
@@ -605,10 +636,14 @@ def kfold_cross_validation(
     print(f"\n{'='*60}")
     print(f"K-Fold Cross-Validation Results ({n_splits} folds)")
     print(f"{'='*60}")
-    print(f"Mean AUC: {mean_auc:.4f} +- {std_auc:.4f}")
-    print(f"Mean Accuracy: {mean_accuracy:.4f} +- {std_accuracy:.4f}")
-    print(f"Individual fold AUC scores: {[f'{auc:.4f}' for auc in fold_auc_scores]}")
-    print(f"Individual fold accuracies: {[f'{acc:.4f}' for acc in fold_accuracies]}")
+    print(f"Mean Test AUC: {mean_auc:.4f} +- {std_auc:.4f}")
+    print(f"Mean Test Accuracy: {mean_accuracy:.4f} +- {std_accuracy:.4f}")
+    print(f"Individual fold Test AUC scores: {[f'{auc:.4f}' for auc in fold_auc_scores]}")
+    print(f"Individual fold Test accuracies: {[f'{acc:.4f}' for acc in fold_accuracies]}")
+    print(f"\nData leakage prevention verified:")
+    print(f"  ✓ Train subset used for model training")
+    print(f"  ✓ Internal validation used for early stopping only")
+    print(f"  ✓ Test set used for final evaluation only (no leakage)")
     
     results_dict = {
         'fold_auc_scores': fold_auc_scores,
@@ -631,8 +666,12 @@ if __name__ == "__main__":
     feature_key = "features_h-optimus-0"  # or your desired feature key
     zarr_dir = "/path/to/zarr/cache"
     
-    # K-fold cross-validation with early stopping (RECOMMENDED)
-    # Early stopping ensures each fold trains until validation AUC plateaus, for fair AUC comparability.
+    # K-fold cross-validation with proper train/internal-val/test split (RECOMMENDED)
+    # Prevents data leakage by using strict three-way split for each fold:
+    # - Train subset (90%): For model training
+    # - Internal validation (10%): For early stopping only
+    # - Test set (20%): For final evaluation only
+    # 
     # random_state parameter ensures fully reproducible results (fold splitting, model init, training randomness).
     # Use the same random_state to reproduce the exact same AUC values.
     results = kfold_cross_validation(
@@ -644,10 +683,10 @@ if __name__ == "__main__":
         zarr_dir=zarr_dir,
         n_splits=5,
         n_epochs=100,               # Maximum epochs
-        early_stopping_patience=3,  # Stop after 3 epochs with no AUC improvement
+        early_stopping_patience=3,  # Stop after 3 epochs with no AUC improvement on internal val
         random_state=42             # Fixed seed for reproducibility: use same value to get identical results
     )
-    print(f"\nFinal Results: AUC = {results['mean_auc']:.4f} +- {results['std_auc']:.4f}")
+    print(f"\nFinal Results: Test AUC = {results['mean_auc']:.4f} +- {results['std_auc']:.4f}")
     
     # Alternative: K-fold without early stopping (train for exactly n_epochs)
     # results_no_es = kfold_cross_validation(
@@ -663,24 +702,37 @@ if __name__ == "__main__":
     #     random_state=42                # Fixed seed for reproducibility
     # )
     
-    # Alternative: Single train/val split (faster, less robust)
+    # Alternative: Single train/internal-val/test split (faster, less robust)
     # from sklearn.model_selection import train_test_split
-    # train_df, val_df = train_test_split(
+    # # First split: 80% train, 20% test
+    # train_df, test_df = train_test_split(
     #     df,
     #     test_size=0.2,
     #     stratify=df[label_col],
     #     random_state=42
     # )
+    # # Second split: split train into 90% train_subset, 10% internal_val
+    # train_subset_df, internal_val_df = train_test_split(
+    #     train_df,
+    #     test_size=1/9,  # 10% of train_df
+    #     stratify=train_df[label_col],
+    #     random_state=42
+    # )
     # train_dataset = ZarrSlideDataset(
-    #     df=train_df, filename_col=filename_col, label_col=label_col,
+    #     df=train_subset_df, filename_col=filename_col, label_col=label_col,
     #     feature_key=feature_key, tile_key="tiles_224", zarr_dir=zarr_dir
     # )
-    # val_dataset = ZarrSlideDataset(
-    #     df=val_df, filename_col=filename_col, label_col=label_col,
+    # internal_val_dataset = ZarrSlideDataset(
+    #     df=internal_val_df, filename_col=filename_col, label_col=label_col,
     #     feature_key=feature_key, tile_key="tiles_224", zarr_dir=zarr_dir
     # )
-    # model, _ = train_ABMIL(train_df, train_dataset, val_dataset, label_col, 
+    # test_dataset = ZarrSlideDataset(
+    #     df=test_df, filename_col=filename_col, label_col=label_col,
+    #     feature_key=feature_key, tile_key="tiles_224", zarr_dir=zarr_dir
+    # )
+    # # Train with early stopping on internal_val, evaluate on test_df
+    # model, _ = train_ABMIL(train_subset_df, train_dataset, internal_val_dataset, label_col, 
     #                         n_epochs=100, early_stopping_patience=3, seed=42)
-    # all_labels, all_preds, all_probs = validate_ABMIL(model, val_dataset)
+    # all_labels, all_preds, all_probs = validate_ABMIL(model, test_dataset)
     # auc = auc_score(all_labels, all_probs)
-    # print(f"Validation AUC: {auc:.4f}")
+    # print(f"Test AUC: {auc:.4f}")
