@@ -49,6 +49,69 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+# ==================== INTERNAL HELPER FUNCTIONS ====================
+
+def _create_dataloader(dataset, batch_size=1, shuffle=False, device=None, worker_init_fn=None):
+    """Create DataLoader with standard configuration."""
+    kwargs = {"batch_size": batch_size, "shuffle": shuffle}
+    if worker_init_fn is not None:
+        kwargs["worker_init_fn"] = worker_init_fn
+    if isinstance(device, str) and device.startswith("cuda"):
+        kwargs["pin_memory"] = True
+    return DataLoader(dataset, **kwargs)
+
+def _configure_gpu_optimization():
+    """Configure GPU for modern CUDA GPUs (H100, etc.)."""
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.set_float32_matmul_precision("high")
+    except AttributeError:
+        pass
+    if hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+    if hasattr(torch.backends.cuda, "cudnn"):
+        torch.backends.cuda.cudnn.allow_tf32 = True
+
+def _preprocess_batch(feats, tile_ids, label, device):
+    """Preprocess batch tensors before forward pass."""
+    if feats.dim() == 3:
+        feats = feats.squeeze(0)
+    if tile_ids.ndim == 2:
+        tile_ids = tile_ids.squeeze(0)
+    feats = feats.to(device, non_blocking=True)
+    label = label.to(device, non_blocking=True)
+    return feats, tile_ids, label
+
+def _should_use_amp(device, use_amp):
+    """Check if AMP should be enabled."""
+    return (isinstance(device, str) and 
+            device.startswith("cuda") and 
+            use_amp and 
+            torch.cuda.is_available())
+
+def _extract_model_dims(model):
+    """Extract dimensions from ABMIL model."""
+    return {
+        'in_dim': model.classifier.in_features,
+        'n_classes': model.classifier.out_features,
+        'hidden_dim': model.attn[0].out_features
+    }
+
+def _compute_metrics(all_labels, all_preds, all_probs):
+    """Compute accuracy and AUC metrics."""
+    accuracy = np.mean(np.array(all_labels) == np.array(all_preds))
+    auc = auc_score(all_labels, all_probs)
+    return {
+        'labels': all_labels,
+        'preds': all_preds,
+        'probs': all_probs,
+        'accuracy': accuracy,
+        'auc': auc
+    }
+
+# ==================== END INTERNAL HELPERS ====================
+
 class ZarrSlideDataset(Dataset):
     def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir, max_tiles=None, seed=None):
         self.df = df.reset_index(drop=True)
@@ -310,11 +373,8 @@ class ABMILPipeline:
         - model: ABMIL model to save
         - model_name: Name for the model file
         """
-        in_dim = model.classifier.in_features
-        n_classes = model.classifier.out_features
-        hidden_dim = model.attn[0].out_features
-        
-        filename = f"{model_name}_{in_dim}_{n_classes}_{hidden_dim}.pth"
+        dims = _extract_model_dims(model)
+        filename = f"{model_name}_{dims['in_dim']}_{dims['n_classes']}_{dims['hidden_dim']}.pth"
         save_path = os.path.join("models/", filename)
         
         os.makedirs("models/", exist_ok=True)
@@ -371,19 +431,10 @@ class ABMILPipeline:
             verbose=True
         )
         
-        accuracy = np.mean(np.array(all_labels) == np.array(all_preds))
-        auc = auc_score(all_labels, all_probs)
+        results = _compute_metrics(all_labels, all_preds, all_probs)
         
-        results = {
-            'labels': all_labels,
-            'preds': all_preds,
-            'probs': all_probs,
-            'accuracy': accuracy,
-            'auc': auc
-        }
-        
-        print(f"Evaluation Accuracy: {accuracy:.4f}")
-        print(f"Evaluation AUC: {auc:.4f}")
+        print(f"Evaluation Accuracy: {results['accuracy']:.4f}")
+        print(f"Evaluation AUC: {results['auc']:.4f}")
         
         return results
 
@@ -454,14 +505,13 @@ def train_ABMIL(
         if seed is not None:
             set_seed(seed + worker_id)
     
-    default_loader_kwargs = {
-        "batch_size": 1, 
-        "shuffle": True,
-        "worker_init_fn": worker_init_fn if seed is not None else None
-    }
-    if device.startswith("cuda"):
-        default_loader_kwargs["pin_memory"] = True
-    train_loader = DataLoader(train_dataset, **default_loader_kwargs)
+    train_loader = _create_dataloader(
+        train_dataset, 
+        batch_size=1, 
+        shuffle=True,
+        device=device,
+        worker_init_fn=worker_init_fn if seed is not None else None
+    )
 
     # Extract Feature Dimension and Number of Classes
     sample_feats, _, _ = train_dataset[0]
@@ -472,15 +522,7 @@ def train_ABMIL(
     model = ABMIL(feat_dim, n_classes).to(device)
 
     # Enable TF32 / high matmul precision on modern GPUs (e.g. H100)
-    if device.startswith("cuda"):
-        try:
-            torch.set_float32_matmul_precision("high")
-        except AttributeError:
-            pass
-        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
-            torch.backends.cuda.matmul.allow_tf32 = True
-            if hasattr(torch.backends.cuda, "cudnn"):
-                torch.backends.cuda.cudnn.allow_tf32 = True
+    _configure_gpu_optimization()
 
     # Compile model for additional speed (PyTorch 2.x+)
     if compile_model and hasattr(torch, "compile") and device.startswith("cuda"):
@@ -513,18 +555,13 @@ def train_ABMIL(
 
         # Loop over slides
         for feats, tile_ids, label in tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs}", leave=False):
-            if feats.dim() == 3:
-                feats = feats.squeeze(0)
-            if tile_ids.ndim == 2:
-                tile_ids = tile_ids.squeeze(0)
-            feats = feats.to(device, non_blocking=True)
-            label = label.to(device, non_blocking=True)
+            feats, tile_ids, label = _preprocess_batch(feats, tile_ids, label, device)
         
             if feats.shape[0] == 0:
                 continue
 
             # Forward pass (optionally with mixed precision on CUDA)
-            if device.startswith("cuda") and use_amp and torch.cuda.is_available():
+            if _should_use_amp(device, use_amp):
                 with torch.autocast(device_type="cuda", dtype=amp_dtype):
                     logits, _ = model(feats)
                     loss = loss_fn(logits.unsqueeze(0), label)
@@ -593,10 +630,7 @@ def validate_ABMIL(
         device = next(model.parameters()).device
 
     # Validation DataLoader
-    default_loader_kwargs = {"batch_size": 1, "shuffle": False,}
-    if isinstance(device, str) and device.startswith("cuda"):
-        default_loader_kwargs["pin_memory"] = True
-    val_loader = DataLoader(val_dataset, **default_loader_kwargs)
+    val_loader = _create_dataloader(val_dataset, batch_size=1, shuffle=False, device=device)
 
     # Validation Loop
     model.eval()   # Disables training behaviors (dropout etc.)
@@ -607,19 +641,13 @@ def validate_ABMIL(
 
     with torch.no_grad():   # Disables gradient computation (save memory)
         for feats, tile_ids, label in tqdm(val_loader, desc="Validation", leave=False, disable=not verbose):
-            if feats.dim() == 3:
-                feats = feats.squeeze(0)
-            if tile_ids.ndim == 2:
-                tile_ids = tile_ids.squeeze(0)
-            feats = feats.to(device, non_blocking=True)
-            label = label.to(device, non_blocking=True)
+            feats, tile_ids, label = _preprocess_batch(feats, tile_ids, label, device)
 
             if feats.shape[0] == 0:
                 continue
 
             # Forward pass (optionally with mixed precision on CUDA)
-            if (isinstance(device, str) and device.startswith("cuda")
-                    and use_amp and torch.cuda.is_available()):
+            if _should_use_amp(device, use_amp):
                 with torch.autocast(device_type="cuda", dtype=amp_dtype):
                     logits, _ = model(feats)
             else:
@@ -664,11 +692,8 @@ def save_model(model, model_name):
     - model (ABMIL): Trained ABMIL model
     - model_name (str): Base name for the model (e.g., 'abmil_placenta')
     """
-    in_dim = model.classifier.in_features
-    n_classes = model.classifier.out_features
-    hidden_dim = model.attn[0].out_features
-    
-    filename = f"{model_name}_{in_dim}_{n_classes}_{hidden_dim}.pth"
+    dims = _extract_model_dims(model)
+    filename = f"{model_name}_{dims['in_dim']}_{dims['n_classes']}_{dims['hidden_dim']}.pth"
     save_path = os.path.join("models/", filename)
     
     os.makedirs("models/", exist_ok=True)
