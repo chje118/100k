@@ -130,8 +130,6 @@ class ABMIL(nn.Module):
 
         return logits, A
 
-# TODO: consider adding dataset-level feature normalization (PathBench)
-
 def train_ABMIL(
     train_df,
     train_dataset,
@@ -494,7 +492,7 @@ def kfold_cross_validation(
     zarr_dir,
     n_splits=5,
     n_epochs=10,
-    early_stopping_patience=3,
+    early_stopping_patience=5,
     class_weights=None,
     device=None,
     use_amp=True,
@@ -532,7 +530,7 @@ def kfold_cross_validation(
     - n_splits: Number of folds (default: 5)
     - n_epochs: Maximum number of training epochs per fold
     - early_stopping_patience: Number of epochs with no validation AUC improvement to wait before
-                              stopping (default: 3). Set to None to disable early stopping and train 
+                              stopping (default: 5). Set to None to disable early stopping and train 
                               for exactly n_epochs.
     - class_weights: Optional tensor of class weights
     - device: Torch device (default: cuda if available else cpu)
@@ -547,7 +545,7 @@ def kfold_cross_validation(
     
     Returns:
     - results_dict: Dictionary with fold results and aggregated metrics
-        Keys: 'fold_auc_scores' (macro AUC per fold), 'mean_auc', 'std_auc', 
+        Keys: 'fold_auc_scores' (macro AUC per fold), 'mean_auc', 'std_auc', (primary metric for pathology benchmark)
               'fold_accuracies', 'mean_accuracy', 'std_accuracy', 'n_splits'
     """
     from sklearn.model_selection import train_test_split
@@ -711,7 +709,7 @@ if __name__ == "__main__":
         zarr_dir=zarr_dir,
         n_splits=5,
         n_epochs=100,               # Maximum epochs
-        early_stopping_patience=3,  # Stop after 3 epochs with no AUC improvement on internal val
+        early_stopping_patience=5,  # Stop after 5 epochs with no AUC improvement on internal val
         max_tiles=5000,             # Limit to 5000 tiles per slide (None = no limit)
         random_state=42             # Fixed seed for reproducibility: use same value to get identical results
     )
@@ -762,7 +760,7 @@ if __name__ == "__main__":
     # )
     # # Train with early stopping on internal_val, evaluate on test_df
     # model, _ = train_ABMIL(train_subset_df, train_dataset, internal_val_dataset, label_col, 
-    #                         n_epochs=100, early_stopping_patience=3, seed=42)
+    #                         n_epochs=100, early_stopping_patience=5, seed=42)
     # all_labels, all_preds, all_probs = validate_ABMIL(model, test_dataset)
     # auc = auc_score(all_labels, all_probs)
     # print(f"Test AUC: {auc:.4f}")
