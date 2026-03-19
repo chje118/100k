@@ -51,7 +51,7 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 class ZarrSlideDataset(Dataset):
-    def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir, max_tiles=None):
+    def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir, max_tiles=None, seed=None):
         self.df = df.reset_index(drop=True)
         self.filename_col = filename_col
         self.label_col = label_col
@@ -59,6 +59,7 @@ class ZarrSlideDataset(Dataset):
         self.tile_key = tile_key
         self.zarr_dir = zarr_dir
         self.max_tiles = max_tiles  # Maximum number of tiles per slide (None = no limit)
+        self.seed = seed  # Seed for deterministic tile sampling across runs
     
     def __len__(self):
         return len(self.df)
@@ -75,10 +76,17 @@ class ZarrSlideDataset(Dataset):
         feats = torch.tensor(adata.X[:]).float() # tile features as a PyTorch tensor
         tile_ids = np.array(adata.obs['tile_id']) # save tile IDs for visualization
         
-        # Apply max_tiles limit if specified
+        # Apply max_tiles limit if specified with deterministic sampling
         if self.max_tiles is not None and feats.shape[0] > self.max_tiles:
-            # Randomly sample max_tiles tiles (without replacement)
-            indices = np.random.choice(feats.shape[0], self.max_tiles, replace=False)
+            # Use deterministic random state based on seed and slide index
+            # This ensures the same slide always gets the same tiles sampled across runs
+            if self.seed is not None:
+                local_rng = np.random.RandomState(self.seed + idx)
+            else:
+                local_rng = np.random.RandomState(idx)
+            
+            # Deterministically sample max_tiles tiles (without replacement)
+            indices = local_rng.choice(feats.shape[0], self.max_tiles, replace=False)
             feats = feats[indices]
             tile_ids = tile_ids[indices]
         
@@ -584,8 +592,10 @@ def kfold_cross_validation(
         print(f"Train subset: {len(train_subset_df)} samples")
         print(f"Internal val: {len(internal_val_df)} samples")
         print(f"Test set: {len(test_df)} samples")
+        # Use fold-specific seed for deterministic tile sampling
+        fold_seed = random_state + fold_idx + 1
         
-        # Create datasets
+        # Create datasets with deterministic tile sampling
         train_dataset = ZarrSlideDataset(
             df=train_subset_df,
             filename_col=filename_col,
@@ -593,7 +603,8 @@ def kfold_cross_validation(
             feature_key=feature_key,
             tile_key=tile_key,
             zarr_dir=zarr_dir,
-            max_tiles=max_tiles
+            max_tiles=max_tiles,
+            seed=fold_seed
         )
         
         internal_val_dataset = ZarrSlideDataset(
@@ -603,7 +614,8 @@ def kfold_cross_validation(
             feature_key=feature_key,
             tile_key=tile_key,
             zarr_dir=zarr_dir,
-            max_tiles=max_tiles
+            max_tiles=max_tiles,
+            seed=fold_seed
         )
         
         test_dataset = ZarrSlideDataset(
@@ -613,12 +625,12 @@ def kfold_cross_validation(
             feature_key=feature_key,
             tile_key=tile_key,
             zarr_dir=zarr_dir,
-            max_tiles=max_tiles
+            max_tiles=max_tiles,
+            seed=fold_seed
         )
         
         # Train model on train_subset with early stopping on internal_val
         # Use fold-specific seed derived from random_state for reproducibility
-        fold_seed = random_state + fold_idx + 1
         model, _ = train_ABMIL(
             train_df=train_subset_df,
             train_dataset=train_dataset,
@@ -698,8 +710,13 @@ if __name__ == "__main__":
     # - Internal validation (10%): For early stopping only
     # - Test set (20%): For final evaluation only
     # 
-    # random_state parameter ensures fully reproducible results (fold splitting, model init, training randomness).
-    # Use the same random_state to reproduce the exact same AUC values.
+    # random_state parameter ensures fully reproducible results including:
+    # - Fold splitting
+    # - Model initialization
+    # - Training randomness
+    # - Tile sampling (deterministic per-slide when max_tiles is used)
+    #
+    # Use the same random_state to reproduce exact same AUC values across runs.
     results = kfold_cross_validation(
         df=df,
         filename_col=filename_col,
@@ -711,7 +728,7 @@ if __name__ == "__main__":
         n_epochs=100,               # Maximum epochs
         early_stopping_patience=5,  # Stop after 5 epochs with no AUC improvement on internal val
         max_tiles=5000,             # Limit to 5000 tiles per slide (None = no limit)
-        random_state=42             # Fixed seed for reproducibility: use same value to get identical results
+        random_state=42             # Fixed seed for reproducibility (controls ALL randomness including tile sampling)
     )
     print(f"\nFinal Results: Test AUC = {results['mean_auc']:.4f} +- {results['std_auc']:.4f}")
     
