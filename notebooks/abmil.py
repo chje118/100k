@@ -30,6 +30,7 @@ import lazyslide as zs
 from tqdm import tqdm
 import re
 import random
+import copy
 
 
 def set_seed(seed):
@@ -283,7 +284,8 @@ def train_ABMIL(
             if val_auc > best_auc:
                 best_auc = val_auc
                 epochs_no_improve = 0
-                best_model_state = model.state_dict().copy()
+                # Use deep copy to avoid shallow copy issues where tensors may drift during training
+                best_model_state = copy.deepcopy(model.state_dict())
                 print(" (improved)", end="")
             else:
                 epochs_no_improve += 1
