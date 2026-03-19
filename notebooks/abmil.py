@@ -112,7 +112,7 @@ class ABMIL(nn.Module):
         # Normalize with softmax (sums to 1)
         A = torch.softmax(A, dim=0)
 
-        # Weighted sum of features (MIL pooling)
+        # Weighted sum of features (MIL posoling)
         M = torch.sum(A * x, dim=0)
 
         # Multiclass predictions
