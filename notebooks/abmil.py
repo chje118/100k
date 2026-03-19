@@ -1,18 +1,19 @@
 """
 Attention-Based Multiple Instance Learning (ABMIL) for Whole Slide Image Classification.
-Assumes binary or multi-class, single-label classification.
+Includes methods for training, validation, and evaluation of ABMIL models on pathology datasets, 
+as well as method for saving and loading trained models.
 
-Evaluation includes confusion matrix and classification report, AUC and ROC curves.
-Model saving and loading functions are included, with auto-generated filenames containing model dimensions for easy tracking.
+ABMIL Classification: 
+- Assumes binary or multi-class, single-label classification.
 
-AUC Metric for Pathology Benchmark:
------------------------------------
-This module uses macro AUC (unweighted mean of one-vs-rest AUC) for multi-class pathology classification.
+ABMIL Evaluation:
+- Confusion matrix, classification report (precision, recall, F1).
+- AUC and ROC curve for binary classification.
+- Macro AUC (unweighted mean of one-vs-rest AUC) for multi-class pathology classification.
+    
 Macro AUC is class-balanced and appropriate when all diagnostic categories are equally important.
 For each class i, one-vs-rest AUC is computed as the ROC AUC treating class i vs. all others.
 Then macro AUC = mean(AUC_i for all classes i).
-
-This provides a single interpretable metric for multi-class problems without requiring per-class weights.
 """
 
 import os
@@ -34,8 +35,7 @@ import copy
 
 
 def set_seed(seed):
-    """
-    Set seeds for reproducibility across numpy, torch, and python random.
+    """ Set seeds for reproducibility.
     
     Parameters:
     - seed: Random seed value (integer)
@@ -46,40 +46,8 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-    # Ensure deterministic behavior (may impact performance)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-def validate_dataset(dataset, verbose=True):
-    """
-    Filter out invalid slides from dataset by attempting to load each one.
-    
-    Some slides may have missing features or corrupted data. This function
-    validates the entire dataset and returns a Subset containing only valid slides.
-    
-    Parameters:
-    - dataset: PyTorch Dataset instance to validate
-    - verbose: If True, print validation progress
-    
-    Returns:
-    - filtered_dataset: torch.utils.data.Subset with only valid slides
-    - valid_indices: List of valid slide indices
-    """
-    valid_indices = []
-    
-    for i in range(len(dataset)):
-        try:
-            _ = dataset[i]
-            valid_indices.append(i)
-        except Exception as e:
-            if verbose:
-                print(f"Invalid slide at index {i}: {type(e).__name__}")
-    
-    filtered_dataset = torch.utils.data.Subset(dataset, valid_indices)
-    if verbose:
-        print(f"Dataset validation complete: {len(valid_indices)}/{len(dataset)} valid slides")
-    
-    return filtered_dataset, valid_indices
 
 class ZarrSlideDataset(Dataset):
     def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir, max_tiles=None, seed=None):
@@ -90,7 +58,7 @@ class ZarrSlideDataset(Dataset):
         self.tile_key = tile_key
         self.zarr_dir = zarr_dir
         self.max_tiles = max_tiles  # Maximum number of tiles per slide (None = no limit)
-        self.seed = seed  # Seed for deterministic tile sampling across runs
+        self.seed = seed  # Seed for deterministic tile sampling (if max_tiles is set)
     
     def __len__(self):
         return len(self.df)
@@ -109,19 +77,16 @@ class ZarrSlideDataset(Dataset):
         
         # Apply max_tiles limit if specified with deterministic sampling
         if self.max_tiles is not None and feats.shape[0] > self.max_tiles:
-            # Use deterministic random state based on seed and slide index
-            # This ensures the same slide always gets the same tiles sampled across runs
             if self.seed is not None:
                 local_rng = np.random.RandomState(self.seed + idx)
             else:
                 local_rng = np.random.RandomState(idx)
             
-            # Deterministically sample max_tiles tiles (without replacement)
             indices = local_rng.choice(feats.shape[0], self.max_tiles, replace=False)
             feats = feats[indices]
             tile_ids = tile_ids[indices]
         
-        label = torch.tensor(row[self.label_col]).long() # the slide label as a long integer (for classification)
+        label = torch.tensor(row[self.label_col]).long() # slide label as a long integer (for classification)
 
         return feats, tile_ids, label
 
@@ -169,41 +134,39 @@ class ABMIL(nn.Module):
 
         return logits, A
 
+def validate_dataset(dataset, verbose=True):
+    """
+    Filter out invalid slides from dataset.
+    
+    Parameters:
+    - dataset: PyTorch Dataset instance to validate
+    - verbose: If True, print validation progress
+    
+    Returns:
+    - filtered_dataset: torch.utils.data.Subset with only valid slides
+    - valid_indices: List of valid slide indices
+    """
+    valid_indices = []
+    
+    for i in range(len(dataset)):
+        try:
+            _ = dataset[i]
+            valid_indices.append(i)
+        except Exception as e:
+            if verbose:
+                print(f"Invalid slide at index {i}: {type(e).__name__}")
+    
+    filtered_dataset = torch.utils.data.Subset(dataset, valid_indices)
+    if verbose:
+        print(f"Dataset validation complete: {len(valid_indices)}/{len(dataset)} valid slides")
+    
+    return filtered_dataset, valid_indices
+
 class ABMILPipeline:
-    """
-    Modular ABMIL training pipeline for whole slide image classification.
-    
-    Usage:
-    ```python
-    pipeline = ABMILPipeline(
-        df=df,
-        filename_col='path',
-        label_col='diagnosis',
-        feature_key='features_h-optimus-0',
-        tile_key='tiles_224',
-        zarr_dir='zarr_cache'
-    )
-    
-    # Step 1: Validate slides (optional, removes invalid slides)
-    valid_df = pipeline.validate_slides()
-    
-    # Step 2: Run k-fold cross-validation
-    results = pipeline.run_k_fold_validation(
-        n_splits=5,
-        n_epochs=100,
-        early_stopping_patience=5
-    )
-    
-    # Step 3: Train final model on all data and save
-    model = pipeline.train_final_model(n_epochs=100)
-    pipeline.save_model(model, 'my_model')
-    ```
-    """
-    
     def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir):
         """
-        Initialize ABMIL pipeline.
-        
+        ABMIL training pipeline for WSI classification. 
+
         Parameters:
         - df: DataFrame with slide metadata
         - filename_col: Column name for slide filenames
@@ -225,25 +188,30 @@ class ABMILPipeline:
     def validate_slides(self, verbose=True):
         """
         Validate all slides and filter out invalid ones.
+        Uses PyTorch dataset validation.
         
+        Parameters:
+        - verbose: If True, print validation progress
+
         Returns:
         - validated_df: DataFrame with only valid slides
         """
         print(f"\nValidating {len(self.df)} slides...")
         
-        valid_indices = []
-        for idx, row in self.df.iterrows():
-            try:
-                slide_path = row[self.filename_col]
-                zarr_path = os.path.join(self.zarr_dir, os.path.basename(slide_path).replace(".mrxs", ".zarr"))
-                wsi = open_wsi(slide_path, zarr_path)
-                adata = wsi.tables[self.feature_key]
-                if adata.X.shape[0] > 0:
-                    valid_indices.append(idx)
-            except Exception as e:
-                if verbose:
-                    print(f"Invalid slide at index {idx}: {type(e).__name__}")
+        # Create temporary dataset for validation
+        temp_dataset = ZarrSlideDataset(
+            df=self.df,
+            filename_col=self.filename_col,
+            label_col=self.label_col,
+            feature_key=self.feature_key,
+            tile_key=self.tile_key,
+            zarr_dir=self.zarr_dir
+        )
         
+        # Validate using the PyTorch dataset method
+        filtered_dataset, valid_indices = validate_dataset(temp_dataset, verbose=verbose)
+        
+        # Filter dataframe to keep only valid slides
         self.validated_df = self.df.iloc[valid_indices].reset_index(drop=True)
         print(f"Validation complete: {len(self.validated_df)}/{len(self.df)} valid slides")
         
@@ -1089,3 +1057,31 @@ if __name__ == "__main__":
     # all_labels, all_preds, all_probs = validate_ABMIL(model, test_dataset)
     # auc = auc_score(all_labels, all_probs)
     # print(f"Test AUC: {auc:.4f}")
+
+
+"""   Usage:
+    ```python
+    pipeline = ABMILPipeline(
+        df=df,
+        filename_col='path',
+        label_col='diagnosis',
+        feature_key='features_h-optimus-0',
+        tile_key='tiles_224',
+        zarr_dir='zarr_cache'
+    )
+    
+    # Step 1: Validate slides (optional, removes invalid slides)
+    valid_df = pipeline.validate_slides()
+    
+    # Step 2: Run k-fold cross-validation
+    results = pipeline.run_k_fold_validation(
+        n_splits=5,
+        n_epochs=100,
+        early_stopping_patience=5
+    )
+    
+    # Step 3: Train final model on all data and save
+    model = pipeline.train_final_model(n_epochs=100)
+    pipeline.save_model(model, 'my_model')
+    ```
+ """
