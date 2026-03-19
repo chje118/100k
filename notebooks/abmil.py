@@ -169,6 +169,256 @@ class ABMIL(nn.Module):
 
         return logits, A
 
+class ABMILPipeline:
+    """
+    Modular ABMIL training pipeline for whole slide image classification.
+    
+    Usage:
+    ```python
+    pipeline = ABMILPipeline(
+        df=df,
+        filename_col='path',
+        label_col='diagnosis',
+        feature_key='features_h-optimus-0',
+        tile_key='tiles_224',
+        zarr_dir='zarr_cache'
+    )
+    
+    # Step 1: Validate slides (optional, removes invalid slides)
+    valid_df = pipeline.validate_slides()
+    
+    # Step 2: Run k-fold cross-validation
+    results = pipeline.run_k_fold_validation(
+        n_splits=5,
+        n_epochs=100,
+        early_stopping_patience=5
+    )
+    
+    # Step 3: Train final model on all data and save
+    model = pipeline.train_final_model(n_epochs=100)
+    pipeline.save_model(model, 'my_model')
+    ```
+    """
+    
+    def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir):
+        """
+        Initialize ABMIL pipeline.
+        
+        Parameters:
+        - df: DataFrame with slide metadata
+        - filename_col: Column name for slide filenames
+        - label_col: Column name for class labels
+        - feature_key: Key for features in zarr tables (e.g., 'features_h-optimus-0')
+        - tile_key: Key for tiles in zarr tables (e.g., 'tiles_224')
+        - zarr_dir: Directory containing zarr files
+        """
+        self.df = df.copy()
+        self.filename_col = filename_col
+        self.label_col = label_col
+        self.feature_key = feature_key
+        self.tile_key = tile_key
+        self.zarr_dir = zarr_dir
+        self.validated_df = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"ABMILPipeline initialized on device: {self.device}")
+    
+    def validate_slides(self, verbose=True):
+        """
+        Validate all slides and filter out invalid ones.
+        
+        Returns:
+        - validated_df: DataFrame with only valid slides
+        """
+        print(f"\nValidating {len(self.df)} slides...")
+        
+        valid_indices = []
+        for idx, row in self.df.iterrows():
+            try:
+                slide_path = row[self.filename_col]
+                zarr_path = os.path.join(self.zarr_dir, os.path.basename(slide_path).replace(".mrxs", ".zarr"))
+                wsi = open_wsi(slide_path, zarr_path)
+                adata = wsi.tables[self.feature_key]
+                if adata.X.shape[0] > 0:
+                    valid_indices.append(idx)
+            except Exception as e:
+                if verbose:
+                    print(f"Invalid slide at index {idx}: {type(e).__name__}")
+        
+        self.validated_df = self.df.iloc[valid_indices].reset_index(drop=True)
+        print(f"Validation complete: {len(self.validated_df)}/{len(self.df)} valid slides")
+        
+        return self.validated_df
+    
+    def run_k_fold_validation(self, n_splits=5, n_epochs=10, early_stopping_patience=5, 
+                              max_tiles=None, random_state=42, class_weights=None, 
+                              use_amp=True, compile_model=False):
+        """
+        Run k-fold cross-validation.
+        
+        Parameters:
+        - n_splits: Number of folds
+        - n_epochs: Maximum epochs per fold
+        - early_stopping_patience: Patience for early stopping
+        - max_tiles: Maximum tiles per slide (None = no limit)
+        - random_state: Random seed for reproducibility
+        - class_weights: Optional class weights tensor
+        - use_amp: Use mixed precision training
+        - compile_model: Use torch.compile
+        
+        Returns:
+        - results_dict: Dictionary with cross-validation results
+        """
+        df_to_use = self.validated_df if self.validated_df is not None else self.df
+        
+        results = kfold_cross_validation(
+            df=df_to_use,
+            filename_col=self.filename_col,
+            label_col=self.label_col,
+            feature_key=self.feature_key,
+            tile_key=self.tile_key,
+            zarr_dir=self.zarr_dir,
+            n_splits=n_splits,
+            n_epochs=n_epochs,
+            early_stopping_patience=early_stopping_patience,
+            max_tiles=max_tiles,
+            random_state=random_state,
+            class_weights=class_weights,
+            device=self.device,
+            use_amp=use_amp,
+            compile_model=compile_model
+        )
+        
+        return results
+    
+    def train_final_model(self, n_epochs=10, class_weights=None, use_amp=True, compile_model=False, seed=42):
+        """
+        Train a final model on all data (no train/test split).
+        
+        Parameters:
+        - n_epochs: Number of epochs
+        - class_weights: Optional class weights
+        - use_amp: Use mixed precision training
+        - compile_model: Use torch.compile
+        - seed: Random seed
+        
+        Returns:
+        - model: Trained ABMIL model
+        """
+        df_to_use = self.validated_df if self.validated_df is not None else self.df
+        
+        print(f"\nTraining final model on {len(df_to_use)} slides...")
+        
+        train_dataset = ZarrSlideDataset(
+            df=df_to_use,
+            filename_col=self.filename_col,
+            label_col=self.label_col,
+            feature_key=self.feature_key,
+            tile_key=self.tile_key,
+            zarr_dir=self.zarr_dir
+        )
+        
+        model, _ = train_ABMIL(
+            train_df=df_to_use,
+            train_dataset=train_dataset,
+            val_dataset=None,  # No validation for final model
+            label_col=self.label_col,
+            n_epochs=n_epochs,
+            class_weights=class_weights,
+            device=self.device,
+            use_amp=use_amp,
+            compile_model=compile_model,
+            early_stopping_patience=None,
+            seed=seed
+        )
+        
+        self.model = model
+        return model
+    
+    def save_model(self, model, model_name):
+        """
+        Save model to disk.
+        
+        Parameters:
+        - model: ABMIL model to save
+        - model_name: Name for the model file
+        """
+        in_dim = model.classifier.in_features
+        n_classes = model.classifier.out_features
+        hidden_dim = model.attn[0].out_features
+        
+        filename = f"{model_name}_{in_dim}_{n_classes}_{hidden_dim}.pth"
+        save_path = os.path.join("models/", filename)
+        
+        os.makedirs("models/", exist_ok=True)
+        torch.save(model.state_dict(), save_path)
+        print(f"Model saved to {save_path}")
+    
+    def load_model(self, model_path):
+        """
+        Load a trained model from disk.
+        
+        Parameters:
+        - model_path: Path to saved model
+        
+        Returns:
+        - model: Loaded ABMIL model
+        - model_config: Dictionary with model configuration
+        """
+        model, config = load_model(model_path)
+        self.model = model
+        return model, config
+    
+    def evaluate_model(self, model=None, use_amp=True):
+        """
+        Evaluate a model on the data.
+        
+        Parameters:
+        - model: Model to evaluate (uses self.model if None)
+        - use_amp: Use mixed precision during evaluation
+        
+        Returns:
+        - results: Dictionary with evaluation results
+        """
+        if model is None:
+            if not hasattr(self, 'model'):
+                raise ValueError("No model loaded or trained. Use train_final_model() or load_model() first.")
+            model = self.model
+        
+        df_to_use = self.validated_df if self.validated_df is not None else self.df
+        
+        val_dataset = ZarrSlideDataset(
+            df=df_to_use,
+            filename_col=self.filename_col,
+            label_col=self.label_col,
+            feature_key=self.feature_key,
+            tile_key=self.tile_key,
+            zarr_dir=self.zarr_dir
+        )
+        
+        all_labels, all_preds, all_probs = validate_ABMIL(
+            model=model,
+            val_dataset=val_dataset,
+            device=self.device,
+            use_amp=use_amp,
+            verbose=True
+        )
+        
+        accuracy = np.mean(np.array(all_labels) == np.array(all_preds))
+        auc = auc_score(all_labels, all_probs)
+        
+        results = {
+            'labels': all_labels,
+            'preds': all_preds,
+            'probs': all_probs,
+            'accuracy': accuracy,
+            'auc': auc
+        }
+        
+        print(f"Evaluation Accuracy: {accuracy:.4f}")
+        print(f"Evaluation AUC: {auc:.4f}")
+        
+        return results
+
 def train_ABMIL(
     train_df,
     train_dataset,
