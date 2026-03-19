@@ -51,13 +51,14 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 class ZarrSlideDataset(Dataset):
-    def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir):
+    def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir, max_tiles=None):
         self.df = df.reset_index(drop=True)
         self.filename_col = filename_col
         self.label_col = label_col
         self.feature_key = feature_key
         self.tile_key = tile_key
         self.zarr_dir = zarr_dir
+        self.max_tiles = max_tiles  # Maximum number of tiles per slide (None = no limit)
     
     def __len__(self):
         return len(self.df)
@@ -73,6 +74,14 @@ class ZarrSlideDataset(Dataset):
 
         feats = torch.tensor(adata.X[:]).float() # tile features as a PyTorch tensor
         tile_ids = np.array(adata.obs['tile_id']) # save tile IDs for visualization
+        
+        # Apply max_tiles limit if specified
+        if self.max_tiles is not None and feats.shape[0] > self.max_tiles:
+            # Randomly sample max_tiles tiles (without replacement)
+            indices = np.random.choice(feats.shape[0], self.max_tiles, replace=False)
+            feats = feats[indices]
+            tile_ids = tile_ids[indices]
+        
         label = torch.tensor(row[self.label_col]).long() # the slide label as a long integer (for classification)
 
         return feats, tile_ids, label
@@ -491,6 +500,7 @@ def kfold_cross_validation(
     use_amp=True,
     amp_dtype=torch.bfloat16,
     compile_model=False,
+    max_tiles=None,
     random_state=42
 ):
     """
@@ -529,6 +539,9 @@ def kfold_cross_validation(
     - use_amp: Use mixed precision training
     - amp_dtype: Autocast dtype for mixed precision
     - compile_model: Whether to compile model with torch.compile
+    - max_tiles: Maximum number of tiles per slide (default: None = no limit). If set, slides with
+                more tiles will have tiles randomly sampled down to this limit. Useful for preventing
+                extremely large bags from skewing the learning.
     - random_state: Random seed for reproducibility (default: 42). Controls fold splitting and 
                    all training randomness for fully reproducible AUC.
     
@@ -581,7 +594,8 @@ def kfold_cross_validation(
             label_col=label_col,
             feature_key=feature_key,
             tile_key=tile_key,
-            zarr_dir=zarr_dir
+            zarr_dir=zarr_dir,
+            max_tiles=max_tiles
         )
         
         internal_val_dataset = ZarrSlideDataset(
@@ -590,7 +604,8 @@ def kfold_cross_validation(
             label_col=label_col,
             feature_key=feature_key,
             tile_key=tile_key,
-            zarr_dir=zarr_dir
+            zarr_dir=zarr_dir,
+            max_tiles=max_tiles
         )
         
         test_dataset = ZarrSlideDataset(
@@ -599,7 +614,8 @@ def kfold_cross_validation(
             label_col=label_col,
             feature_key=feature_key,
             tile_key=tile_key,
-            zarr_dir=zarr_dir
+            zarr_dir=zarr_dir,
+            max_tiles=max_tiles
         )
         
         # Train model on train_subset with early stopping on internal_val
@@ -696,6 +712,7 @@ if __name__ == "__main__":
         n_splits=5,
         n_epochs=100,               # Maximum epochs
         early_stopping_patience=3,  # Stop after 3 epochs with no AUC improvement on internal val
+        max_tiles=5000,             # Limit to 5000 tiles per slide (None = no limit)
         random_state=42             # Fixed seed for reproducibility: use same value to get identical results
     )
     print(f"\nFinal Results: Test AUC = {results['mean_auc']:.4f} +- {results['std_auc']:.4f}")
@@ -711,6 +728,7 @@ if __name__ == "__main__":
     #     n_splits=5,
     #     n_epochs=20,
     #     early_stopping_patience=None,  # Disable early stopping
+    #     max_tiles=None,                # No tile limit
     #     random_state=42                # Fixed seed for reproducibility
     # )
     
@@ -732,15 +750,15 @@ if __name__ == "__main__":
     # )
     # train_dataset = ZarrSlideDataset(
     #     df=train_subset_df, filename_col=filename_col, label_col=label_col,
-    #     feature_key=feature_key, tile_key="tiles_224", zarr_dir=zarr_dir
+    #     feature_key=feature_key, tile_key="tiles_224", zarr_dir=zarr_dir, max_tiles=5000
     # )
     # internal_val_dataset = ZarrSlideDataset(
     #     df=internal_val_df, filename_col=filename_col, label_col=label_col,
-    #     feature_key=feature_key, tile_key="tiles_224", zarr_dir=zarr_dir
+    #     feature_key=feature_key, tile_key="tiles_224", zarr_dir=zarr_dir, max_tiles=5000
     # )
     # test_dataset = ZarrSlideDataset(
     #     df=test_df, filename_col=filename_col, label_col=label_col,
-    #     feature_key=feature_key, tile_key="tiles_224", zarr_dir=zarr_dir
+    #     feature_key=feature_key, tile_key="tiles_224", zarr_dir=zarr_dir, max_tiles=5000
     # )
     # # Train with early stopping on internal_val, evaluate on test_df
     # model, _ = train_ABMIL(train_subset_df, train_dataset, internal_val_dataset, label_col, 
