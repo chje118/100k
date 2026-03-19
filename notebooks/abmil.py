@@ -450,17 +450,27 @@ def auc_score(all_labels, all_probs):
 
 def plot_roc_curve(all_labels, all_probs):
     """
-    Plot ROC curve for multi-class classification.
+    Plot ROC curve for binary classification only.
+    
+    ROC curves are most interpretable for binary classification. For multi-class problems,
+    use macro AUC (computed via auc_score) instead.
     
     Parameters:
-    - all_labels: list of true labels
-    - all_probs: array of predicted probabilities (shape: [n_samples, n_classes])
+    - all_labels: list of true labels (must be binary: 0 and 1)
+    - all_probs: array of predicted probabilities (shape: [n_samples, 2])
     """
     n_classes = all_probs.shape[1]
+    
+    if n_classes != 2:
+        raise ValueError(
+            f"plot_roc_curve only supports binary classification. "
+            f"Found {n_classes} classes. Use auc_score() with macro averaging for multi-class."
+        )
+    
     y_true = np.eye(n_classes)[all_labels]
 
     RocCurveDisplay.from_predictions(y_true, all_probs, average="macro")
-    plt.title("ROC Curve")
+    plt.title("ROC Curve (Binary Classification)")
     plt.show()
 
 # No weights for FM benchmark
