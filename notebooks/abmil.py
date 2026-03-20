@@ -442,7 +442,12 @@ def auc_score(all_labels, all_probs):
     onehot_labels = np.eye(n_classes)[all_labels]
 
     # Compute macro AUC: unweighted mean of one-vs-rest AUC for each class
-    return roc_auc_score(onehot_labels, all_probs, average="macro", multi_class="ovr")
+    try:
+        auc = roc_auc_score(onehot_labels, all_probs, average="macro", multi_class="ovr")
+    except ValueError as e:
+        print(f"Error computing AUC: {e}")
+        auc = np.nan  # Return NaN if AUC cannot be computed (e.g., only one class present)
+    return auc
 
 
 def plot_roc_curve(all_labels, all_probs):
