@@ -5,7 +5,6 @@ from scipy.optimize import linear_sum_assignment
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from upsetplot import from_contents, UpSet
 import seaborn as sns
 
 
@@ -90,7 +89,6 @@ class SpatialAgreement:
             target_col = f"domain_{model}"
             gdf_aligned[target_col] = gdf_aligned[target_col].map(mapping)
 
-        gdf_aligned[ref_col] = gdf_aligned[ref_col]
         return gdf_aligned
 
     def agreement_level(self, gdf_aligned):
@@ -123,7 +121,7 @@ class SpatialAgreement:
         for i, path in enumerate(self.filenames):
             wsi = self.load_slide(path)
             gdf = self.get_shapes(wsi)
-            cont_tables = self.contingency_tabels(gdf)
+            cont_tables = self.contingency_tables(gdf)
             gdf_aligned = self.domain_alignment(gdf, cont_tables)
             gdf_aligned = self.agreement_level(gdf_aligned)
             agreement_dict[i] = gdf_aligned
@@ -160,7 +158,7 @@ class SpatialAgreement:
         out["full_agreement"] = full_rate
         return out
 
-    def plot_agreement_map(self, slide_idx, show=True):
+    def plot_agreement_map(self, slide_idx):
         """
         Plot spatial agreement, with generalized coloring for any number of models:
         - 0 agreeing pairs -> "Disagreement"
@@ -175,9 +173,9 @@ class SpatialAgreement:
         max_pairs = n_models * (n_models - 1) // 2
 
         colors = {
-            "strong": "#1a9850",
+            "strong": "#19b95e",
             "moderate": "#fee08b",
-            "disagreement": "#d73027",
+            "disagreement": "#ed4138",
         }
 
         level = gdf_aligned["agreement_level"]
@@ -188,7 +186,7 @@ class SpatialAgreement:
         plot_df["agreement_class"] = agreement_class
         plot_df["agreement_color"] = plot_df["agreement_class"].map(colors)
 
-        fig, ax = plt.subplots(figsize=(6, 6))
+        fig, ax = plt.subplots(figsize=(5, 5))
 
         plot_df.plot(color=plot_df["agreement_color"], linewidth=0, ax=ax)
 
@@ -196,17 +194,20 @@ class SpatialAgreement:
             mpatches.Patch(color=colors["strong"], label=f"Strong ({max_pairs}/{max_pairs})"),
             mpatches.Patch(color=colors["disagreement"], label=f"Disagreement (0/{max_pairs})"),
         ]
-        if max_pairs > 1:
+        if max_pairs > 2:
+            # Moderate agreement: need at least 2 agreeing pairs
+            if max_pairs == 3:
+                mod_label = f"Moderate ({max_pairs-1}/{max_pairs})"
+            else:
+                mod_label = f"Moderate (2..{max_pairs-1}/{max_pairs})"
             legend_patches.insert(
-                1, mpatches.Patch(color=colors["moderate"], label=f"Moderate (1..{max_pairs-1}/{max_pairs})")
+                1, mpatches.Patch(color=colors["moderate"], label=mod_label)
             )
-        ax.legend(handles=legend_patches, title="Agreement (pairwise)", loc="center left")
+        ax.legend(handles=legend_patches, title="Agreement (pairwise)", loc="upper left", bbox_to_anchor=(1, 1))
         ax.set_title("Spatial Agreement Across Models")
         ax.set_axis_off()
         plt.tight_layout()
-        if show:
-            plt.show()
-        return fig, ax, plot_df
+        plt.show()
 
     def overall_slide_agreement(self):
         """
@@ -217,18 +218,18 @@ class SpatialAgreement:
         rows = []
         # change d, k and v to understable variable names
         for slide_idx in range(len(self.filenames)):
-            d = self.slide_level_agreement(slide_idx)
-            for k, v in d.items():
+            agree_metrics = self.slide_level_agreement(slide_idx)
+            for comp_key, agree_value in agree_metrics.items():
                 rows.append(
                     {
                         "slide_idx": slide_idx,
-                        "comparison": "all_agree" if k == "full_agreement" else k,
-                        "agreement_rate": float(v),
+                        "comparison": "all_agree" if comp_key == "full_agreement" else comp_key,
+                        "agreement_rate": float(agree_value),
                     }
                 )
         return pd.DataFrame(rows)
 
-    def boxplot_slide_agreement(self, show=True, percent=True):
+    def boxplot_slide_agreement(self, percent=True):
         """
         Boxplot of slide-level agreement rates across slides.
         """
@@ -241,18 +242,16 @@ class SpatialAgreement:
         else:
             ylab = "Agreement"
 
-        fig, ax = plt.subplots(figsize=(10, 4))
+        fig, ax = plt.subplots(figsize=(6, 5))
         
         sns.boxplot(data=df, x="comparison", y="agreement_rate")
         ax.set_xlabel("")
         ax.set_ylabel(ylab)
         ax.tick_params(axis="x", rotation=45)
         plt.tight_layout()
-        if show:
-            plt.show()
-        return fig, ax, df
-
-    def stripplot_slide_agreement(self, show=True, percent=True):
+        plt.show()
+        
+    def stripplot_slide_agreement(self, percent=True):
         """
         Stripplot of slide-level agreement rates (one point per slide per comparison).
         """
@@ -264,14 +263,21 @@ class SpatialAgreement:
         else:
             ylab = "Agreement"
 
-        fig, ax = plt.subplots(figsize=(10, 4))
+        fig, ax = plt.subplots(figsize=(6, 5))
         
+        sns.boxplot(
+            data=df,
+            x="comparison",
+            y="agreement_rate",
+            ax=ax,
+            width=0.5,
+        )
         sns.stripplot(
             data=df,
             x="comparison",
             y="agreement_rate",
-            jitter=True,
-            size=3,
+            jitter=False,
+            size=5,
             alpha=0.7,
             ax=ax,
         )
@@ -279,6 +285,4 @@ class SpatialAgreement:
         ax.set_ylabel(ylab)
         ax.tick_params(axis="x", rotation=45)
         plt.tight_layout()
-        if show:
-            plt.show()
-        return fig, ax, df
+        plt.show()
