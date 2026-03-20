@@ -46,7 +46,7 @@ class ZarrSlideDataset(Dataset):
         wsi = open_wsi(slide_path, zarr_path)
         adata = wsi.tables[self.feature_key]
 
-        feats = torch.tensor(adata.X[:]).float() # tile features as a PyTorch tensor
+        feats = torch.from_numpy(adata.X[:]).float() # tile features as a PyTorch tensor
         tile_ids = np.array(adata.obs['tile_id']) # save tile IDs for visualization
         
         # Apply max_tiles limit with deterministic, norm-biased sampling
@@ -231,11 +231,11 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
     model = ABMIL(feat_dim, n_classes).to(device)
 
     # Enable TF32 / high matmul precision on modern GPUs (e.g. H100)
-    if device.startswith("cuda") and torch.cuda.is_available():
+    if device == "cuda":
         _configure_gpu_optimization()
     
     # Compile model for additional speed (PyTorch 2.x+)
-    if hasattr(torch, "compile") and device.startswith("cuda"):
+    if hasattr(torch, "compile") and device == "cuda":
         try:
             model = torch.compile(model)
             print("Model compiled with torch.compile()")
@@ -266,7 +266,7 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
                 continue
 
             # Forward pass with mixed precision on CUDA
-            if device.startswith("cuda") and torch.cuda.is_available():
+            if device == "cuda":
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
                     logits, _ = model(feats)
                     loss = loss_fn(logits.unsqueeze(0), label)
@@ -335,7 +335,7 @@ def validate_ABMIL(model, val_dataset):
                 continue
 
             # Forward pass with mixed precision on CUDA
-            if device.startswith("cuda") and torch.cuda.is_available():
+            if device == "cuda":
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
                     logits, _ = model(feats)
             else:
