@@ -141,8 +141,7 @@ def validate_dataset(dataset):
     - valid_indices: List of valid slide indices
     """
     valid_indices = []
-    
-    for i in range(len(dataset)):
+    for i in tqdm(range(len(dataset)), desc="Validating slides"):
         try:
             _ = dataset[i]
             valid_indices.append(i)
