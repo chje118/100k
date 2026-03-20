@@ -46,7 +46,7 @@ class ZarrSlideDataset(Dataset):
         wsi = open_wsi(slide_path, zarr_path)
         adata = wsi.tables[self.feature_key]
 
-        feats = torch.from_numpy(adata.X[:]).float() # tile features as a PyTorch tensor
+        feats = torch.from_numpy(adata.X).float() # tile features as a PyTorch tensor
         tile_ids = np.array(adata.obs['tile_id']) # save tile IDs for visualization
         
         # Apply max_tiles limit with deterministic, norm-biased sampling
@@ -57,7 +57,7 @@ class ZarrSlideDataset(Dataset):
                 local_rng = np.random.RandomState(idx)
 
             # Slightly bias sampling toward high-information tiles
-            norms = np.linalg.norm(feats.numpy(), axis=1)
+            norms = torch.linalg.norm(feats, dim=1).cpu().numpy()
             probs = norms / norms.sum() if norms.sum() > 0 else None
 
             indices = local_rng.choice(feats.shape[0], self.max_tiles, replace=False, p=probs)
@@ -583,7 +583,7 @@ class KFoldPipeline:
             split_seed = random_state + fold_idx + 1
             train_subset_df, internal_val_df = train_test_split(
                 fold_df,
-                test_size=1/9, 
+                test_size=1/9, # 90% train, 10% internal val
                 stratify=fold_df[self.label_col],
                 random_state=split_seed
             )
