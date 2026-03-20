@@ -185,6 +185,62 @@ def _preprocess_batch(feats, tile_ids, label, device):
     label = label.to(device, non_blocking=True)
     return feats, tile_ids, label
 
+def save_checkpoint(model, config, label_mapping, path):
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "config": config,  # model + dataset config
+        "label_mapping": label_mapping,
+    }
+    torch.save(checkpoint, path)
+    print(f"Saved checkpoint to {path}")
+
+def load_checkpoint(path):
+    """
+    Load a checkpoint with model, config, and label mapping.
+    
+    Parameters:
+    - path: Path to checkpoint file
+    
+    Returns:
+    - model: Loaded ABMIL model
+    - config: Dictionary with model and dataset configuration
+    - label_mapping: Dictionary mapping label strings to class indices
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    checkpoint = torch.load(path, map_location=device)
+
+    config = checkpoint["config"]
+    label_mapping = checkpoint["label_mapping"]
+
+    # Reconstruct model from config
+    model = ABMIL(
+        in_dim=config["in_dim"],
+        n_classes=config["n_classes"],
+        hidden_dim=config["hidden_dim"],
+    ).to(device)
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    print(f"Loaded checkpoint from {path}")
+    print(f"Model config: in_dim={config['in_dim']}, n_classes={config['n_classes']}, hidden_dim={config['hidden_dim']}")
+    print(f"Label mapping: {label_mapping}")
+    
+    return model, config, label_mapping
+
+def create_label_mapping(df, label_col):
+    """
+    Create a mapping from label strings to class indices.
+    
+    Parameters:
+    - df: DataFrame with labels
+    - label_col: Column name for labels
+    
+    Returns:
+    - label_mapping: Dictionary {label: class_index}
+    """
+    return {label: i for i, label in enumerate(sorted(df[label_col].unique()))}
+
 
 # ========= Training and Validation Functions ==========
 
@@ -648,6 +704,22 @@ class KFoldPipeline:
             fold_class_aucs.append(fold_per_class_aucs)
         
             print(f"Fold {fold_idx + 1} - Test AUC: {fold_auc:.4f}, Test Accuracy: {fold_accuracy:.4f}")
+            
+            # Save checkpoint for this fold
+            config = {
+                "in_dim": model.classifier.in_features,
+                "hidden_dim": model.attn[0].out_features,
+                "n_classes": model.classifier.out_features,
+                "feature_key": self.feature_key,
+                "tile_key": self.tile_key,
+                "max_tiles": max_tiles,
+            }
+            label_mapping = create_label_mapping(self.df, self.label_col)
+            
+            checkpoint_dir = "checkpoints/"
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            checkpoint_path = os.path.join(checkpoint_dir, f"fold_{fold_idx + 1}_auc_{fold_auc:.4f}.pt")
+            save_checkpoint(model, config, label_mapping, checkpoint_path)
 
         # Compute mean and std across folds
         mean_auc = np.mean(fold_auc_scores)
