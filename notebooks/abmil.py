@@ -233,15 +233,7 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
     # Enable TF32 / high matmul precision on modern GPUs (e.g. H100)
     if device == "cuda":
         _configure_gpu_optimization()
-    
-    # Compile model for additional speed (PyTorch 2.x+)
-    if hasattr(torch, "compile") and device == "cuda":
-        try:
-            model = torch.compile(model)
-            print("Model compiled with torch.compile()")
-        except Exception as e:
-            print(f"torch.compile failed, continuing without compilation: {e}")
- 
+     
     # Create Optimizer and Loss Function
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     
