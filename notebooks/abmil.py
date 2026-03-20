@@ -9,7 +9,6 @@ Computes macro AUC (one-vs-rest, class-balanced)
 import os
 import torch
 import torch.nn as nn
-import pandas as pd
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from wsidata import open_wsi
@@ -19,111 +18,8 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import re
-import random
 import copy
-
-
-# ========== Helper Functions ==========
-
-def set_seed(seed):
-    """ Set seeds for reproducibility.
-    
-    Parameters:
-    - seed: Random seed value (integer)
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-def _create_dataloader(dataset, batch_size=1, shuffle=False, device=None, worker_init_fn=None):
-    """Create DataLoader with standard configuration."""
-    kwargs = {"batch_size": batch_size, "shuffle": shuffle}
-    if worker_init_fn is not None:
-        kwargs["worker_init_fn"] = worker_init_fn
-    if isinstance(device, str) and device.startswith("cuda"):
-        kwargs["pin_memory"] = True
-    return DataLoader(dataset, **kwargs)
-
-def _configure_gpu_optimization():
-    """Configure GPU for modern CUDA GPUs."""
-    if not torch.cuda.is_available():
-        return
-    try:
-        torch.set_float32_matmul_precision("high")
-    except AttributeError:
-        pass
-    if hasattr(torch.backends.cuda, "matmul"):
-        torch.backends.cuda.matmul.allow_tf32 = True
-    if hasattr(torch.backends.cuda, "cudnn"):
-        torch.backends.cuda.cudnn.allow_tf32 = True
-
-def _preprocess_batch(feats, tile_ids, label, device):
-    """Preprocess batch tensors before forward pass."""
-    if feats.dim() == 3:
-        feats = feats.squeeze(0)
-    if tile_ids.ndim == 2:
-        tile_ids = tile_ids.squeeze(0)
-    feats = feats.to(device, non_blocking=True)
-    label = label.to(device, non_blocking=True)
-    return feats, tile_ids, label
-
-def _should_use_amp(device, use_amp, amp_dtype=torch.float16):
-    """Check if AMP should be enabled."""
-    return (isinstance(device, str) and device.startswith("cuda") and 
-            use_amp and torch.cuda.is_available())
-
-def _extract_model_dims(model):
-    """Extract dimensions from ABMIL model."""
-    return {
-        'in_dim': model.classifier.in_features,
-        'n_classes': model.classifier.out_features,
-        'hidden_dim': model.attn[0].out_features
-    }
-
-def _compute_metrics(all_labels, all_preds, all_probs):
-    """Compute accuracy and AUC metrics."""
-    accuracy = np.mean(np.array(all_labels) == np.array(all_preds))
-    auc = auc_score(all_labels, all_probs)
-    return {
-        'labels': all_labels,
-        'preds': all_preds,
-        'probs': all_probs,
-        'accuracy': accuracy,
-        'auc': auc
-    }
-
-def validate_dataset(dataset, verbose=True):
-    """
-    Filter out invalid slides from dataset.
-    
-    Parameters:
-    - dataset: PyTorch Dataset instance to validate
-    - verbose: If True, print validation progress
-    
-    Returns:
-    - filtered_dataset: torch.utils.data.Subset with only valid slides
-    - valid_indices: List of valid slide indices
-    """
-    valid_indices = []
-    
-    for i in range(len(dataset)):
-        try:
-            _ = dataset[i]
-            valid_indices.append(i)
-        except Exception as e:
-            if verbose:
-                print(f"Invalid slide at index {i}: {type(e).__name__}")
-    
-    filtered_dataset = torch.utils.data.Subset(dataset, valid_indices)
-    if verbose:
-        print(f"Dataset validation complete: {len(valid_indices)}/{len(dataset)} valid slides")
-    
-    return filtered_dataset, valid_indices
+import random
 
 # ========== Dataset and Model Definitions ==========
 
@@ -212,6 +108,368 @@ class ABMIL(nn.Module):
 
         return logits, A
 
+# ========= Helper Functions for Training and Evaluation ==========
+
+def set_seed(seed):
+    """ Set seeds for reproducibility.
+    
+    Parameters:
+    - seed: Random seed value (integer)
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def validate_dataset(dataset):
+    """
+    Filter out invalid slides from dataset.
+    
+    Parameters:
+    - dataset: PyTorch Dataset instance to validate
+    
+    Returns:
+    - filtered_dataset: torch.utils.data.Subset with only valid slides
+    - valid_indices: List of valid slide indices
+    """
+    valid_indices = []
+    
+    for i in range(len(dataset)):
+        try:
+            _ = dataset[i]
+            valid_indices.append(i)
+        except Exception as e:
+            print(f"Invalid slide at index {i}: {type(e).__name__}")
+    
+    filtered_dataset = torch.utils.data.Subset(dataset, valid_indices)
+    print(f"Dataset validation complete: {len(valid_indices)}/{len(dataset)} valid slides")
+    
+    return filtered_dataset, valid_indices
+
+def _create_dataloader(dataset, batch_size=1, shuffle=False, device=None, worker_init_fn=None):
+    """ Create DataLoader with standard configuration. """
+    kwargs = {"batch_size": batch_size, "shuffle": shuffle}
+    if worker_init_fn is not None:
+        kwargs["worker_init_fn"] = worker_init_fn
+    if isinstance(device, str) and device.startswith("cuda"):
+        kwargs["pin_memory"] = True
+    return DataLoader(dataset, **kwargs)
+
+def _configure_gpu_optimization():
+    """Configure GPU for modern CUDA GPUs."""
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.set_float32_matmul_precision("high")
+    except AttributeError:  
+        pass
+    if hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+    if hasattr(torch.backends.cuda, "cudnn"):
+        torch.backends.cuda.cudnn.allow_tf32 = True
+
+def _preprocess_batch(feats, tile_ids, label, device):
+    """ Preprocess batch tensors before forward pass. """
+    if feats.dim() == 3:
+        feats = feats.squeeze(0)
+    if tile_ids.ndim == 2:
+        tile_ids = tile_ids.squeeze(0)
+    feats = feats.to(device, non_blocking=True)
+    label = label.to(device, non_blocking=True)
+    return feats, tile_ids, label
+
+
+# ========= Training and Validation Functions ==========
+
+def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epochs=10, 
+        early_stopping_patience=None, seed=None):
+    """
+    Train ABMIL model with optional early stopping for best AUC comparability.
+    
+    Parameters:
+    - train_df: DataFrame with training data
+    - train_dataset: ZarrSlideDataset instance
+    - val_dataset: Optional ZarrSlideDataset for early stopping.
+    - label_col: Column name for labels (required if using early stopping)
+    - n_epochs: Maximum number of training epochs
+    - early_stopping_patience: Number of epochs with no improvement to wait before stopping.
+    - seed: Random seed for reproducibility. If None, uses current random state.
+    
+    Returns:
+    - model: Trained ABMIL model
+    - best_model_state: Best model state dict (for restoring best model when using early stopping)
+    """
+    if seed is not None:
+        set_seed(seed)
+    
+    # Device setup
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # DataLoader: handles shuffling and batching
+    train_loader = _create_dataloader(
+        train_dataset, 
+        batch_size=1, 
+        shuffle=True,
+        device=device,
+        worker_init_fn = lambda worker_id: set_seed(seed + worker_id) if seed is not None else None
+    )
+
+    # Extract Feature Dimension and Number of Classes
+    sample_feats, _, _ = train_dataset[0]
+    feat_dim = sample_feats.shape[1]
+    n_classes = train_df[label_col].nunique()
+
+    # Create the ABMIL Model
+    model = ABMIL(feat_dim, n_classes).to(device)
+
+    # Enable TF32 / high matmul precision on modern GPUs (e.g. H100)
+    if device.startswith("cuda") and torch.cuda.is_available():
+        _configure_gpu_optimization()
+    
+    # Compile model for additional speed (PyTorch 2.x+)
+    if hasattr(torch, "compile") and device.startswith("cuda"):
+        try:
+            model = torch.compile(model)
+            print("Model compiled with torch.compile()")
+        except Exception as e:
+            print(f"torch.compile failed, continuing without compilation: {e}")
+ 
+    # Create Optimizer and Loss Function
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    
+    # Loss function: CrossEntropyLoss for multi-class classification
+    loss_fn = torch.nn.CrossEntropyLoss()
+
+    # Early stopping setup
+    best_auc = -1.0
+    epochs_no_improve = 0
+    best_model_state = None
+    
+    # Training Loop
+    for epoch in tqdm(range(n_epochs), desc="Epochs"):
+        model.train()
+        total_loss = 0.0
+
+        # Loop over slides
+        for feats, tile_ids, label in tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs}", leave=False):
+            feats, tile_ids, label = _preprocess_batch(feats, tile_ids, label, device)
+        
+            if feats.shape[0] == 0:
+                continue
+
+            # Forward pass with mixed precision on CUDA
+            if device.startswith("cuda") and torch.cuda.is_available():
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    logits, _ = model(feats)
+                    loss = loss_fn(logits.unsqueeze(0), label)
+            else:
+                logits, _ = model(feats)
+                loss = loss_fn(logits.unsqueeze(0), label)
+
+            # Clear gradients
+            optimizer.zero_grad()
+            
+            # Backpropagation
+            loss.backward()
+
+            # Update weights
+            optimizer.step()
+
+            # Accumulate loss
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch+1}/{n_epochs} | Loss: {total_loss:.4f}", end="")
+        
+        # Early stopping: evaluate on validation set if provided
+        if val_dataset is not None and early_stopping_patience is not None:
+            all_labels, _, all_probs = validate_ABMIL(model=model, val_dataset=val_dataset)
+            val_auc = auc_score(all_labels, all_probs)
+            print(f" | Val AUC: {val_auc:.4f}", end="")
+            
+            # Check if validation AUC improved
+            if val_auc > best_auc:
+                best_auc = val_auc
+                epochs_no_improve = 0
+                # Use deep copy to avoid shallow copy issues where tensors may drift during training
+                best_model_state = copy.deepcopy(model.state_dict())
+                print(" (improved)", end="")
+            else:
+                epochs_no_improve += 1
+                print(f" (no improve: {epochs_no_improve}/{early_stopping_patience})", end="")
+            
+            # Early stopping
+            if epochs_no_improve >= early_stopping_patience:
+                print(f"\nEarly stopping at epoch {epoch+1}")
+                model.load_state_dict(best_model_state)
+                break
+        
+        print()
+
+    return model, best_model_state
+
+def validate_ABMIL(model, val_dataset):
+    device = next(model.parameters()).device
+    
+    # Validation DataLoader
+    val_loader = _create_dataloader(val_dataset, batch_size=1, shuffle=False, device=device)
+
+    model.eval() # Evaluation mode (disables dropout, batch norm updates)
+
+    all_labels = []
+    all_preds = []
+    all_probs = []
+
+    with torch.no_grad():
+        for feats, tile_ids, label in tqdm(val_loader, desc="Validation", leave=False):
+            feats, tile_ids, label = _preprocess_batch(feats, tile_ids, label, device)
+
+            if feats.shape[0] == 0:
+                continue
+
+            # Forward pass with mixed precision on CUDA
+            if device.startswith("cuda") and torch.cuda.is_available():
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    logits, _ = model(feats)
+            else:
+                logits, _ = model(feats)
+    
+            # Compute predicted class and probabilities
+            probs = torch.softmax(logits.float(), dim=0).cpu().numpy()
+            pred = torch.argmax(logits, dim=0).item()
+            
+            all_labels.append(label.item())
+            all_preds.append(pred)
+            all_probs.append(probs)
+
+    all_probs = np.array(all_probs)
+    
+    return all_labels, all_preds, all_probs
+
+
+# ======== Model Saving and Loading ==========
+
+def save_model(model, model_name):
+    """
+    Save the trained ABMIL model to disk with auto-generated filename including model parameters.
+    
+    Parameters:
+    - model (ABMIL): Trained ABMIL model
+    - model_name (str): Base name for the model (e.g., 'abmil_placenta')
+    """
+    'in_dim' = model.classifier.in_features,
+    'n_classes' = model.classifier.out_features,
+    'hidden_dim'= model.attn[0].out_features
+
+    filename = f"{model_name}_{'in_dim'}_{'n_classes'}_{'hidden_dim'}.pth"
+    save_path = os.path.join("models/", filename)
+    os.makedirs("models/", exist_ok=True)
+    torch.save(model.state_dict(), save_path)
+    print(f"Model saved to {save_path}")
+
+def _parse_model_dimensions(model_path):
+    """ Parse dimensions from model filename: `..._<in_dim>_<n_classes>_<hidden_dim>.pth`. """
+    base = os.path.basename(model_path)
+    parsed = re.search(r"_(\d+)_(\d+)_(\d+)\.pth$", base)
+    if not parsed:
+        raise ValueError(
+            f"Could not parse dimensions from model filename '{base}'. "
+            "Expected suffix like '_<in_dim>_<n_classes>_<hidden_dim>.pth'."
+        )
+    return int(parsed.group(1)), int(parsed.group(2)), int(parsed.group(3))
+
+def load_model(model_path):
+    """
+    Load a trained ABMIL model. 
+    Expects filename in format: `..._<in_dim>_<n_classes>_<hidden_dim>.pth`.
+    """
+    in_dim, n_classes, hidden_dim = _parse_model_dimensions(model_path)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Loading model from {model_path} on device: {device}")
+
+    # Initialize model and load state dict
+    model = ABMIL(in_dim, n_classes, hidden_dim).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()  # Set to evaluation mode
+    print(f"Model successfully loaded")
+    return model, {"in_dim": in_dim, "n_classes": n_classes, "hidden_dim": hidden_dim}
+
+
+# ========= Evaluation Methods ==========
+
+def confusion_matrix_report(all_labels, all_preds):
+    """
+    Generate a confusion matrix report.
+ 
+    Parameters:
+    - all_labels: list of true labels
+    - all_preds: list of predicted labels
+    """
+    cm = confusion_matrix(all_labels, all_preds)
+    print(classification_report(all_labels, all_preds))
+
+    plt.figure(figsize=(6,5))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.show()
+
+
+def auc_score(all_labels, all_probs):
+    """
+    Compute macro AUC score for multi-class classification (pathology benchmark).
+    
+    For the pathology benchmark, macro AUC is computed as the unweighted mean of 
+    one-vs-rest AUC scores across all classes. This metric is class-balanced and 
+    appropriate for multi-class problems where all classes are equally important.
+    
+    Formula: macro AUC = mean(AUC_class_i for i in 1..n_classes)
+    where each AUC_class_i is computed using the one-vs-rest approach.
+    
+    Parameters:
+    - all_labels: list of true labels (class indices)
+    - all_probs: array of predicted probabilities (shape: [n_samples, n_classes])
+    
+    Returns:
+    - macro AUC score (float, range [0, 1])
+    """
+    # Convert true labels to one-hot encoding for multi-class AUC computation
+    n_classes = all_probs.shape[1]
+    onehot_labels = np.eye(n_classes)[all_labels]
+
+    # Compute macro AUC: unweighted mean of one-vs-rest AUC for each class
+    return roc_auc_score(onehot_labels, all_probs, average="macro", multi_class="ovr")
+
+
+def plot_roc_curve(all_labels, all_probs):
+    """
+    Plot ROC curve for binary classification only.
+    
+    ROC curves are most interpretable for binary classification. For multi-class problems,
+    use macro AUC (computed via auc_score) instead.
+    
+    Parameters:
+    - all_labels: list of true labels (must be binary: 0 and 1)
+    - all_probs: array of predicted probabilities (shape: [n_samples, 2])
+    """
+    n_classes = all_probs.shape[1]
+    
+    if n_classes != 2:
+        raise ValueError(
+            f"plot_roc_curve only supports binary classification. "
+            f"Found {n_classes} classes. Use auc_score() with macro averaging for multi-class."
+        )
+    
+    onehot_labels = np.eye(n_classes)[all_labels]
+
+    RocCurveDisplay.from_predictions(onehot_labels, all_probs, average="macro")
+    plt.title("ROC Curve (Binary Classification)")
+    plt.show()
+
 
 # ========== Training and Evaluation Pipelines ==========
 
@@ -221,7 +479,7 @@ class KFoldPipeline:
     
     Usage:
         pipeline = KFoldPipeline(df, 'path_col', 'label_col', 'features_key', 'tiles_key', 'zarr_dir')
-        results = pipeline.run(n_splits=5, n_epochs=100)
+        results = pipeline.kfold_cross_validation(n_splits=5, n_epochs=100, max_tiles=5000)
         pipeline.print_results()
         pipeline.plot_fold_distribution()
     """
@@ -243,15 +501,14 @@ class KFoldPipeline:
         self.tile_key = tile_key
         self.zarr_dir = zarr_dir
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"KFoldPipeline initialized on device: {self.device}")
         self.validate_slides()
         self.results = None
-        print(f"KFoldPipeline initialized on device: {self.device}")
     
     def validate_slides(self):
-        """
-        Filter out invalid slides (those that cause errors during loading).
-        """
-        print(f"\nValidating {len(self.df)} slides...")
+        """ Filter out invalid slides causing errors during loading. """
+        len_before = len(self.df)
+        print(f"\nValidating {len_before} slides...")
         
         temp_dataset = ZarrSlideDataset(
             df=self.df,
@@ -264,14 +521,13 @@ class KFoldPipeline:
         
         filtered_dataset, valid_indices = validate_dataset(temp_dataset, verbose=True)
         self.df = self.df.iloc[valid_indices].reset_index(drop=True)
-        print(f"Validation complete: {len(self.df)} valid slides")
+        print(f"Validation complete: {len(self.df)} valid slides (removed {len_before - len(self.df)})")
         
         return self.df
     
     def kfold_cross_validation(self, n_splits=5, n_epochs=10, early_stopping_patience=5, max_tiles=None, 
-            random_state=42, use_amp=True, compile_model=False):
-        """
-        Run k-fold cross-validation.
+            random_state=42):
+        """ Run k-fold cross-validation.
         
         Parameters:
         - n_splits: Number of folds
@@ -303,14 +559,13 @@ class KFoldPipeline:
             fold_df = self.df.iloc[train_idx].reset_index(drop=True)
             test_df = self.df.iloc[test_idx].reset_index(drop=True)
         
-            # Further split train into 90% train_subset + 10% internal_val
-            # Use fold-specific seed for this split
+            # Further split train into 90% train_subset + 10% internal_val (use fold-specific seed)
             split_seed = random_state + fold_idx + 1
             train_subset_df, internal_val_df = train_test_split(
                 fold_df,
                 test_size=1/9, 
                 stratify=fold_df[self.label_col],
-            random_state=split_seed
+                random_state=split_seed
             )
         
             print(f"Train subset: {len(train_subset_df)} samples")
@@ -365,7 +620,8 @@ class KFoldPipeline:
                 early_stopping_patience=early_stopping_patience,
                 seed=fold_seed
             )
-        
+
+            # Validate on test set for final evaluation of this fold
             all_labels, all_preds, all_probs = validate_ABMIL(
                 model=model,
                 val_dataset=test_dataset,
@@ -401,7 +657,7 @@ class KFoldPipeline:
     def print_results(self):
         """ Print cross-validation results summary."""
         if self.results is None:
-            print("No results available. Run the pipeline first with .run_kfold_cross_validation()")
+            print("No results available. Run the pipeline first with .kfold_cross_validation()")
             return
         
         print(f"\n{'='*60}")
@@ -415,7 +671,7 @@ class KFoldPipeline:
     def plot_fold_distribution(self):
         """Plot fold AUC and accuracy distribution."""
         if self.results is None:
-            print("No results available. Run the pipeline first with .run_kfold_cross_validation()")
+            print("No results available. Run the pipeline first with .kfold_cross_validation()")
             return
         
         fig, axes = plt.subplots(1, 2, figsize=(12, 4))
@@ -440,306 +696,4 @@ class KFoldPipeline:
         
         plt.tight_layout()
         plt.show()
-
-
-def train_ABMIL(
-    train_df,
-    train_dataset,
-    val_dataset=None,
-    label_col=None,
-    n_epochs=10,
-    early_stopping_patience=None,
-    seed=None,
-    use_amp=False,
-    compile_model=False
-):
-    """
-    Train ABMIL model with optional early stopping for best AUC comparability.
-    
-    Parameters:
-    - train_df: DataFrame with training data
-    - train_dataset: ZarrSlideDataset instance
-    - val_dataset: Optional ZarrSlideDataset for early stopping.
-    - label_col: Column name for labels (required if using early stopping)
-    - n_epochs: Maximum number of training epochs
-    - early_stopping_patience: Number of epochs with no improvement to wait before stopping.
-    - seed: Random seed for reproducibility. If None, uses current random state.
-    - use_amp: Enable automatic mixed precision (AMP) for faster training on CUDA
-    - compile_model: Compile model with torch.compile() for additional speed (PyTorch 2.x+)
-    
-    Returns:
-    - model: Trained ABMIL model
-    - best_model_state: Best model state dict (for restoring best model when using early stopping)
-    """
-    if seed is not None:
-        set_seed(seed)
-    
-    amp_dtype = torch.float16
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    # DataLoader: decides when items are loaded, handles shuffling and batching
-    # Use worker_init_fn to ensure reproducibility with multiple workers
-    def worker_init_fn(worker_id):
-        if seed is not None:
-            set_seed(seed + worker_id)
-    
-    train_loader = _create_dataloader(
-        train_dataset, 
-        batch_size=1, 
-        shuffle=True,
-        device=device,
-        worker_init_fn=worker_init_fn if seed is not None else None
-    )
-
-    # Extract Feature Dimension and Number of Classes
-    sample_feats, _, _ = train_dataset[0]
-    feat_dim = sample_feats.shape[1]
-    n_classes = train_df[label_col].nunique()
-
-    # Create the ABMIL Model
-    model = ABMIL(feat_dim, n_classes).to(device)
-
-    # Enable TF32 / high matmul precision on modern GPUs (e.g. H100)
-    _configure_gpu_optimization()
-    
-    # Compile model for additional speed (PyTorch 2.x+)
-    if compile_model and hasattr(torch, "compile") and device.startswith("cuda"):
-        try:
-            model = torch.compile(model)
-            print("Model compiled with torch.compile()")
-        except Exception as e:
-            print(f"torch.compile failed, continuing without compilation: {e}")
-
-    # Create Optimizer and Loss Function
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    
-    # Loss function: CrossEntropyLoss for multi-class classification
-    loss_fn = torch.nn.CrossEntropyLoss()
-
-    # Early stopping setup
-    best_auc = -1.0
-    epochs_no_improve = 0
-    best_model_state = None
-    
-    # Training Loop
-    for epoch in tqdm(range(n_epochs), desc="Epochs"):
-        model.train()
-        total_loss = 0.0
-
-        # Loop over slides
-        for feats, tile_ids, label in tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs}", leave=False):
-            feats, tile_ids, label = _preprocess_batch(feats, tile_ids, label, device)
-        
-            if feats.shape[0] == 0:
-                continue
-
-            # Forward pass
-            if _should_use_amp(device, use_amp):
-                with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                    logits, _ = model(feats)
-                    loss = loss_fn(logits.unsqueeze(0), label)
-            else:
-                logits, _ = model(feats)
-                loss = loss_fn(logits.unsqueeze(0), label)
-
-            # Clear gradients
-            optimizer.zero_grad()
-            
-            # Backpropagation
-            loss.backward()
-
-            # Update weights
-            optimizer.step()
-
-            # Accumulate loss
-            total_loss += loss.item()
-
-        print(f"Epoch {epoch+1}/{n_epochs} | Loss: {total_loss:.4f}", end="")
-        
-        # Early stopping: evaluate on validation set if provided
-        if val_dataset is not None and early_stopping_patience is not None:
-            all_labels, all_preds, all_probs = validate_ABMIL(
-                model=model,
-                val_dataset=val_dataset,
-                )
-            val_auc = auc_score(all_labels, all_probs)
-            print(f" | Val AUC: {val_auc:.4f}", end="")
-            
-            # Check if validation AUC improved
-            if val_auc > best_auc:
-                best_auc = val_auc
-                epochs_no_improve = 0
-                # Use deep copy to avoid shallow copy issues where tensors may drift during training
-                best_model_state = copy.deepcopy(model.state_dict())
-                print(" (improved)", end="")
-            else:
-                epochs_no_improve += 1
-                print(f" (no improve: {epochs_no_improve}/{early_stopping_patience})", end="")
-            
-            # Early stopping
-            if epochs_no_improve >= early_stopping_patience:
-                print(f"\nEarly stopping at epoch {epoch+1}")
-                model.load_state_dict(best_model_state)
-                break
-        
-        print()
-
-    return model, best_model_state
-
-
-def validate_ABMIL(
-    model,
-    val_dataset,
-    use_amp=False,
-    verbose=True
-):
-    device = next(model.parameters()).device
-    amp_dtype = torch.float16
-
-    # Validation DataLoader
-    val_loader = _create_dataloader(val_dataset, batch_size=1, shuffle=False, device=device)
-
-    # Set model to evaluation mode (disables dropout, batch norm updates)
-    model.eval()
-
-    all_labels = []
-    all_preds = []
-    all_probs = []
-
-    with torch.no_grad():
-        for feats, tile_ids, label in tqdm(val_loader, desc="Validation", leave=False, disable=not verbose):
-            feats, tile_ids, label = _preprocess_batch(feats, tile_ids, label, device)
-
-            if feats.shape[0] == 0:
-                continue
-
-            # Forward pass (optionally with mixed precision on CUDA)
-            if _should_use_amp(device, use_amp, amp_dtype):
-                with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                    logits, _ = model(feats)
-            else:
-                logits, _ = model(feats)
-
-            # Compute predicted class and probabilities
-            probs = torch.softmax(logits.float(), dim=0).cpu().numpy()
-            pred = torch.argmax(logits, dim=0).item()
-            
-            all_labels.append(label.item())
-            all_preds.append(pred)
-            all_probs.append(probs)
-
-    all_probs = np.array(all_probs)
-    accuracy = np.mean(np.array(all_labels) == np.array(all_preds))
-    
-    return all_labels, all_preds, all_probs
-
-def confusion_matrix_report(all_labels, all_preds):
-    """
-    Generate a confusion matrix report.
-    Parameters:
-    - all_labels: list of true labels
-    - all_preds: list of predicted labels
-    """
-    cm = confusion_matrix(all_labels, all_preds)
-    print(classification_report(all_labels, all_preds))
-
-    plt.figure(figsize=(6,5))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-    plt.xlabel("Predicted")
-    plt.ylabel("True")
-    plt.show()
-
-def save_model(model, model_name):
-    """
-    Save the trained ABMIL model to disk with auto-generated filename including model parameters.
-    
-    Parameters:
-    - model (ABMIL): Trained ABMIL model
-    - model_name (str): Base name for the model (e.g., 'abmil_placenta')
-    """
-    dims = _extract_model_dims(model)
-    filename = f"{model_name}_{dims['in_dim']}_{dims['n_classes']}_{dims['hidden_dim']}.pth"
-    save_path = os.path.join("models/", filename)
-    
-    os.makedirs("models/", exist_ok=True)
-    torch.save(model.state_dict(), save_path)
-    print(f"Model saved to {save_path}")
-
-def _parse_model_dimensions(model_path):
-    """ Parse dimensions from model filename: `..._<in_dim>_<n_classes>_<hidden_dim>.pth`. """
-    base = os.path.basename(model_path)
-    parsed = re.search(r"_(\d+)_(\d+)_(\d+)\.pth$", base)
-    if not parsed:
-        raise ValueError(
-            f"Could not parse dims from model filename '{base}'. "
-            "Expected suffix like '_<in_dim>_<n_classes>_<hidden_dim>.pth'."
-        )
-    return int(parsed.group(1)), int(parsed.group(2)), int(parsed.group(3))
-
-def load_model(model_path):
-    """
-    Load a trained ABMIL model. 
-    Expects filename in format: `..._<in_dim>_<n_classes>_<hidden_dim>.pth`.
-    """
-    in_dim, n_classes, hidden_dim = _parse_model_dimensions(model_path)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Loading model from {model_path} on device: {device}")
-
-    # Initialize model and load state dict
-    model = ABMIL(in_dim, n_classes, hidden_dim).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.eval()  # Set to evaluation mode
-    print(f"Model successfully loaded")
-    return model, {"in_dim": in_dim, "n_classes": n_classes, "hidden_dim": hidden_dim}
-
-def auc_score(all_labels, all_probs):
-    """
-    Compute macro AUC score for multi-class classification (pathology benchmark).
-    
-    For the pathology benchmark, macro AUC is computed as the unweighted mean of 
-    one-vs-rest AUC scores across all classes. This metric is class-balanced and 
-    appropriate for multi-class problems where all classes are equally important.
-    
-    Formula: macro AUC = mean(AUC_class_i for i in 1..n_classes)
-    where each AUC_class_i is computed using the one-vs-rest approach.
-    
-    Parameters:
-    - all_labels: list of true labels (class indices)
-    - all_probs: array of predicted probabilities (shape: [n_samples, n_classes])
-    
-    Returns:
-    - macro AUC score (float, range [0, 1])
-    """
-    # Convert true labels to one-hot encoding for multi-class AUC computation
-    n_classes = all_probs.shape[1]
-    y_true = np.eye(n_classes)[all_labels]
-
-    # Compute macro AUC: unweighted mean of one-vs-rest AUC for each class
-    return roc_auc_score(y_true, all_probs, average="macro", multi_class="ovr")
-
-def plot_roc_curve(all_labels, all_probs):
-    """
-    Plot ROC curve for binary classification only.
-    
-    ROC curves are most interpretable for binary classification. For multi-class problems,
-    use macro AUC (computed via auc_score) instead.
-    
-    Parameters:
-    - all_labels: list of true labels (must be binary: 0 and 1)
-    - all_probs: array of predicted probabilities (shape: [n_samples, 2])
-    """
-    n_classes = all_probs.shape[1]
-    
-    if n_classes != 2:
-        raise ValueError(
-            f"plot_roc_curve only supports binary classification. "
-            f"Found {n_classes} classes. Use auc_score() with macro averaging for multi-class."
-        )
-    
-    y_true = np.eye(n_classes)[all_labels]
-
-    RocCurveDisplay.from_predictions(y_true, all_probs, average="macro")
-    plt.title("ROC Curve (Binary Classification)")
-    plt.show()
 
