@@ -453,6 +453,16 @@ def auc_score(all_labels, all_probs):
         auc = np.nan  # Return NaN if AUC cannot be computed (e.g., only one class present)
     return auc
 
+def per_class_auc(all_labels, all_probs):
+    n_classes = all_probs.shape[1]
+    onehot_labels = np.eye(n_classes)[all_labels]
+    
+    try:
+        aucs = roc_auc_score(onehot_labels, all_probs, average=None, multi_class="ovr")
+    except ValueError:
+        aucs = [np.nan] * n_classes
+    
+    return aucs
 
 def plot_roc_curve(all_labels, all_probs):
     """
@@ -555,6 +565,7 @@ class KFoldPipeline:
     
         fold_auc_scores = []
         fold_accuracies = []
+        fold_class_aucs = []
     
         print(f"Starting {n_splits}-fold cross-validation with early stopping (patience={early_stopping_patience})...")
         print(f"Data leakage prevention: Train (80%) (90% Training | 10% Internal Val → Early stopping) | Test (20%) → Final evaluation")
@@ -639,9 +650,11 @@ class KFoldPipeline:
             # Compute AUC and accuracy for this fold
             fold_auc = auc_score(all_labels, all_probs)
             fold_accuracy = np.mean(np.array(all_labels) == np.array(all_preds))
+            fold_per_class_aucs = per_class_auc(all_labels, all_probs)
         
             fold_auc_scores.append(fold_auc)
             fold_accuracies.append(fold_accuracy)
+            fold_class_aucs.append(fold_per_class_aucs)
         
             print(f"Fold {fold_idx + 1} - Test AUC: {fold_auc:.4f}, Test Accuracy: {fold_accuracy:.4f}")
 
@@ -650,6 +663,9 @@ class KFoldPipeline:
         std_auc = np.std(fold_auc_scores)
         mean_accuracy = np.mean(fold_accuracies)
         std_accuracy = np.std(fold_accuracies)
+        class_aucs = np.array(fold_class_aucs, dtype=float)
+        mean_per_class_auc = np.nanmean(class_aucs, axis=0)
+        std_per_class_auc = np.nanstd(class_aucs, axis=0)
     
         results_dict = {
             'fold_auc_scores': fold_auc_scores,
@@ -658,6 +674,9 @@ class KFoldPipeline:
             'fold_accuracies': fold_accuracies,
             'mean_accuracy': mean_accuracy,
             'std_accuracy': std_accuracy,
+            'fold_per_class_aucs': fold_per_class_aucs,
+            'mean_per_class_auc': mean_per_class_auc.tolist(),
+            'std_per_class_auc': std_per_class_auc.tolist(),
             'n_splits': n_splits
         }    
         self.results = results_dict
@@ -676,6 +695,11 @@ class KFoldPipeline:
         print(f"Mean Accuracy: {self.results['mean_accuracy']:.4f} ± {self.results['std_accuracy']:.4f}")
         print(f"\nPer-fold AUC: {[f'{auc:.4f}' for auc in self.results['fold_auc_scores']]}")
         print(f"Per-fold Accuracy: {[f'{acc:.4f}' for acc in self.results['fold_accuracies']]}")
+        print("Per-class AUC (mean ± std):")
+        for class_idx, (mean_auc, std_auc) in enumerate(
+            zip(self.results['mean_per_class_auc'], self.results['std_per_class_auc'])
+        ):
+            print(f"  Class {class_idx}: {mean_auc:.4f} ± {std_auc:.4f}")
     
     def plot_fold_distribution(self):
         """Plot fold AUC and accuracy distribution."""
