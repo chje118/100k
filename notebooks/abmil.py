@@ -100,7 +100,7 @@ class ABMIL(nn.Module):
         # Normalize with softmax (sums to 1)
         A = torch.softmax(A, dim=0)
 
-        # Weighted sum of features (MIL posoling)
+        # Weighted sum of features (MIL pooling)
         M = torch.sum(A * x, dim=0)
 
         # Multiclass predictions
@@ -360,11 +360,11 @@ def save_model(model, model_name):
     - model (ABMIL): Trained ABMIL model
     - model_name (str): Base name for the model (e.g., 'abmil_placenta')
     """
-    'in_dim' = model.classifier.in_features,
-    'n_classes' = model.classifier.out_features,
-    'hidden_dim'= model.attn[0].out_features
+    in_dim = model.classifier.in_features
+    n_classes = model.classifier.out_features
+    hidden_dim = model.attn[0].out_features
 
-    filename = f"{model_name}_{'in_dim'}_{'n_classes'}_{'hidden_dim'}.pth"
+    filename = f"{model_name}_{in_dim}_{n_classes}_{hidden_dim}.pth"
     save_path = os.path.join("models/", filename)
     os.makedirs("models/", exist_ok=True)
     torch.save(model.state_dict(), save_path)
@@ -519,7 +519,7 @@ class KFoldPipeline:
             zarr_dir=self.zarr_dir
         )
         
-        filtered_dataset, valid_indices = validate_dataset(temp_dataset, verbose=True)
+        filtered_dataset, valid_indices = validate_dataset(temp_dataset)
         self.df = self.df.iloc[valid_indices].reset_index(drop=True)
         print(f"Validation complete: {len(self.df)} valid slides (removed {len_before - len(self.df)})")
         
