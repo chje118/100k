@@ -49,16 +49,20 @@ class ZarrSlideDataset(Dataset):
         feats = torch.tensor(adata.X[:]).float() # tile features as a PyTorch tensor
         tile_ids = np.array(adata.obs['tile_id']) # save tile IDs for visualization
         
-        # Apply max_tiles limit if specified with deterministic sampling
+        # Apply max_tiles limit with deterministic, norm-biased sampling
         if self.max_tiles is not None and feats.shape[0] > self.max_tiles:
             if self.seed is not None:
                 local_rng = np.random.RandomState(self.seed + idx)
             else:
                 local_rng = np.random.RandomState(idx)
-            
-            indices = local_rng.choice(feats.shape[0], self.max_tiles, replace=False)
+
+            # Slightly bias sampling toward high-information tiles
+            norms = np.linalg.norm(feats.numpy(), axis=1)
+            probs = norms / norms.sum() if norms.sum() > 0 else None
+
+            indices = local_rng.choice(feats.shape[0], self.max_tiles, replace=False, p=probs)
             feats = feats[indices]
-            tile_ids = tile_ids[indices]
+            tile_ids = tile_ids[indices] 
         
         label = torch.tensor(row[self.label_col]).long() # slide label as a long integer (for classification)
 
