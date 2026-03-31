@@ -208,7 +208,7 @@ def load_checkpoint(path):
     - label_mapping: Dictionary mapping label strings to class indices
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
 
     config = checkpoint["config"]
     label_mapping = checkpoint["label_mapping"]
@@ -569,7 +569,6 @@ class KFoldPipeline:
         self.zarr_dir = zarr_dir
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"KFoldPipeline initialized on device: {self.device}")
-        self.validate_slides()
         self.results = None
     
     def validate_slides(self):
