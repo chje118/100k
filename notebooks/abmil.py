@@ -18,6 +18,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import re
+import glob
 import copy
 import random
 
@@ -207,7 +208,7 @@ def load_checkpoint(path):
     - label_mapping: Dictionary mapping label strings to class indices
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
 
     config = checkpoint["config"]
     label_mapping = checkpoint["label_mapping"]
@@ -568,7 +569,6 @@ class KFoldPipeline:
         self.zarr_dir = zarr_dir
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"KFoldPipeline initialized on device: {self.device}")
-        self.validate_slides()
         self.results = None
     
     def validate_slides(self):
@@ -592,7 +592,7 @@ class KFoldPipeline:
         return self.df
     
     def kfold_cross_validation(self, n_splits=5, n_epochs=10, early_stopping_patience=5, max_tiles=None, 
-            random_state=42):
+            random_state=42, resume_from_checkpoints=False, checkpoint_dir="checkpoints/"):
         """ Run k-fold cross-validation.
         
         Parameters:
@@ -601,6 +601,8 @@ class KFoldPipeline:
         - early_stopping_patience: Patience for early stopping
         - max_tiles: Maximum tiles per slide (None = no limit)
         - random_state: Random seed for reproducibility
+        - resume_from_checkpoints: If True, detect completed folds from checkpoint files and continue from next fold
+        - checkpoint_dir: Directory containing fold checkpoints (fold_{n}_auc_*.pt)
         
         Returns:
         - Dictionary with cross-validation results
@@ -616,10 +618,34 @@ class KFoldPipeline:
     
         print(f"Starting {n_splits}-fold cross-validation with early stopping (patience={early_stopping_patience})...")
         print(f"Data leakage prevention: Train (80%) (90% Training | 10% Internal Val → Early stopping) | Test (20%) → Final evaluation")
+
+        start_fold = 1
+        checkpoint_by_fold = {}
+        if resume_from_checkpoints:
+            pattern = os.path.join(checkpoint_dir, "fold_*_auc_*.pt")
+            checkpoint_files = glob.glob(pattern)
+            fold_regex = re.compile(r"fold_(\d+)_auc_.*\.pt$")
+
+            for checkpoint_file in checkpoint_files:
+                checkpoint_name = os.path.basename(checkpoint_file)
+                match = fold_regex.match(checkpoint_name)
+                if not match:
+                    continue
+                fold_num = int(match.group(1))
+                prev_path = checkpoint_by_fold.get(fold_num)
+                if prev_path is None or os.path.getmtime(checkpoint_file) > os.path.getmtime(prev_path):
+                    checkpoint_by_fold[fold_num] = checkpoint_file
+
+            while start_fold in checkpoint_by_fold and start_fold <= n_splits:
+                start_fold += 1
+
+            print(f"Resume mode enabled. Found checkpoints for folds: {sorted(checkpoint_by_fold.keys())}")
+            print(f"Will train from fold {start_fold}/{n_splits}")
     
         for fold_idx, (train_idx, test_idx) in enumerate(skf.split(self.df, self.df[self.label_col])):
+            fold_num = fold_idx + 1
             print(f"\n{'='*60}")
-            print(f"Fold {fold_idx + 1}/{n_splits}")
+            print(f"Fold {fold_num}/{n_splits}")
             print(f"{'='*60}")
         
             # Split fold into 80% train + 20% test
@@ -627,7 +653,7 @@ class KFoldPipeline:
             test_df = self.df.iloc[test_idx].reset_index(drop=True)
         
             # Further split train into 90% train_subset + 10% internal_val (use fold-specific seed)
-            split_seed = random_state + fold_idx + 1
+            split_seed = random_state + fold_num
             train_subset_df, internal_val_df = train_test_split(
                 fold_df,
                 test_size=1/9, # 90% train, 10% internal val
@@ -640,7 +666,7 @@ class KFoldPipeline:
             print(f"Test set: {len(test_df)} samples")
             
             # Use fold-specific seed for deterministic tile sampling
-            fold_seed = random_state + fold_idx + 1
+            fold_seed = random_state + fold_num
         
             # Create datasets with deterministic tile sampling
             train_dataset = ZarrSlideDataset(
@@ -675,6 +701,31 @@ class KFoldPipeline:
                 max_tiles=max_tiles,
                 seed=fold_seed
             )
+
+            if resume_from_checkpoints and fold_num < start_fold:
+                checkpoint_path = checkpoint_by_fold.get(fold_num)
+                if checkpoint_path is None:
+                    raise FileNotFoundError(
+                        f"Missing checkpoint for fold {fold_num} in {checkpoint_dir}."
+                    )
+                print(f"Using existing checkpoint for fold {fold_num}: {checkpoint_path}")
+                model, _, _ = load_checkpoint(checkpoint_path)
+
+                all_labels, all_preds, all_probs = validate_ABMIL(
+                    model=model,
+                    val_dataset=test_dataset,
+                )
+
+                fold_auc = auc_score(all_labels, all_probs)
+                fold_accuracy = np.mean(np.array(all_labels) == np.array(all_preds))
+                fold_per_class_aucs = per_class_auc(all_labels, all_probs)
+
+                fold_auc_scores.append(fold_auc)
+                fold_accuracies.append(fold_accuracy)
+                fold_class_aucs.append(fold_per_class_aucs)
+
+                print(f"Fold {fold_num} (checkpoint) - Test AUC: {fold_auc:.4f}, Test Accuracy: {fold_accuracy:.4f}")
+                continue
         
             # Train model on train_subset with early stopping on internal_val
             # Use fold-specific seed derived from random_state for reproducibility
@@ -703,7 +754,7 @@ class KFoldPipeline:
             fold_accuracies.append(fold_accuracy)
             fold_class_aucs.append(fold_per_class_aucs)
         
-            print(f"Fold {fold_idx + 1} - Test AUC: {fold_auc:.4f}, Test Accuracy: {fold_accuracy:.4f}")
+            print(f"Fold {fold_num} - Test AUC: {fold_auc:.4f}, Test Accuracy: {fold_accuracy:.4f}")
             
             # Save checkpoint for this fold
             config = {
@@ -716,9 +767,8 @@ class KFoldPipeline:
             }
             label_mapping = create_label_mapping(self.df, self.label_col)
             
-            checkpoint_dir = "checkpoints/"
             os.makedirs(checkpoint_dir, exist_ok=True)
-            checkpoint_path = os.path.join(checkpoint_dir, f"fold_{fold_idx + 1}_auc_{fold_auc:.4f}.pt")
+            checkpoint_path = os.path.join(checkpoint_dir, f"fold_{fold_num}_auc_{fold_auc:.4f}.pt")
             save_checkpoint(model, config, label_mapping, checkpoint_path)
 
         # Compute mean and std across folds
@@ -737,7 +787,7 @@ class KFoldPipeline:
             'fold_accuracies': fold_accuracies,
             'mean_accuracy': mean_accuracy,
             'std_accuracy': std_accuracy,
-            'fold_per_class_aucs': fold_per_class_aucs,
+            'fold_class_aucs': fold_class_aucs,
             'mean_per_class_auc': mean_per_class_auc.tolist(),
             'std_per_class_auc': std_per_class_auc.tolist(),
             'n_splits': n_splits
