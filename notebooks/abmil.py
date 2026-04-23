@@ -12,7 +12,7 @@ import torch.nn as nn
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from wsidata import open_wsi
-from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score, RocCurveDisplay
+from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score, roc_curve
 from sklearn.model_selection import StratifiedKFold, train_test_split
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -530,11 +530,18 @@ def plot_roc_curve(all_labels, all_probs):
             f"plot_roc_curve only supports binary classification. "
             f"Found {n_classes} classes. Use auc_score() with macro averaging for multi-class."
         )
-    
-    onehot_labels = np.eye(n_classes)[all_labels]
 
-    RocCurveDisplay.from_predictions(onehot_labels, all_probs, average="macro")
+    fpr, tpr, _ = roc_curve(all_labels, all_probs[:, 1])
+    roc_auc = roc_auc_score(all_labels, all_probs[:, 1])
+
+    plt.figure(figsize=(6, 5))
+    plt.plot(fpr, tpr, label=f"AUC = {roc_auc:.4f}")
+    plt.plot([0, 1], [0, 1], linestyle="--", color="gray")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
     plt.title("ROC Curve (Binary Classification)")
+    plt.legend(loc="lower right")
+    plt.tight_layout()
     plt.show()
 
 
@@ -825,4 +832,57 @@ class KFoldPipeline:
             zip(self.results['mean_per_class_auc'], self.results['std_per_class_auc'])
         ):
             print(f"  Class {class_idx}: {mean_auc:.4f} ± {std_auc:.4f}")
+
+    def _get_evaluation_data(self, fold_idx=None):
+        """Return labels, predictions, and probabilities for one fold or all folds."""
+        if self.results is None:
+            raise ValueError("No results available. Run .kfold_cross_validation() first.")
+
+        fold_all_labels = self.results.get('fold_all_labels', [])
+        fold_all_preds = self.results.get('fold_all_preds', [])
+        fold_all_probs = self.results.get('fold_all_probs', [])
+
+        if not fold_all_labels or not fold_all_preds or not fold_all_probs:
+            raise ValueError("Evaluation outputs are missing from self.results.")
+
+        if fold_idx is None:
+            all_labels = [label for fold_labels in fold_all_labels for label in fold_labels]
+            all_preds = [pred for fold_preds in fold_all_preds for pred in fold_preds]
+            all_probs = np.concatenate([np.asarray(fold_probs) for fold_probs in fold_all_probs], axis=0)
+            return all_labels, all_preds, all_probs
+
+        if fold_idx < 1 or fold_idx > len(fold_all_labels):
+            raise IndexError(f"fold_idx must be between 1 and {len(fold_all_labels)}")
+
+        index = fold_idx - 1
+        return list(fold_all_labels[index]), list(fold_all_preds[index]), np.asarray(fold_all_probs[index])
+
+    def plot_confusion_matrix(self, fold_idx=None):
+        """Plot a confusion matrix for one fold or all folds combined."""
+        all_labels, all_preds, _ = self._get_evaluation_data(fold_idx=fold_idx)
+        confusion_matrix_report(all_labels, all_preds)
+
+    def plot_roc_curve(self, fold_idx=None):
+        """Plot ROC curve for binary classification for one fold or all folds combined."""
+        all_labels, _, all_probs = self._get_evaluation_data(fold_idx=fold_idx)
+        n_classes = all_probs.shape[1]
+        title_suffix = f"Fold {fold_idx}" if fold_idx is not None else "All folds"
+
+        if n_classes != 2:
+            raise ValueError(
+                f"plot_roc_curve only supports binary classification. Found {n_classes} classes."
+            )
+
+        fpr, tpr, _ = roc_curve(all_labels, all_probs[:, 1])
+        roc_auc = roc_auc_score(all_labels, all_probs[:, 1])
+
+        plt.figure(figsize=(6, 5))
+        plt.plot(fpr, tpr, label=f"AUC = {roc_auc:.4f}")
+        plt.plot([0, 1], [0, 1], linestyle="--", color="gray")
+        plt.xlabel("False Positive Rate")
+        plt.ylabel("True Positive Rate")
+        plt.title(f"ROC Curve ({title_suffix})")
+        plt.legend(loc="lower right")
+        plt.tight_layout()
+        plt.show()
     
