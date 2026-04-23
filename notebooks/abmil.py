@@ -615,6 +615,9 @@ class KFoldPipeline:
         fold_auc_scores = []
         fold_accuracies = []
         fold_class_aucs = []
+        fold_all_labels = []
+        fold_all_preds = []
+        fold_all_probs = []
     
         print(f"Starting {n_splits}-fold cross-validation with early stopping (patience={early_stopping_patience})...")
         print(f"Data leakage prevention: Train (80%) (90% Training | 10% Internal Val → Early stopping) | Test (20%) → Final evaluation")
@@ -723,6 +726,9 @@ class KFoldPipeline:
                 fold_auc_scores.append(fold_auc)
                 fold_accuracies.append(fold_accuracy)
                 fold_class_aucs.append(fold_per_class_aucs)
+                fold_all_labels.append(list(all_labels))
+                fold_all_preds.append(list(all_preds))
+                fold_all_probs.append(all_probs.tolist())
 
                 print(f"Fold {fold_num} (checkpoint) - Test AUC: {fold_auc:.4f}, Test Accuracy: {fold_accuracy:.4f}")
                 continue
@@ -753,6 +759,9 @@ class KFoldPipeline:
             fold_auc_scores.append(fold_auc)
             fold_accuracies.append(fold_accuracy)
             fold_class_aucs.append(fold_per_class_aucs)
+            fold_all_labels.append(list(all_labels))
+            fold_all_preds.append(list(all_preds))
+            fold_all_probs.append(all_probs.tolist())
         
             print(f"Fold {fold_num} - Test AUC: {fold_auc:.4f}, Test Accuracy: {fold_accuracy:.4f}")
             
@@ -790,6 +799,9 @@ class KFoldPipeline:
             'fold_class_aucs': fold_class_aucs,
             'mean_per_class_auc': mean_per_class_auc.tolist(),
             'std_per_class_auc': std_per_class_auc.tolist(),
+            'fold_all_labels': fold_all_labels,
+            'fold_all_preds': fold_all_preds,
+            'fold_all_probs': fold_all_probs,
             'n_splits': n_splits
         }    
         self.results = results_dict
