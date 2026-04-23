@@ -826,32 +826,3 @@ class KFoldPipeline:
         ):
             print(f"  Class {class_idx}: {mean_auc:.4f} ± {std_auc:.4f}")
     
-    def plot_fold_distribution(self):
-        """Plot fold AUC and accuracy distribution."""
-        if self.results is None:
-            print("No results available. Run the pipeline first with .kfold_cross_validation()")
-            return
-        
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-        
-        # AUC plot
-        axes[0].bar(range(len(self.results['fold_auc_scores'])), self.results['fold_auc_scores'], alpha=0.7)
-        axes[0].axhline(self.results['mean_auc'], color='r', linestyle='--', label=f"Mean: {self.results['mean_auc']:.4f}")
-        axes[0].set_xlabel("Fold")
-        axes[0].set_ylabel("AUC")
-        axes[0].set_title("AUC per Fold")
-        axes[0].legend()
-        axes[0].set_ylim([0, 1])
-        
-        # Accuracy plot
-        axes[1].bar(range(len(self.results['fold_accuracies'])), self.results['fold_accuracies'], alpha=0.7)
-        axes[1].axhline(self.results['mean_accuracy'], color='r', linestyle='--', label=f"Mean: {self.results['mean_accuracy']:.4f}")
-        axes[1].set_xlabel("Fold")
-        axes[1].set_ylabel("Accuracy")
-        axes[1].set_title("Accuracy per Fold")
-        axes[1].legend()
-        axes[1].set_ylim([0, 1])
-        
-        plt.tight_layout()
-        plt.show()
-
