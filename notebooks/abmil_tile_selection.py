@@ -11,7 +11,7 @@ import math
 class SlideAttention:
     def __init__(self, model, dataset, slide_idx, feature_key, tile_key, filename_col, zarr_dir):
         self.model = model # trained ABMIL model
-        self.dataset = dataset # ZarrSlideDataset or Subset
+        self.dataset = dataset # ZarrSlideDataset 
         self.slide_idx = slide_idx
         self.feature_key = feature_key
         self.tile_key = tile_key
@@ -30,15 +30,12 @@ class SlideAttention:
             return None
         feats = feats.to(device)
 
-        # Normalize features
-        feats = (feats - feats.mean(0)) / (feats.std(0) + 1e-6)
-
         # Forward pass to get attention
         with torch.no_grad():
             logits, A = self.model(feats)
         A = A.squeeze(1).cpu().numpy()
 
-        # Normalize to [0,1] - only if there's variation
+        # Normalize visualization to [0,1] - only if there's variation
         if A.max() > A.min():
             A_normalized = (A - A.min()) / (A.max() - A.min() + 1e-8)
         else:
