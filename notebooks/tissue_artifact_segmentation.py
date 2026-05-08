@@ -45,8 +45,8 @@ class SegmentTissue:
         self.zarr_path = os.path.join(local_zarr_dir, os.path.basename(wsi_path).replace(".mrxs", ".zarr"))
         os.makedirs(local_zarr_dir, exist_ok=True)
         self.wsi = open_wsi(wsi_path, self.zarr_path) if os.path.exists(self.zarr_path) else open_wsi(wsi_path)
-        if version not in ["default", "grandqc", "threshold"]:
-            raise ValueError("version must be one of ['default', 'grandqc', 'threshold']")
+        if version not in ["default", "grandqc", "threshold",'threshold2']:
+            raise ValueError("version must be one of ['default', 'grandqc', 'threshold','threshold2']")
         self.version = f"tissue_{version}"
         self.TILE_KEY = "tiles_px512_mpp1.5_overlap0.1"
         self.elapsed_time = None
@@ -73,6 +73,9 @@ class SegmentTissue:
         elif self.version == "tissue_threshold":
             self.TISSUE_KEY = 'tissue_threshold'
             self._seg_threshold()
+        elif self.version == "tissue_threshold2":
+            self.TISSUE_KEY = 'tissue_threshold2'
+            self._seg_threshold2()
 
     def _seg_default(self):
         try: 
@@ -110,6 +113,18 @@ class SegmentTissue:
         except Exception as e:
             raise RuntimeError(f"Error during threshold tissue segmentation: {e}")
 
+    def _seg_threshold2(self):
+        try: 
+            if self.TISSUE_KEY in self.wsi.shapes:
+                print(f"Tissue already segmented: {self.TISSUE_KEY}")
+                return
+            start = datetime.now()
+            zs.pp.find_tissues(self.wsi, threshold=7, to_hsv=True, filter_artifacts=False, key_added=self.TISSUE_KEY)
+            self.elapsed_time = datetime.now() - start
+            self.wsi.write(self.zarr_path)
+        except Exception as e:
+            raise RuntimeError(f"Error during threshold tissue segmentation: {e}")
+            
     def tile_tissue(self, tile_px=512, mpp=1.5, overlap=0.1):
         if self.TILE_KEY not in self.wsi.shapes:
             zs.pp.tile_tissues(self.wsi, tile_px=tile_px, mpp=mpp, overlap=overlap, key_added=self.TILE_KEY, tissue_key=self.TISSUE_KEY)
