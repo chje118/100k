@@ -4,6 +4,12 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 import matplotlib.pyplot as plt
+import gc
+try:
+    import torch
+    _TORCH_AVAILABLE = True
+except Exception:
+    _TORCH_AVAILABLE = False
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler, LabelEncoder
@@ -12,22 +18,6 @@ from tissue_artifact_segmentation import load_big_cache, save_big_cache
 from wsidata import open_wsi
 from tqdm import tqdm
 
-
-def build_diagnose(topography, morphology):
-    if isinstance(topography, list):
-        topography = " / ".join(str(t) for t in topography)
-    
-    if isinstance(morphology, list):
-        return [f"{topography} - {m}" for m in morphology]
-    
-    return f"{topography} - {morphology}"
-
-def apply_diagnose(df, topo_col, morph_col, new_col="diagnose"):
-    df[new_col] = df.apply(
-        lambda row: build_diagnose(row[topo_col], row[morph_col]),
-        axis=1
-    )
-    return df
 
 class FeatureDataBuilder:
     def __init__(self, filenames, df_metadata: pd.DataFrame, zarr_dir: str, cache_file: str, models: list[str]):
@@ -95,11 +85,13 @@ class FeatureDataBuilder:
 
 
 class FeatureVisualizer:
-    def __init__(self, df: pd.DataFrame, label_col: str, features_col: str = "features", artifact_col: Optional[str] = None):
+    def __init__(self, df: pd.DataFrame, label_col: str, features_col: str = "features", artifact_col: Optional[str] = None, use_gpu: bool = True, mixed_precision: bool = True):
         self.df = df
         self.label_col = label_col
         self.features_col = features_col
         self.artifact_col = artifact_col
+        self.use_gpu = use_gpu and _TORCH_AVAILABLE
+        self.mixed_precision = mixed_precision
         self._cache = {}
 
         for col in [label_col, features_col]:
@@ -140,14 +132,32 @@ class FeatureVisualizer:
 
             artifacts.append(artifact_pct)
 
-        embeddings = np.vstack(embeddings)
+        # ensure float32 to reduce memory pressure
+        embeddings = np.vstack(embeddings).astype(np.float32)
         labels = np.array(labels)
-        artifacts = np.array(artifacts)
-
+        artifacts = np.array(artifacts, dtype=np.float32)
+        
         self._cache["agg"] = (embeddings, labels, artifacts)
+        
         return self._cache["agg"]
 
     def _standardize_features(self, emb):
+        # GPU path if requested and available
+        if self.use_gpu and _TORCH_AVAILABLE:
+            device = torch.device("cuda")
+            t = torch.from_numpy(emb.astype(np.float32)).to(device)
+            mean = t.mean(dim=0, keepdim=True)
+            std = t.std(dim=0, unbiased=False, keepdim=True)
+            std = std.clamp_min(1e-6)
+            t = (t - mean) / std
+            out = t.cpu().numpy()
+            # free GPU memory
+            del t, mean, std
+            torch.cuda.empty_cache()
+            gc.collect()
+            return out
+        
+        # Fallback to numpy
         if "scaler" not in self._cache:
             self._cache["scaler"] = StandardScaler().fit(emb)
         return self._cache["scaler"].transform(emb)
@@ -169,11 +179,35 @@ class FeatureVisualizer:
     def pca_plot(self, figsize=(8, 10)):
         emb, labels, artifacts = self._extract_embeddings()
         emb_scaled = self._standardize_features(emb)
-        #labels_encoded = self._encode_labels(labels)
-    
+
         n_components = self._auto_pca_components(emb_scaled)
-        pca = PCA(n_components=n_components)
-        reduced = pca.fit_transform(emb_scaled)
+
+        # GPU path if requested and available
+        if self.use_gpu:
+            device = torch.device("cuda")
+            # Move normalized embeddings to GPU as float32
+            t = torch.from_numpy(emb_scaled.astype(np.float32)).to(device)
+            with torch.no_grad():
+                try:
+                    # Perform SVD on GPU for faster computation
+                    u, s, v = torch.linalg.svd(t, full_matrices=False)
+                    # Project onto principal components: U * Sigma
+                    reduced = (u[:, :n_components] * s[:n_components]).cpu().numpy()
+                    # Clean up GPU memory
+                    del t, u, s, v
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                except RuntimeError:
+                    # Fallback to sklearn if GPU SVD fails
+                    pca = PCA(n_components=n_components, svd_solver="randomized")
+                    reduced = pca.fit_transform(emb_scaled)
+                    del t
+                    torch.cuda.empty_cache()
+                    gc.collect()
+        else:
+            # CPU fallback: use sklearn's randomized SVD
+            pca = PCA(n_components=n_components, svd_solver="randomized")
+            reduced = pca.fit_transform(emb_scaled)
 
         alpha_vals = 1 - artifacts
 
@@ -205,9 +239,10 @@ class FeatureVisualizer:
     def tsne_plot(self, figsize=(8, 10)):
         emb, labels, artifacts = self._extract_embeddings()
         emb_scaled = self._standardize_features(emb)
-        
+
         perplexity = self._auto_tsne_perplexity(len(emb_scaled))
-    
+
+        # Note: sklearn's TSNE does not have GPU support; runs on CPU
         tsne = TSNE(
             n_components=2,
             perplexity=perplexity,
@@ -244,7 +279,7 @@ class FeatureVisualizer:
         plt.show()
 
     def label_separation_score(self):
-        emb, labels, artifacts = self._extract_embeddings()
+        emb, labels, _ = self._extract_embeddings()
         emb_scaled = self._standardize_features(emb)
         labels_encoded = self._encode_labels(labels)
 
@@ -283,10 +318,3 @@ class FeatureVisualizer:
         print(f"Silhouette: {sil:.3f} (−1 to 1, higher → better separation)")
         print(f"Davies–Bouldin: {db:.3f} (0 to ∞, lower → better clustering)")
         print(f"Fisher Ratio: {fisher_ratio:.3f} (higher → better separation)")
-
-
-# Example usage:
-if __name__ == "__main__":
-    # Build diagnose column
-    df = pd.read_csv("path/to/dataframe.csv")
-    df = apply_diagnose(df, "T category", "M category")
