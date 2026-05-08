@@ -4,30 +4,60 @@ import lazyslide as zs
 from datetime import datetime
 import pandas as pd
 import geopandas as gpd
+import torch
 from tqdm import tqdm
 import gc
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
+def _configure_h100() -> None:
+    if not torch.cuda.is_available():
+        print("CUDA is not available. Running on CPU.")
+        return
+    try:
+        torch.set_float32_matmul_precision("high")  # Prefer faster TF32-style matmul on H100
+    except Exception:
+        pass
+    if hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 matmuls for throughput
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = True  # Let cuDNN use TF32 kernels
+        torch.backends.cudnn.benchmark = True  # Pick fastest convolution kernels for this input shape
+
+# Configure H100 optimizations at module level
+_configure_h100()
+
 
 class ExtractFeatures:
-    def __init__(self, wsi_path, local_zarr_dir, model, remove_artifacts = False):
+    def __init__(
+        self,
+        wsi_path,
+        local_zarr_dir,
+        model,
+        remove_artifacts=False,
+        feature_batch_size=512,
+        feature_num_workers=None,
+        feature_autocast_dtype=None,
+    ):
         self.wsi_path = wsi_path
         self.zarr_path = os.path.join(local_zarr_dir, os.path.basename(wsi_path).replace(".mrxs", ".zarr"))
-        if os.path.exists(self.zarr_path):
-            self.wsi = open_wsi(self.wsi_path, self.zarr_path)
-        else:
-            self.wsi = open_wsi(self.wsi_path)
-            os.makedirs(local_zarr_dir, exist_ok=True)
+        os.makedirs(local_zarr_dir, exist_ok=True)
+        self.wsi = open_wsi(self.wsi_path, self.zarr_path)
         self.model_name = model
         self.remove_artifacts = remove_artifacts
+        
+        # Configure feature extraction parameters, with sensible defaults for H100
+        self.feature_batch_size = feature_batch_size
+        cpu_count = os.cpu_count() or 8
+        self.feature_num_workers = feature_num_workers if feature_num_workers is not None else max(4, min(16, cpu_count // 2))
+        self.feature_autocast_dtype = feature_autocast_dtype or torch.bfloat16  # bf16 is ideal on H100 tensor cores
+        
         if remove_artifacts: 
             self.TILE_KEY = "clean_tiles_224"
             self.FEATURE_KEY = f'clean_features_{self.model_name}'
         else:
             self.TILE_KEY = "tiles_224"
             self.FEATURE_KEY = f'features_{self.model_name}'
-        #self.num_workers = os.cpu_count()-2
         self.elapsed_time = None
         self.process_slide()
     
@@ -37,9 +67,13 @@ class ExtractFeatures:
         if hasattr(arr, "is_empty"):
             return arr.is_empty.all()
         try:
+            return len(arr) == 0
+        except Exception:
+            pass
+        try:
             return arr.sum() == 0
         except Exception:
-            return len(arr) == 0
+            return False
 
     def process_slide(self):
         try:
@@ -70,7 +104,6 @@ class ExtractFeatures:
             raise RuntimeError(str(e))
     
     def tile_tissue(self, tile_px=224):
-        """ TODO: look up px, mpp and overlap for models. """
         try:
             if self.TILE_KEY not in self.wsi.shapes:
                 zs.pp.tile_tissues(self.wsi, tile_px=tile_px, key_added=self.TILE_KEY, tissue_key=self.TISSUE_KEY)
@@ -85,6 +118,7 @@ class ExtractFeatures:
             
             self.wsi.write(self.zarr_path)
             return self.wsi
+        
         except Exception as e:
             print(f"Error while extracting tiles: {e}")
             raise            
@@ -93,11 +127,22 @@ class ExtractFeatures:
         try:
             if self.FEATURE_KEY not in self.wsi.tables:
                 start_time = datetime.now()
-                #zs.tl.feature_extraction(self.wsi, model=self.model_name, tile_key=self.TILE_KEY, key_added=self.FEATURE_KEY, batch_size=256, num_workers=self.num_workers)
-                zs.tl.feature_extraction(self.wsi, model=self.model_name, tile_key=self.TILE_KEY, key_added=self.FEATURE_KEY)
+                zs.tl.feature_extraction(
+                    self.wsi,
+                    model=self.model_name,
+                    tile_key=self.TILE_KEY,
+                    key_added=self.FEATURE_KEY,
+                    device="cuda" if torch.cuda.is_available() else 'cpu',
+                    amp=torch.cuda.is_available(),
+                    autocast_dtype=self.feature_autocast_dtype,
+                    batch_size=self.feature_batch_size,  # Larger batches keep the H100 busy
+                    num_workers=self.feature_num_workers,  # Overlap host preprocessing with GPU work
+                    )
                 self.elapsed_time = datetime.now() - start_time
-                self.wsi.write(self.zarr_path)
+            
+            self.wsi.write(self.zarr_path)
             return self.wsi
+        
         except Exception as e:
             raise RuntimeError(f"Error during feature extraction: {e}")
 
@@ -106,6 +151,7 @@ class ExtractFeatures:
             zs.tl.feature_aggregation(self.wsi, feature_key=self.FEATURE_KEY, tile_key=self.TILE_KEY)
             self.wsi.write(self.zarr_path)
             return self.wsi
+        
         except Exception as e:
             raise RuntimeError(f"Error during feature aggregation: {e}")
 
@@ -114,12 +160,28 @@ class ExtractFeatures:
 
 
 class ExtractMany:
-    def __init__(self, wsi_paths, output_path, local_zarr_dir, model, remove_artifacts=False):
+    def __init__(
+        self,
+        wsi_paths,
+        output_path,
+        local_zarr_dir,
+        model,
+        remove_artifacts=False,
+        feature_batch_size=512,
+        feature_num_workers=None,
+        feature_autocast_dtype=None,
+    ):
         self.wsi_paths = wsi_paths
         self.local_zarr_dir = local_zarr_dir
         self.model = model
         self.remove_artifacts = remove_artifacts
         self.csv_path = output_path
+        
+        # Configure feature extraction parameters, with sensible defaults for H100
+        self.feature_batch_size = feature_batch_size
+        self.feature_num_workers = feature_num_workers
+        self.feature_autocast_dtype = feature_autocast_dtype
+        
         self.extract_features()
 
     def already_processed(self):
@@ -145,7 +207,15 @@ class ExtractMany:
             slide_name = os.path.basename(path)
             print(f"\nProcessing {slide_name}...")
             try:
-                wsiobj = ExtractFeatures(path, self.local_zarr_dir, model = self.model, remove_artifacts = self.remove_artifacts)
+                wsiobj = ExtractFeatures(
+                    path,
+                    self.local_zarr_dir,
+                    model=self.model,
+                    remove_artifacts=self.remove_artifacts,
+                    feature_batch_size=self.feature_batch_size,
+                    feature_num_workers=self.feature_num_workers,
+                    feature_autocast_dtype=self.feature_autocast_dtype,
+                )
                 features = wsiobj.get_features()
                 elapsed_time = wsiobj.elapsed_time
                 status = "feature extraction complete"
@@ -181,4 +251,4 @@ if __name__ == "__main__":
     output_dir = "path/to/output"
     local_dir = "path/to/local/zarr/dir"
 
-    extractor = ExtractMany(all_filenames, output_dir, local_zarr_dir = local_dir, segmentation_type = "feature", model = "h-optimus-0")
+    extractor = ExtractMany(all_filenames, output_dir, local_zarr_dir=local_dir, model="h-optimus-0")
