@@ -1,8 +1,15 @@
+
 import os
 import numpy as np
 import pandas as pd
 from typing import Optional
 import matplotlib.pyplot as plt
+import gc
+try:
+    import torch
+    _TORCH_AVAILABLE = True
+except Exception:
+    _TORCH_AVAILABLE = False
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler, LabelEncoder
@@ -94,11 +101,14 @@ class FeatureDataBuilder:
 
 
 class FeatureVisualizer:
-    def __init__(self, df: pd.DataFrame, label_col: str, features_col: str = "features", artifact_col: Optional[str] = None):
+    def __init__(self, df: pd.DataFrame, label_col: str, features_col: str = "features", artifact_col: Optional[str] = None, use_gpu: bool = False, mixed_precision: bool = True, max_viz_samples: int = 2000):
         self.df = df
         self.label_col = label_col
         self.features_col = features_col
         self.artifact_col = artifact_col
+        self.use_gpu = use_gpu and _TORCH_AVAILABLE
+        self.mixed_precision = mixed_precision
+        self.max_viz_samples = int(max_viz_samples)
         self._cache = {}
 
         for col in [label_col, features_col]:
@@ -139,17 +149,49 @@ class FeatureVisualizer:
 
             artifacts.append(artifact_pct)
 
-        embeddings = np.vstack(embeddings)
+        # ensure float32 to reduce memory pressure
+        embeddings = np.vstack(embeddings).astype(np.float32)
         labels = np.array(labels)
-        artifacts = np.array(artifacts)
+        artifacts = np.array(artifacts, dtype=np.float32)
 
         self._cache["agg"] = (embeddings, labels, artifacts)
         return self._cache["agg"]
 
+    def _sample_for_viz(self, embeddings, labels, artifacts):
+        n = len(embeddings)
+        if n <= self.max_viz_samples:
+            return embeddings, labels, artifacts
+
+        rng = np.random.default_rng(0)
+        idx = rng.choice(n, size=self.max_viz_samples, replace=False)
+        return embeddings[idx], labels[idx], artifacts[idx]
+
     def _standardize_features(self, emb):
-        if "scaler" not in self._cache:
-            self._cache["scaler"] = StandardScaler().fit(emb)
-        return self._cache["scaler"].transform(emb)
+        # Use numpy scaler by default; if GPU is requested and available, use torch ops
+        if not self.use_gpu:
+            if "scaler" not in self._cache:
+                self._cache["scaler"] = StandardScaler().fit(emb)
+            return self._cache["scaler"].transform(emb)
+
+        # GPU path (torch)
+        if not _TORCH_AVAILABLE:
+            if "scaler" not in self._cache:
+                self._cache["scaler"] = StandardScaler().fit(emb)
+            return self._cache["scaler"].transform(emb)
+
+        # move to torch for standardization
+        device = torch.device("cuda")
+        t = torch.from_numpy(emb.astype(np.float32)).to(device)
+        mean = t.mean(dim=0, keepdim=True)
+        std = t.std(dim=0, unbiased=False, keepdim=True)
+        std = std.clamp_min(1e-6)
+        t = (t - mean) / std
+        out = t.cpu().numpy()
+        # free GPU memory
+        del t, mean, std
+        torch.cuda.empty_cache()
+        gc.collect()
+        return out
 
     def _encode_labels(self, lbls):
         if "label_encoder" not in self._cache:
@@ -167,14 +209,32 @@ class FeatureVisualizer:
 
     def pca_plot(self, figsize=(8, 10)):
         emb, labels, artifacts = self._extract_embeddings()
-        emb_scaled = self._standardize_features(emb)
-        #labels_encoded = self._encode_labels(labels)
-    
-        n_components = self._auto_pca_components(emb_scaled)
-        pca = PCA(n_components=n_components)
-        reduced = pca.fit_transform(emb_scaled)
+        # sample for visualization if too large
+        emb_viz, labels_viz, artifacts_viz = self._sample_for_viz(emb, labels, artifacts)
+        emb_scaled = self._standardize_features(emb_viz)
 
-        alpha_vals = 1 - artifacts
+        n_components = self._auto_pca_components(emb_scaled)
+
+        # If GPU requested and available, perform PCA with torch SVD on GPU to reduce memory spikes
+        if self.use_gpu and _TORCH_AVAILABLE:
+            device = torch.device("cuda")
+            t = torch.from_numpy(emb_scaled.astype(np.float32)).to(device)
+            with torch.no_grad():
+                try:
+                    u, s, v = torch.linalg.svd(t, full_matrices=False)
+                    reduced = (u[:, :n_components] * s[:n_components]).cpu().numpy()
+                except RuntimeError:
+                    # fallback to sklearn if torch SVD fails
+                    pca = PCA(n_components=n_components, svd_solver="randomized")
+                    reduced = pca.fit_transform(emb_scaled)
+            del t, u, s, v
+            torch.cuda.empty_cache()
+            gc.collect()
+        else:
+            pca = PCA(n_components=n_components, svd_solver="randomized")
+            reduced = pca.fit_transform(emb_scaled)
+
+        alpha_vals = 1 - artifacts_viz
 
         unique_labels = np.unique(labels)
         cmap = plt.get_cmap("tab20")
@@ -203,10 +263,11 @@ class FeatureVisualizer:
 
     def tsne_plot(self, figsize=(8, 10)):
         emb, labels, artifacts = self._extract_embeddings()
-        emb_scaled = self._standardize_features(emb)
-        
+        emb_viz, labels_viz, artifacts_viz = self._sample_for_viz(emb, labels, artifacts)
+        emb_scaled = self._standardize_features(emb_viz)
+
         perplexity = self._auto_tsne_perplexity(len(emb_scaled))
-    
+
         tsne = TSNE(
             n_components=2,
             perplexity=perplexity,
@@ -215,15 +276,15 @@ class FeatureVisualizer:
         )
         reduced = tsne.fit_transform(emb_scaled)
 
-        alpha_vals = 1 - artifacts
+        alpha_vals = 1 - artifacts_viz
 
-        unique_labels = np.unique(labels)
+        unique_labels = np.unique(labels_viz)
         cmap = plt.get_cmap("tab20")
         
         plt.figure(figsize=figsize)
         
         for i, lbl in enumerate(unique_labels):
-            idx = labels == lbl
+            idx = labels_viz == lbl
             plt.scatter(
                 reduced[idx, 0],
                 reduced[idx, 1],
@@ -244,8 +305,10 @@ class FeatureVisualizer:
 
     def label_separation_score(self):
         emb, labels, artifacts = self._extract_embeddings()
-        emb_scaled = self._standardize_features(emb)
-        labels_encoded = self._encode_labels(labels)
+        # to avoid memory blowups, sample when dataset large
+        emb_for_score, labels_for_score, _ = self._sample_for_viz(emb, labels, artifacts)
+        emb_scaled = self._standardize_features(emb_for_score)
+        labels_encoded = self._encode_labels(labels_for_score)
 
         # 1) Silhouette Score (higher = better)
         if len(np.unique(labels_encoded)) > 1:
