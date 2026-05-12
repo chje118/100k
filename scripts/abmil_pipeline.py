@@ -7,6 +7,8 @@ import pandas as pd
 import torch
 from wsidata import open_wsi
 from abmil import ZarrSlideDataset, load_checkpoint
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
+           
 
 class DiseaseClassification:
     """Simple ABMIL workflow for one-slide inference, batch processing, and cache-based reporting."""
@@ -186,7 +188,7 @@ class DiseaseClassification:
             ymax = maxy + margin
 
             zs.pl.tiles(wsi, tile_key=slide_data["tile_key"], zoom=(xmin, xmax, ymin, ymax), ax=axes[i])
-            axes[i].set_title(f"tile {tile_row.get('tile_id', index)}")
+            axes[i].set_title(f"tile {tile_row.get('tile_id', i)}")
 
         for i in range(len(top_tiles), len(axes)):
             axes[i].axis("off")
@@ -194,68 +196,52 @@ class DiseaseClassification:
         plt.tight_layout()
         plt.show()        
         
+    def assessment_report(self, true_labels: list | None = None):
+        """ Compute confusion matrix and classification report from cached slides. """
+        if not self._slide_cache:
+            raise ValueError("No cached inference results found. Run inference first.")
 
-
-    def assessment_report(self, true_labels: list | None = None, output_path: str | None = None):
-        """ Compute confusion matrix and classification report from cached slide predictions. """
         if true_labels is not None and len(true_labels) != len(self.slides):
             raise ValueError("true_labels must have same length as slides")
 
         rows = []
         for idx, slide_path in enumerate(self.slides):
             cached = self._slide_cache.get(slide_path)
-            if not cached:
-                print(f"No cached data found for slide: {slide_path}")
+            if cached is None:
                 continue
 
-            row = dict(cached["row"])
+            true_idx = cached.get("true_idx")
             if true_labels is not None:
-                row["true_label"] = true_labels[idx]
-                row["true_idx"] = self._label_to_index(true_labels[idx])
-                row["is_correct"] = None if row["true_idx"] is None else row["pred_idx"] == row["true_idx"]
-            rows.append(row)
+                true_idx = self._label_to_index(true_labels[idx])
+
+            rows.append({
+                "slide_path": slide_path,
+                "true_idx": true_idx,
+                "pred_idx": cached.get("pred_idx"),
+            })
 
         results_df = pd.DataFrame(rows)
+
         if results_df.empty or "true_idx" not in results_df.columns or results_df["true_idx"].isna().all():
-            if output_path is not None:
-                self.save_assessment(output_path, report)
-            return report
+            return {"cm": None, "labels": None, "report_str": None, "results_df": results_df}
 
         valid = results_df["true_idx"].notna()
         y_true = results_df.loc[valid, "true_idx"].astype(int).tolist()
         y_pred = results_df.loc[valid, "pred_idx"].astype(int).tolist()
 
-        from sklearn.metrics import classification_report, confusion_matrix
-
         labels = sorted(list(set(y_true) | set(y_pred)))
         cm = confusion_matrix(y_true, y_pred, labels=labels)
         report_str = classification_report(y_true, y_pred, labels=labels)
 
-        if display:
-            from sklearn.metrics import ConfusionMatrixDisplay
-
+        print("Classification report:\n")
+        print(report_str)
+        try:
             disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
             fig, ax = plt.subplots(figsize=(8, 6))
             disp.plot(ax=ax, cmap="Blues", colorbar=True)
             ax.set_title("Confusion Matrix")
             plt.show()
-            print("\nClassification report:")
-            print(report_str)
+        except Exception:
+            print("Confusion matrix:\n", cm)
 
-        report = {"cm": cm, "labels": labels, "report_str": report_str, "results_df": results_df}
-        if output_path is not None:
-            self.save_assessment(output_path, report)
-        return report
-
-    def save_assessment(self, output_path: str, report: dict):
-        """Save assessment results to a pickle file."""
-        payload = {
-            "cm": report.get("cm"),
-            "labels": report.get("labels"),
-            "report_str": report.get("report_str"),
-            "results_df": report.get("results_df", pd.DataFrame()),
-        }
-        with open(output_path, "wb") as f:
-            pickle.dump(payload, f)
-        return payload
-
+        return {"cm": cm, "labels": labels, "report_str": report_str, "results_df": results_df}
