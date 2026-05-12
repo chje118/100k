@@ -51,7 +51,7 @@ class DiseaseClassification:
             seed=None,
         )
 
-    def _infer_slide(self, slide_path: str, true_label=None):
+    def _infer_slide(self, slide_path: str, true_label = None, top_k: int = 100):
         """ Infer one slide once and cache the full result. """
         if slide_path in self._slide_cache:
             return self._slide_cache[slide_path]
@@ -84,6 +84,10 @@ class DiseaseClassification:
         tile_df = wsi.shapes[self.tile_key][["tile_id", "geometry"]].copy()
         tile_table = pd.merge(attention_df, tile_df, on="tile_id", how="inner")
 
+        # Compute top_k tiles at inference time
+        top_tiles_df = tile_table.sort_values("attention", ascending=False).head(top_k).copy()
+
+        true_idx = self._label_to_index(true_label)
         slide_data = {
             "slide_path": slide_path,
             "zarr_path": zarr_path,
@@ -91,6 +95,7 @@ class DiseaseClassification:
             "tile_key": self.tile_key,
             "attention": attention,
             "tile_table": tile_table,
+            "top_tiles_df": top_tiles_df,
             "pred_idx": pred_idx,
             "pred_label": self.idx_to_label.get(pred_idx, pred_idx),
             "confidence": float(probs[pred_idx]),
@@ -98,6 +103,7 @@ class DiseaseClassification:
             "true_label": true_label,
             "is_correct": None if true_idx is None else pred_idx == true_idx,
         }
+
         slide_data.update({f"prob_{self.idx_to_label.get(i, i)}": float(prob) for i, prob in enumerate(probs)})
 
         self._slide_cache[slide_path] = slide_data
@@ -116,48 +122,24 @@ class DiseaseClassification:
         with open(input_path, "rb") as f:
             return pickle.load(f)
 
-    def process_slides(self, true_labels: list | None = None, top_k: int = 10):
-        """Batch process slides, save cache after each slide, and return a success message."""
+    def process_slides(self, true_labels: list | None = None, top_k: int = 100):
+        """ Batch process slides, save cache after each slide. """
         if true_labels is not None and len(true_labels) != len(self.slides):
             raise ValueError("true_labels must have same length as slides")
 
-        rows = []
         for idx, slide_path in enumerate(self.slides):
             true_label = None if true_labels is None else true_labels[idx]
-            row = self.infer_slide(slide_path, true_label=true_label)
-            top_tiles_df = self.top_k_tiles(slide_path, k=top_k)
-            top_tiles = top_tiles_df.to_dict(orient="records") if not top_tiles_df.empty else []
-            rows.append({**row, "n_top_tiles": len(top_tiles), "top_tiles": top_tiles})
-
-        results_df = pd.DataFrame(rows)
-        valid = results_df["true_idx"].notna() if "true_idx" in results_df.columns else None
-        accuracy = float(results_df.loc[valid, "is_correct"].mean()) if valid is not None and valid.any() else None
-
-        results_df["run_n_slides"] = len(self.slides)
-        results_df["run_n_labeled_slides"] = int(valid.sum()) if valid is not None else np.nan
-        results_df["run_accuracy"] = accuracy
-
-        return {
-            "message": "Batch processing complete.",
-            "results_df": results_df,
-            "summary": {
-                "n_slides": len(self.slides),
-                "n_labeled_slides": int(valid.sum()) if valid is not None else 0,
-                "accuracy": accuracy,
-            },
-            "accuracy": accuracy,
-        }
-
-    def top_k_tiles(self, slide_path: str, k: int = 10):
-        """Return the top-k tiles from cache for later use."""
-        tile_table = self._get_cached_slide(slide_path)["tile_table"]
-        if tile_table.empty:
-            return pd.DataFrame()
-        return tile_table.sort_values("attention", ascending=False).head(k).copy()
+            self.infer_slide(slide_path, true_label=true_label, top_k=top_k)
+        
+        print(f"Processed {len(self.slides)} slides. Cache saved to {self.cache_path}.")
 
     def attention_heatmap(self, slide_path: str):
         """Plot the attention heatmap for one cached slide."""
-        slide_data = self._get_cached_slide(slide_path)
+        slide_data = self._slide_cache.get(slide_path)
+        if not slide_data:
+            print(f"No cached data found for slide: {slide_path}")
+            return None
+        
         wsi = open_wsi(slide_path, slide_data["zarr_path"])
         wsi.tables[slide_data["feature_key"]].obs["attention"] = slide_data["attention"]
 
@@ -172,57 +154,60 @@ class DiseaseClassification:
             show_contours=False,
             ax=ax,
         )
-        ax.set_title(f"Attention heatmap: {os.path.basename(slide_path)}")
+        ax.set_title(f"Attention heatmap: {os.path.basename(slide_path)}, Predicted: {slide_data['pred_label']} (Conf: {slide_data['confidence']:.2f}), True: {slide_data['true_label']}")
         ax.axis("off")
         plt.show()
-        return fig
 
-    def zoom_view(self, slide_path: str, k: int = 5, margin: int = 0):
-        """Show a zoomed view of the top-k tiles on the slide."""
-        slide_data = self._get_cached_slide(slide_path)
-        tile_table = slide_data["tile_table"]
-        wsi = open_wsi(slide_path, slide_data["zarr_path"])
-
-        if tile_table.empty:
-            print("No tiles available for zoom view.")
+    def zoomed_view(self, slide_path: str, margin: int = 0):
+        """ Show a zoomed view of the top-k tiles on the slide. """
+        slide_data = self._slide_cache.get(slide_path)
+        if not slide_data:
+            print(f"No cached data found for slide: {slide_path}")
             return None
+        wsi = open_wsi(slide_path, slide_data["zarr_path"])
+        
+        top_tiles = slide_data.get("top_tiles_df")
 
-        top_tiles = tile_table.sort_values("attention", ascending=False).head(k).copy()
         cols = 2
-        rows = int(np.ceil(k / cols))
+        rows = int(np.ceil(len(top_tiles) / cols))
         fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 4 * rows))
         axes = np.asarray(axes).flatten()
 
-        for index, (_, tile_row) in enumerate(top_tiles.iterrows()):
+        for i, (_, tile_row) in enumerate(top_tiles.iterrows()):
             geometry = tile_row["geometry"]
             if not hasattr(geometry, "bounds"):
-                axes[index].axis("off")
+                axes[i].axis("off")
                 continue
-
+        
             minx, miny, maxx, maxy = geometry.bounds
             xmin = minx - margin
             ymin = miny - margin
             xmax = maxx + margin
             ymax = maxy + margin
 
-            zs.pl.tiles(wsi, tile_key=slide_data["tile_key"], zoom=(xmin, xmax, ymin, ymax), ax=axes[index])
-            axes[index].set_title(f"tile {tile_row.get('tile_id', index)}")
+            zs.pl.tiles(wsi, tile_key=slide_data["tile_key"], zoom=(xmin, xmax, ymin, ymax), ax=axes[i])
+            axes[i].set_title(f"tile {tile_row.get('tile_id', index)}")
 
-        for index in range(len(top_tiles), len(axes)):
-            axes[index].axis("off")
-
+        for i in range(len(top_tiles), len(axes)):
+            axes[i].axis("off")
+        
         plt.tight_layout()
-        plt.show()
-        return fig
+        plt.show()        
+        
 
-    def assessment_report(self, true_labels: list | None = None, display: bool = True, output_path: str | None = None):
-        """Compute confusion matrix and classification report from cached slide predictions."""
+
+    def assessment_report(self, true_labels: list | None = None, output_path: str | None = None):
+        """ Compute confusion matrix and classification report from cached slide predictions. """
         if true_labels is not None and len(true_labels) != len(self.slides):
             raise ValueError("true_labels must have same length as slides")
 
         rows = []
         for idx, slide_path in enumerate(self.slides):
-            cached = self._get_cached_slide(slide_path)
+            cached = self._slide_cache.get(slide_path)
+            if not cached:
+                print(f"No cached data found for slide: {slide_path}")
+                continue
+
             row = dict(cached["row"])
             if true_labels is not None:
                 row["true_label"] = true_labels[idx]
@@ -232,9 +217,6 @@ class DiseaseClassification:
 
         results_df = pd.DataFrame(rows)
         if results_df.empty or "true_idx" not in results_df.columns or results_df["true_idx"].isna().all():
-            if display:
-                print("No true labels available to compute confusion matrix.")
-            report = {"cm": None, "labels": None, "report_str": None, "results_df": results_df}
             if output_path is not None:
                 self.save_assessment(output_path, report)
             return report
