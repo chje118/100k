@@ -22,7 +22,10 @@ class DiseaseClassification:
         # Load cache
         if self.cache_path and os.path.exists(self.cache_path):
             loaded_cache = self.load_cache(self.cache_path)
-            self._slide_cache = loaded_cache.get("slide_cache", {})
+            if isinstance(loaded_cache, dict) and "slide_cache" in loaded_cache:
+                self._slide_cache = loaded_cache.get("slide_cache", {})
+            elif isinstance(loaded_cache, dict):
+                self._slide_cache = loaded_cache
 
         # Load the trained model
         self.model, self.config, self.label_mapping = load_checkpoint(self.checkpoint_path)
@@ -130,7 +133,7 @@ class DiseaseClassification:
 
         for idx, slide_path in enumerate(self.slides):
             true_label = None if true_labels is None else true_labels[idx]
-            self.infer_slide(slide_path, true_label=true_label, top_k=top_k)
+            self._infer_slide(slide_path, true_label=true_label, top_k=top_k)
         
         print(f"Processed {len(self.slides)} slides. Cache saved to {self.cache_path}.")
 
