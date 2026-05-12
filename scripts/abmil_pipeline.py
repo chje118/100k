@@ -248,3 +248,74 @@ class DiseaseClassification:
             print(report_str)
 
         return {"cm": cm, "labels": labels, "report_str": report_str, "results_df": results_df}
+    
+
+# FEATURES
+def load_features(wsi):
+    adata = wsi.tables[FEATURE_KEY]
+
+    feats = torch.from_numpy(adata.X).float()
+    tile_ids = np.array(adata.obs["tile_id"])
+
+    return feats, tile_ids
+
+
+# MODEL INFERENCE
+def abmil_inference(model, feats, device):
+    feats = feats.to(device)
+
+    with torch.no_grad():
+        logits, attention = model(feats)
+
+    probs = torch.softmax(logits.squeeze().float(), dim=0).cpu().numpy()
+    pred = int(np.argmax(probs))
+
+    return logits, probs, attention.squeeze().cpu().numpy(), pred
+
+# POSTPROCESSING
+def get_top_k_tiles(wsi, tile_ids, attention, k=10):
+    tile_table = wsi.tables[FEATURE_KEY].obs.copy()
+
+    df = pd.DataFrame({
+        "tile_id": tile_ids,
+        "attention": attention
+    })
+
+    merged = df.merge(
+        tile_table[["tile_id", "geometry"]],
+        on="tile_id",
+        how="inner"
+    )
+
+    if merged.empty:
+        return merged
+
+    return merged.sort_values("attention", ascending=False).head(k)
+
+
+# PIPELINE ENTRYPOINT
+def run_inference(wsi, checkpoint_path, slide_path, top_k=10):
+    model, config, label_mapping, device = load_checkpoint(checkpoint_path)
+
+    feats, tile_ids = load_features(wsi)
+
+    if feats.shape[0] == 0:
+        raise ValueError(f"No tiles found for slide: {slide_path}")
+
+    logits, probs, attention, pred = abmil_inference(model, feats, device)
+
+    top_tiles = get_top_k_tiles(
+        wsi=wsi,
+        tile_ids=tile_ids,
+        attention=attention,
+        k=top_k
+    )
+
+    return {
+        "slide": slide_path,
+        "prediction": pred,
+        "probabilities": probs,
+        "attention": attention,
+        "tile_ids": tile_ids,
+        "top_k_tiles": top_tiles,
+    }
