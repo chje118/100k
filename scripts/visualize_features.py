@@ -1,4 +1,3 @@
-
 import os
 import numpy as np
 import pandas as pd
@@ -141,15 +140,6 @@ class FeatureVisualizer:
         
         return self._cache["agg"]
 
-    def _sample_for_viz(self, embeddings, labels, artifacts):
-        n = len(embeddings)
-        if n <= self.max_viz_samples:
-            return embeddings, labels, artifacts
-
-        rng = np.random.default_rng(0)
-        idx = rng.choice(n, size=self.max_viz_samples, replace=False)
-        return embeddings[idx], labels[idx], artifacts[idx]
-
     def _standardize_features(self, emb):
         # GPU path if requested and available
         if self.use_gpu and _TORCH_AVAILABLE:
@@ -170,20 +160,6 @@ class FeatureVisualizer:
         if "scaler" not in self._cache:
             self._cache["scaler"] = StandardScaler().fit(emb)
         return self._cache["scaler"].transform(emb)
-
-        # move to torch for standardization
-        device = torch.device("cuda")
-        t = torch.from_numpy(emb.astype(np.float32)).to(device)
-        mean = t.mean(dim=0, keepdim=True)
-        std = t.std(dim=0, unbiased=False, keepdim=True)
-        std = std.clamp_min(1e-6)
-        t = (t - mean) / std
-        out = t.cpu().numpy()
-        # free GPU memory
-        del t, mean, std
-        torch.cuda.empty_cache()
-        gc.collect()
-        return out
 
     def _encode_labels(self, lbls):
         if "label_encoder" not in self._cache:
@@ -232,7 +208,7 @@ class FeatureVisualizer:
             pca = PCA(n_components=n_components, svd_solver="randomized")
             reduced = pca.fit_transform(emb_scaled)
 
-        alpha_vals = 1 - artifacts_viz
+        alpha_vals = 1 - artifacts
 
         unique_labels = np.unique(labels)
         cmap = plt.get_cmap("tab20")
@@ -274,15 +250,15 @@ class FeatureVisualizer:
         )
         reduced = tsne.fit_transform(emb_scaled)
 
-        alpha_vals = 1 - artifacts_viz
+        alpha_vals = 1 - artifacts
 
-        unique_labels = np.unique(labels_viz)
+        unique_labels = np.unique(labels)
         cmap = plt.get_cmap("tab20")
         
         plt.figure(figsize=figsize)
         
         for i, lbl in enumerate(unique_labels):
-            idx = labels_viz == lbl
+            idx = labels == lbl
             plt.scatter(
                 reduced[idx, 0],
                 reduced[idx, 1],
