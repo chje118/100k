@@ -6,9 +6,8 @@ import numpy as np
 import pandas as pd
 import torch
 from wsidata import open_wsi
-from abmil import ZarrSlideDataset, load_checkpoint
-from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
-           
+from abmil import ZarrSlideDataset, load_checkpoint, confusion_matrix_report
+
 
 class DiseaseClassification:
     """Simple ABMIL workflow for one-slide inference, batch processing, and cache-based reporting."""
@@ -229,19 +228,7 @@ class DiseaseClassification:
         y_true = results_df.loc[valid, "true_idx"].astype(int).tolist()
         y_pred = results_df.loc[valid, "pred_idx"].astype(int).tolist()
 
-        labels = sorted(list(set(y_true) | set(y_pred)))
-        cm = confusion_matrix(y_true, y_pred, labels=labels)
-        report_str = classification_report(y_true, y_pred, labels=labels)
+        # Call confusion_matrix_report from abmil module (handles printing and plotting)
+        confusion_matrix_report(y_true, y_pred)
 
-        print("Classification report:\n")
-        print(report_str)
-        try:
-            disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
-            fig, ax = plt.subplots(figsize=(8, 6))
-            disp.plot(ax=ax, cmap="Blues", colorbar=True)
-            ax.set_title("Confusion Matrix")
-            plt.show()
-        except Exception:
-            print("Confusion matrix:\n", cm)
-
-        return {"cm": cm, "labels": labels, "report_str": report_str, "results_df": results_df}
+        return {"results_df": results_df}
