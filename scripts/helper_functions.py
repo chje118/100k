@@ -185,12 +185,9 @@ def with_tissue_artifact(df, cache_file, segmentation_type, status="complete", v
     
     return df_subset
 
-
-
-
 def with_features(df, feature_file):
     df_feature = pd.read_csv(feature_file)
-    df_feature = df_feature_result[df_feature_result['status'] == "feature extraction complete"]["wsi_path"].astype(str)
+    df_feature = df_feature[df_feature['status'] == "feature extraction complete"]["wsi_path"].astype(str)
     with_features = set(df_feature)
     print("WSIs with features detected: ", len(with_features))
     files = list(with_features)
@@ -199,13 +196,13 @@ def with_features(df, feature_file):
     return df_subset
 
 def top_tissues(df, n_tissues):
-    all_tissues = [cat for sublist in df['T category'] for cat in sublist]
+    all_tissues = [cat for sublist in df['T_category'] for cat in sublist]
     top_counts = pd.Series(all_tissues).value_counts().head(n_tissues)
     top_tissues = top_counts.index.tolist()
     return top_tissues
 
 def tissue_subset(df, tissue):
-    subset = df[df["T category"].apply(lambda x: len(x) == 1 and tissue in x)]
+    subset = df[df["T_category"].apply(lambda x: len(x) == 1 and tissue in x)]
     return subset
 
 def sample_by_patient(df, n_patients, n_samples):

@@ -3,8 +3,8 @@ import numpy as np
 import pandas as pd
 from collections import Counter
 import matplotlib.pyplot as plt
+
 from wsidata import open_wsi
-import lazyslide as zs
 
 class TileSelector:
     def __init__(
@@ -147,7 +147,6 @@ class TileSelector:
         self.meta_df = meta_df
         self.features = features
         self.centroids = np.stack([cx, cy], axis=1)
-        # If multiple domain keys, use "domain" as the column name for consensus; otherwise use the single domain key
         self.domain_col = "domain" if len(self.domain_keys) > 1 else self.domain_keys[0]
 
         return meta_df, features
@@ -385,14 +384,31 @@ class TileSelector:
         ax.set_ylabel("cy")
         ax.set_title("Tile domains and selections")
         return ax
+    
+    def zoom_to_selected(self, selected: pd.DataFrame):
+        """ Visualize selected tiles with zoomed-in view. """
+        # TODO: domain_consensus column added to the tile table 
+        # TODO: zoom to selected tiles 
+        viewer = zs.pl.WSIViewer(wsi)
+        viewer.add_tiles(
+            key=tile_key,
+            feature_key=feature_key,
+            color_by='domain_consensus',
+            style='heatmap',
+            alpha=0.6
+        )
+        viewer.show()
+    
+ 
 
 if __name__ == "__main__":
-    from wsidata import open_wsi
+    import open_wsi
 
     slide_path = "path/to/slide.mrxs"
     zarr_path = "path/to/slide.zarr"
     wsi = open_wsi(slide_path, zarr_path)
     
+    # Single Domain
     selector = TileSelector(
         wsi=wsi,
         feature_key="features",
@@ -401,6 +417,21 @@ if __name__ == "__main__":
         min_distance_px=500.0
     )
     selected_tiles = selector.select_tiles_per_domain()
-    print(f"Selected {len(selected_tiles)} tiles by domain")
+    print(f"Selected {len(selected_tiles)} tiles")
+    print(selected_tiles.head())
     selector.plot_domains(selected_tiles)
+    
+    # Multiple Domains
+    selector_multi = TileSelector(
+        wsi=wsi,
+        feature_key="features", 
+        domain_keys=["domain_conch", "domain_uni", "domain_hopt"],
+        n_per_domain=3,
+        agreement_mode="all_same",
+        min_distance_px=300.0
+    )
+    selected_tiles_multi = selector_multi.select_tiles_per_domain()
+    print(f"Selected {len(selected_tiles_multi)} tiles with consensus")
+    print(selected_tiles_multi.head())
+    selector_multi.plot_domains(selected_tiles_multi)
     

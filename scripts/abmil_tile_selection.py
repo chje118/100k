@@ -9,8 +9,8 @@ import math
 
 
 class SlideAttention:
-    def __init__(self, model, dataset, slide_idx, feature_key, tile_key, filename_col, zarr_dir):
-        self.model = model # trained ABMIL model
+    def __init__(self, abmil_model, dataset, slide_idx, feature_key, tile_key, filename_col, zarr_dir):
+        self.model = abmil_model # trained ABMIL model
         self.dataset = dataset # ZarrSlideDataset 
         self.slide_idx = slide_idx
         self.feature_key = feature_key
@@ -94,7 +94,7 @@ class SlideAttention:
         )
         viewer.show()
     
-    def select_top_tiles(self, n_tiles=10):   
+    def select_top_tiles(self, n_tiles):   
         # Merge attention scores with tile geometries
         attention_df = self._get_attention_df()
         tile_df = self._get_tile_df()        
