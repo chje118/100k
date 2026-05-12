@@ -5,12 +5,14 @@ import numpy as np
 import pandas as pd
 from wsidata import open_wsi
 import geopandas as gpd
+import napari
 
 class ROISelector:
     """ Handle ROI selection from cached ABMIL inference results. """
-    def __init__(self, cache_path: str, slide_path: str):
+    def __init__(self, cache_path: str, slide_path: str, top_k: int = 100):
         self.cache_path = cache_path
         self.slide_path = slide_path
+        self.top_k = top_k
         self.slide_cache = self.load_cache(cache_path)
         self.slide_data = self.get_slide_data()
 
@@ -26,17 +28,17 @@ class ROISelector:
             raise KeyError(f"No cached data found for slide: {self.slide_path}")
         return slide_data
 
-    def top_tiles_from_slide_data(self, top_k: int = 100) -> gpd.GeoDataFrame:
+    def top_tiles_from_slide_data(self) -> gpd.GeoDataFrame:
         """ Return the top-k tiles from cached slide data. """
         tile_table = self.slide_data.get("tile_table")
         if tile_table is None:
             raise KeyError("slide_data must contain 'tile_table'")
-        top_tiles = tile_table.sort_values("attention", ascending=False).head(top_k).copy()
+        top_tiles = tile_table.sort_values("attention", ascending=False).head(self.top_k).copy()
         return gpd.GeoDataFrame(top_tiles, geometry="geometry")
 
-    def zoomed_view(self, margin: int = 0, top_k: int = 100):
+    def zoomed_view(self, margin: int = 0):
         """ Plot zoomed tiles (grid) for review from cached slide data. """
-        top_tiles_gdf = self.top_tiles_from_slide_data(top_k=top_k)
+        top_tiles_gdf = self.top_tiles_from_slide_data(self.top_k)
 
         slide_path = self.slide_data["slide_path"]
         zarr_path = self.slide_data["zarr_path"]
@@ -69,13 +71,34 @@ class ROISelector:
         plt.tight_layout()
         plt.show()
 
-    def napari_polygons(self, top_tiles_gdf: gpd.GeoDataFrame):
-        """ Return list of polygon coordinate arrays suitable for Napari `add_shapes`.
-        Each polygon is returned as an Nx2 numpy array of coords.
-        """
+    def napari_polygons(self):
+        """ Return list of polygon coordinate arrays suitable for Napari `add_shapes`."""
+        top_tiles_gdf = self.top_tiles_from_slide_data()
         polygons = [
             np.array(g.exterior.coords)
             for g in top_tiles_gdf.geometry
             if g.geom_type == "Polygon"
         ]
         return polygons
+
+    def napari_view(self):
+        """Plot the current slide and the selected tiles in Napari."""
+        slide_path = self.slide_data["slide_path"]
+        zarr_path = self.slide_data["zarr_path"]
+        wsi = open_wsi(slide_path, zarr_path)
+
+        viewer = napari.Viewer()
+
+        viewer.add_image(
+            wsi, 
+            name="slide", 
+            multiscale=True
+        )
+        viewer.add_shapes(
+            self.napari_polygons(),
+            shape_type="polygon",
+            edge_color="red",
+            face_color="red",
+            name="top_tiles",
+        )
+        napari.run()
