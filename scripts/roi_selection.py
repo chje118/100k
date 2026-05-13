@@ -71,6 +71,16 @@ class ROISelector:
         plt.tight_layout()
         plt.show()
 
+    def get_wsi(self):
+        slide_path = self.slide_data["slide_path"]
+        zarr_path = self.slide_data["zarr_path"]
+        self.wsi = open_wsi(slide_path, zarr_path)
+        return self.wsi
+    
+    def get_sdata(self):
+        self.sdata = self.wsi.to_spatialdata()
+        return self.sdata
+
     def napari_polygons(self):
         """ Return list of polygon coordinate arrays suitable for Napari `add_shapes`."""
         top_tiles_gdf = self.top_tiles_from_slide_data()
@@ -80,25 +90,3 @@ class ROISelector:
             if g.geom_type == "Polygon"
         ]
         return polygons
-
-    def napari_view(self):
-        """Plot the current slide and the selected tiles in Napari."""
-        slide_path = self.slide_data["slide_path"]
-        zarr_path = self.slide_data["zarr_path"]
-        wsi = open_wsi(slide_path, zarr_path)
-
-        viewer = napari.Viewer()
-
-        viewer.add_image(
-            wsi, 
-            name="slide", 
-            multiscale=True
-        )
-        viewer.add_shapes(
-            self.napari_polygons(),
-            shape_type="polygon",
-            edge_color="red",
-            face_color="red",
-            name="top_tiles",
-        )
-        napari.run()
