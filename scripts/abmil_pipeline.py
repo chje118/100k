@@ -18,6 +18,7 @@ class DiseaseClassification:
         self.slides = list(slides)
         self.cache_path = cache_path
         self._slide_cache = {}
+        self._skipped_slides = []
 
         # Load cache
         if self.cache_path and os.path.exists(self.cache_path):
@@ -127,11 +128,27 @@ class DiseaseClassification:
         if true_labels is not None and len(true_labels) != len(self.slides):
             raise ValueError("true_labels must have same length as slides")
 
+        self._skipped_slides = []
+        processed_count = 0
         for idx, slide_path in enumerate(self.slides):
             true_label = None if true_labels is None else true_labels[idx]
-            self._infer_slide(slide_path, true_label=true_label)
-        
-        print(f"Processed {len(self.slides)} slides. Cache saved to {self.cache_path}.")
+            try:
+                self._infer_slide(slide_path, true_label=true_label)
+                processed_count += 1
+            except Exception as e:
+                self._skipped_slides.append({
+                    "slide_path": slide_path,
+                    "true_label": true_label,
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                })
+                print(f"Skipping slide {slide_path}: {type(e).__name__}: {e}")
+
+        print(
+            f"Processed {processed_count}/{len(self.slides)} slides. Cache saved to {self.cache_path}."
+        )
+        if self._skipped_slides:
+            print(f"Skipped {len(self._skipped_slides)} slides due to errors.")
 
     def attention_heatmap(self, slide_path: str):
         """Plot the attention heatmap for one cached slide."""
