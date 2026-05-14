@@ -36,9 +36,11 @@ class ROISelector:
         top_tiles = tile_table.sort_values("attention", ascending=False).head(self.top_k).copy()
         return gpd.GeoDataFrame(top_tiles, geometry="geometry")
 
-    def zoomed_view(self, margin: int = 0):
+    def zoomed_view(self, margin: int = 0, max_tiles: int = 4):
         """ Plot zoomed tiles (grid) for review from cached slide data. """
-        top_tiles_gdf = self.top_tiles_from_slide_data(self.top_k)
+        top_tiles_gdf = self.top_tiles_from_slide_data()
+        if max_tiles is not None:
+            top_tiles_gdf = top_tiles_gdf.head(max_tiles)
 
         slide_path = self.slide_data["slide_path"]
         zarr_path = self.slide_data["zarr_path"]
