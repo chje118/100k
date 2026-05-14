@@ -76,10 +76,6 @@ class DiseaseClassification:
         pred_idx = int(np.argmax(probs))
         attention = attention.squeeze(1).detach().cpu().numpy()
 
-        # Normalize attention scores to [0, 1]
-        if attention.size and attention.max() > attention.min():
-            attention = (attention - attention.min()) / (attention.max() - attention.min() + 1e-8)
-
         zarr_path = os.path.join(self.zarr_dir, os.path.basename(slide_path).replace(".mrxs", ".zarr"))
         wsi = open_wsi(slide_path, zarr_path)
         wsi.tables[self.feature_key].obs["attention"] = attention
@@ -158,17 +154,35 @@ class DiseaseClassification:
             return None
         
         wsi = open_wsi(slide_path, slide_data["zarr_path"])
-        wsi.tables[slide_data["feature_key"]].obs["attention"] = slide_data["attention"]
+        attention = np.asarray(slide_data["attention"], dtype=float)
+        if attention.size:
+            low, high = np.percentile(attention, [5, 99])
+            if high > low:
+                attention_display = np.clip((attention - low) / (high - low + 1e-8), 0.0, 1.0)
+            else:
+                attention_display = attention.copy()
+        else:
+            attention_display = attention
+
+        print(
+            f"Attention stats for {os.path.basename(slide_path)}: "
+            f"min={attention.min():.4f}, p5={np.percentile(attention, 5):.4f}, "
+            f"median={np.median(attention):.4f}, p99={np.percentile(attention, 99):.4f}, "
+            f"max={attention.max():.4f}"
+        )
+
+        wsi.tables[slide_data["feature_key"]].obs["attention_display"] = attention_display
 
         fig, ax = plt.subplots(figsize=(10, 10))
         zs.pl.tiles(
             wsi,
             tile_key=slide_data["tile_key"],
             feature_key=slide_data["feature_key"],
-            color="attention",
+            color="attention_display",
             cmap="hot",
-            alpha=0.8,
-            show_contours=False,
+            vmin=0,
+            vmax=1,
+            show_contours=True,
             ax=ax,
         )
         ax.set_title(f"Attention heatmap: {os.path.basename(slide_path)}, Predicted: {slide_data['pred_label']} (Conf: {slide_data['confidence']:.2f}), True: {slide_data['true_label']}")
