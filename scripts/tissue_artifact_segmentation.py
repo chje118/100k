@@ -6,6 +6,7 @@ from tqdm import tqdm
 import gc
 from datetime import datetime
 import pickle
+import shutil
 
 def load_big_cache(cache_file):
     if os.path.exists(cache_file):
@@ -38,6 +39,21 @@ def is_empty_array(arr):
             return arr.sum() == 0
         except Exception:
             return len(arr) == 0
+
+def remove_zarr_path(zarr_path):
+    if os.path.isdir(zarr_path):
+        shutil.rmtree(zarr_path)
+    elif os.path.exists(zarr_path):
+        os.remove(zarr_path)
+
+def open_wsi_with_recovery(wsi_path, zarr_path):
+    try:
+        return open_wsi(wsi_path, zarr_path)
+        print(f"Opened WSI with zarr cache: {zarr_path}")
+    except Exception:
+        print(f"Existing zarr at {zarr_path} failed to open; recreating it.")
+        remove_zarr_path(zarr_path)
+        return open_wsi(wsi_path)
 
 class SegmentTissue:
     def __init__(self, wsi_path, local_zarr_dir, version="default"):
