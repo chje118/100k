@@ -46,15 +46,19 @@ def remove_zarr_path(zarr_path):
     elif os.path.exists(zarr_path):
         os.remove(zarr_path)
 
-def open_wsi_with_recovery(wsi_path, zarr_path):
-    try:
-        return open_wsi(wsi_path, zarr_path)
-        print(f"Opened WSI with zarr cache: {zarr_path}")
-    except Exception:
-        print(f"Existing zarr at {zarr_path} failed to open; recreating it.")
-        remove_zarr_path(zarr_path)
-        return open_wsi(wsi_path)
-
+def open_wsi_with_recovery(wsi_paths, zarr_path):
+    for path in wsi_paths:
+        if not os.path.exists(zarr_path):
+            continue
+        try:
+            open_wsi(path, zarr_path)
+            print(f"Opened WSI with zarr cache: {zarr_path}")
+            continue
+        except Exception:
+            print(f"Existing zarr at {zarr_path} failed to open; recreating it.")
+            remove_zarr_path(zarr_path)
+            continue
+        
 class SegmentTissue:
     def __init__(self, wsi_path, local_zarr_dir, version="default"):
         self.wsi_path = wsi_path
