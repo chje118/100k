@@ -46,9 +46,9 @@ def remove_zarr_path(zarr_path):
     elif os.path.exists(zarr_path):
         os.remove(zarr_path)
 
-def open_wsi_with_recovery(wsi_paths):
+def open_wsi_with_recovery(wsi_paths, zarr_dir):
     for path in wsi_paths:
-        zarr_path = path.replace(".mrxs", ".zarr")
+        zarr_path = os.path.join(zarr_dir, os.path.basename(path).replace(".mrxs", ".zarr"))
         if not os.path.exists(zarr_path):
             continue
         try:
