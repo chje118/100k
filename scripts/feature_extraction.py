@@ -188,8 +188,8 @@ class ExtractMany:
         if not os.path.exists(self.csv_path):
             return set()
         try:
-            df_existing = pd.read_csv(self.csv_path, usecols=["wsi_path", "model"])
-            df_existing = df_existing[df_existing["model"] == self.model]
+            df_existing = pd.read_csv(self.csv_path, usecols=["wsi_path", "model", "status"])
+            df_existing = df_existing[df_existing["model"] == self.model & (df_existing["status"] == "feature extraction complete")]
 
             return {os.path.abspath(str(p)) for p in df_existing["wsi_path"].dropna()}
 
