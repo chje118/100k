@@ -229,6 +229,15 @@ class SpatialAgreement:
                 )
         return pd.DataFrame(rows)
 
+    def summary_slide_agreement(self):
+        """
+        Compute summary statistics for agreement rates across all slides.
+        
+        Returns a DataFrame with mean, std, min, 25%, 50%, 75%, max, and count.
+        """
+        df = self.overall_slide_agreement()
+        return df.groupby("comparison")["agreement_rate"].describe()
+
     def boxplot_slide_agreement(self, percent=True):
         """
         Boxplot of slide-level agreement rates across slides.
