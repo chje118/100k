@@ -545,6 +545,37 @@ def plot_roc_curve(all_labels, all_probs):
     plt.show()
 
 
+from sklearn.metrics import precision_recall_curve, average_precision_score
+import numpy as np
+import matplotlib.pyplot as plt
+
+def per_class_pr_curves(all_labels, all_probs, class_names=None):
+    n_classes = all_probs.shape[1]
+    y_true = np.eye(n_classes)[all_labels]  # one-hot
+
+    precisions = {}
+    recalls = {}
+    ap_scores = {}
+
+    for c in range(n_classes):
+        p, r, _ = precision_recall_curve(y_true[:, c], all_probs[:, c])
+        ap = average_precision_score(y_true[:, c], all_probs[:, c])
+        precisions[c] = p
+        recalls[c] = r
+        ap_scores[c] = ap
+
+        name = class_names[c] if class_names is not None else f"class {c}"
+        plt.plot(r, p, label=f"{name} (AP={ap:.3f})")
+
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title("Per-class Precision–Recall curves (OvR)")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    return precisions, recalls, ap_scores
+
 # ========== Training and Evaluation Pipelines ==========
 
 class KFoldPipeline:
