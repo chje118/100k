@@ -280,3 +280,30 @@ class ABMILEvaluation:
             raise ValueError("No matched labels found. Call match_true_labels() first.")
         
         return per_class_pr_curves(self.y_true, self.y_probs)
+
+
+if __name__ == "__main__":
+    """Example usage for running this module directly.
+
+    Update the file paths and column names below to match your data.
+    """
+    # Example: inference on a batch of slides
+    # inference = ABMILInference(
+    #     checkpoint_path="/path/to/checkpoint.pt",
+    #     zarr_dir="/path/to/zarr_cache",
+    #     slides=[
+    #         "/path/to/slide_001.mrxs",
+    #         "/path/to/slide_002.mrxs",
+    #     ],
+    #     cache_path="/path/to/abmil_cache.pkl",
+    # )
+    # inference.process_slides()
+    # results_df = inference.results_dataframe()
+
+    # Example: evaluation against metadata
+    # metadata_df = pd.read_csv("/path/to/metadata.csv")
+    # evaluator = ABMILEvaluation(results_df, metadata_df, true_label_col="diagnosis")
+    # evaluator.match_true_labels(slide_id_col="filename", results_path_col="slide_path")
+    # evaluator.assessment_report()
+    # metrics = evaluator.compute_metrics()
+    # print(metrics)
