@@ -80,9 +80,8 @@ class ROISelector:
         tile_key = self.slide_data["tile_key"]
 
         fig, ax = plt.subplots(figsize=(12, 12))
-        zs.pl.tiles(
+        zs.pl.tissue(
             wsi,
-            tile_key=tile_key,
             ax=ax,
             show_contours=True,
         )
