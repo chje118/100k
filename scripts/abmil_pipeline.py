@@ -6,12 +6,11 @@ import numpy as np
 import pandas as pd
 import torch
 from wsidata import open_wsi
-from abmil import ZarrSlideDataset, load_checkpoint, confusion_matrix_report
+from abmil import ZarrSlideDataset, load_checkpoint, confusion_matrix_report, auc_score, per_class_auc, plot_roc_curve, per_class_pr_curves
 
 
-class DiseaseClassification:
-    """Simple ABMIL workflow for one-slide inference, batch processing, and cache-based reporting."""
-
+class ABMILInference:
+    """ ABMIL inference: predicts slide-level labels from tile features. """
     def __init__(self, checkpoint_path: str, zarr_dir: str, slides: list[str], cache_path: str):
         self.checkpoint_path = checkpoint_path
         self.zarr_dir = zarr_dir
@@ -35,16 +34,9 @@ class DiseaseClassification:
         self.tile_key = self.config.get("tile_key")
         self.idx_to_label = {v: k for k, v in self.label_mapping.items()} if self.label_mapping else {}
 
-    def _label_to_index(self, label):
-        if isinstance(label, (int, np.integer)):
-            return int(label)
-        if label is not None and self.label_mapping and label in self.label_mapping:
-            return int(self.label_mapping[label])
-        return None
-
-    def _single_slide_dataset(self, slide_path: str, label=None):
-        """Build a one-row dataset for a single slide."""
-        df = pd.DataFrame({"slide_path": [slide_path], "label": [label]})
+    def _single_slide_dataset(self, slide_path: str):
+        """ Build a one-row dataset for a single slide. """
+        df = pd.DataFrame({"slide_path": [slide_path], "label": [None]})
         return ZarrSlideDataset(
             df=df,
             filename_col="slide_path",
@@ -56,13 +48,13 @@ class DiseaseClassification:
             seed=None,
         )
 
-    def _infer_slide(self, slide_path: str, true_label = None):
+    def _infer_slide(self, slide_path: str):
         """ Infer one slide once and cache the full result. """
         if slide_path in self._slide_cache:
             return self._slide_cache[slide_path]
 
         # Load features and tile information for one slide.
-        dataset = self._single_slide_dataset(slide_path, label=true_label)
+        dataset = self._single_slide_dataset(slide_path)
         feats, _, _ = dataset[0]
 
         if feats.shape[0] == 0:
@@ -85,7 +77,6 @@ class DiseaseClassification:
         tile_df = wsi.shapes[self.tile_key][["tile_id", "geometry"]].copy()
         tile_table = pd.merge(attention_df, tile_df, on="tile_id", how="inner")
 
-        true_idx = self._label_to_index(true_label)
         slide_data = {
             "slide_path": slide_path,
             "zarr_path": zarr_path,
@@ -96,9 +87,6 @@ class DiseaseClassification:
             "pred_idx": pred_idx,
             "pred_label": self.idx_to_label.get(pred_idx, pred_idx),
             "confidence": float(probs[pred_idx]),
-            "true_idx": true_idx,
-            "true_label": true_label,
-            "is_correct": None if true_idx is None else pred_idx == true_idx,
         }
 
         slide_data.update({f"prob_{self.idx_to_label.get(i, i)}": float(prob) for i, prob in enumerate(probs)})
@@ -119,27 +107,21 @@ class DiseaseClassification:
         with open(input_path, "rb") as f:
             return pickle.load(f)
 
-    def process_slides(self, true_labels: list | None = None):
+    def process_slides(self):
         """ Batch process slides, save cache after each slide. """
-        if true_labels is not None and len(true_labels) != len(self.slides):
-            raise ValueError("true_labels must have same length as slides")
-
         self._skipped_slides = []
         processed_count = 0
-        for idx, slide_path in enumerate(self.slides):
-            true_label = None if true_labels is None else true_labels[idx]
+        for slide_path in self.slides:
             try:
-                self._infer_slide(slide_path, true_label=true_label)
+                self._infer_slide(slide_path)
                 processed_count += 1
             except Exception as e:
                 self._skipped_slides.append({
                     "slide_path": slide_path,
-                    "true_label": true_label,
                     "error_type": type(e).__name__,
                     "error_message": str(e),
                 })
                 print(f"Skipping slide {slide_path}: {type(e).__name__}: {e}")
-
         print(
             f"Processed {processed_count}/{len(self.slides)} slides. Cache saved to {self.cache_path}."
         )
@@ -147,7 +129,7 @@ class DiseaseClassification:
             print(f"Skipped {len(self._skipped_slides)} slides due to errors.")
 
     def attention_heatmap(self, slide_path: str):
-        """Plot the attention heatmap for one cached slide."""
+        """ Plot the attention heatmap for one cached slide. """
         slide_data = self._slide_cache.get(slide_path)
         if not slide_data:
             print(f"No cached data found for slide: {slide_path}")
@@ -185,44 +167,65 @@ class DiseaseClassification:
             show_contours=True,
             ax=ax,
         )
-        ax.set_title(f"Attention heatmap: {os.path.basename(slide_path)}, Predicted: {slide_data['pred_label']} (Conf: {slide_data['confidence']:.2f}), True: {slide_data['true_label']}")
+        ax.set_title(f"Attention heatmap: {os.path.basename(slide_path)}, Predicted: {slide_data['pred_label']} (Conf: {slide_data['confidence']:.2f})")
         ax.axis("off")
         plt.show()
-        
-    def assessment_report(self, true_labels: list | None = None):
-        """ Compute confusion matrix and classification report from cached slides. """
+
+    def results_dataframe(self):
+        """ Get a DataFrame of cached results for all processed slides. """
         if not self._slide_cache:
-            raise ValueError("No cached inference results found. Run inference first.")
-
-        if true_labels is not None and len(true_labels) != len(self.slides):
-            raise ValueError("true_labels must have same length as slides")
-
+            print("No cached results found. Run process_slides() first.")
+            return pd.DataFrame()
+        
         rows = []
-        for idx, slide_path in enumerate(self.slides):
-            cached = self._slide_cache.get(slide_path)
-            if cached is None:
-                continue
-
-            true_idx = cached.get("true_idx")
-            if true_labels is not None:
-                true_idx = self._label_to_index(true_labels[idx])
-
+        for slide_path, cached in self._slide_cache.items():
             rows.append({
                 "slide_path": slide_path,
-                "true_idx": true_idx,
                 "pred_idx": cached.get("pred_idx"),
+                "pred_label": cached.get("pred_label"),
+                "confidence": cached.get("confidence"),
+                **{col: cached.get(col) for col in cached if col.startswith("prob_")},
             })
+        return pd.DataFrame(rows)
 
-        results_df = pd.DataFrame(rows)
+class ABMILEvaluation:
+    """ Evaluates ABMIL inference results by matching predictions with true labels via filenames."""
+    def __init__(self, results_df: pd.DataFrame, metadata_df: pd.DataFrame, true_label_col: str):
+        self.results_df = results_df
+        self.metadata_df = metadata_df
+        self.true_label_col = true_label_col
 
-        if results_df.empty or "true_idx" not in results_df.columns or results_df["true_idx"].isna().all():
-            return {"cm": None, "labels": None, "report_str": None, "results_df": results_df}
+    
+    def assessment_report(self):
+        """Compute confusion matrix and classification report from matched results."""
+        if self.y_true is None or self.y_pred is None:
+            raise ValueError("No matched labels found. Call match_true_labels() first.")
 
-        valid = results_df["true_idx"].notna()
-        y_true = results_df.loc[valid, "true_idx"].astype(int).tolist()
-        y_pred = results_df.loc[valid, "pred_idx"].astype(int).tolist()
+        confusion_matrix_report(self.y_true, self.y_pred)
+        return {"results_df": self.results_df}
 
-        # Call confusion_matrix_report from abmil module (handles printing and plotting)
-        confusion_matrix_report(y_true, y_pred)
+    def confusion_matrix(self):
+        """ Plot confusion matrix. """
+        if self.y_true is None or self.y_pred is None:
+            raise ValueError("No matched labels found. Call match_true_labels() first.")
+        confusion_matrix_report(self.y_true, self.y_pred)
 
-        return {"results_df": results_df}
+    def compute_metrics(self):
+        """Compute AUC and per-class AUC scores."""
+        if self.y_true is None or self.y_probs is None:
+            raise ValueError("No matched labels found. Call match_true_labels() first.")
+        auc = auc_score(self.y_true, self.y_probs)
+        per_class_aucs = per_class_auc(self.y_true, self.y_probs)
+        return {"auc": auc, "per_class_aucs": per_class_aucs}
+
+    def roc_curve(self):
+        """Plot ROC curves."""
+        if self.y_true is None or self.y_probs is None:
+            raise ValueError("No matched labels found. Call match_true_labels() first.")
+        plot_roc_curve(self.y_true, self.y_probs)
+
+    def pr_curves(self):
+        """Plot precision-recall curves."""
+        if self.y_true is None or self.y_probs is None:
+            raise ValueError("No matched labels found. Call match_true_labels() first.")
+        return per_class_pr_curves(self.y_true, self.y_probs)
