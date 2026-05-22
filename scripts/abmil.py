@@ -555,7 +555,8 @@ def per_class_pr_curves(all_labels, all_probs):
     ap_scores = {}
 
     plt.figure(figsize=(8, 6))
-    colors = plt.cm.get_cmap("tab10", n_classes)
+    # Use seaborn 'pastel' palette for consistent visuals across plots
+    colors = sns.color_palette("pastel", n_classes)
 
     for c in range(n_classes):
         p, r, _ = precision_recall_curve(y_true[:, c], all_probs[:, c])
@@ -564,7 +565,8 @@ def per_class_pr_curves(all_labels, all_probs):
         recalls[c] = r
         ap_scores[c] = ap
 
-        plt.plot(r, p, color=colors(c), linewidth=2, label=c)
+        # AP: area under the precision-recall curve, summarizing the tradeoff between precision and recall for this class
+        plt.plot(r, p, color=colors[c], linewidth=2, label=f"Class {c} (AP={ap:.2f})")
 
     plt.xlabel("Recall")
     plt.ylabel("Precision")
