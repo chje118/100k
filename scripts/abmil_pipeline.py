@@ -267,6 +267,35 @@ class ABMILEvaluation:
         per_class_aucs = per_class_auc(self.y_true, self.y_probs)
         return {"auc": auc, "per_class_aucs": per_class_aucs}
 
+    def group_by_metrics(self, group_col: str):
+        """Compute metrics grouped by a metadata column."""
+        if self.matched_df is None or self.matched_df.empty:
+            raise ValueError("No matched labels found. Call match_true_labels() first.")
+        if group_col not in self.metadata_df.columns:
+            raise ValueError(f"Column '{group_col}' not found in metadata_df.")
+
+        grouped_df = self.matched_df.copy()
+        grouped_df["_slide_id"] = grouped_df["slide_path"].apply(self._extract_slide_id)
+        metadata = self.metadata_df[[group_col]].copy()
+        metadata["_slide_id"] = self.metadata_df["filename"].apply(self._extract_slide_id)
+        grouped_df = grouped_df.merge(metadata, on="_slide_id", how="left")
+
+        prob_cols = [col for col in grouped_df.columns if col.startswith("prob_")]
+        rows = []
+        for group_val, group_data in grouped_df.groupby(group_col, dropna=False):
+            probs = group_data[prob_cols].to_numpy() if prob_cols else None
+            rows.append({
+                group_col: group_val,
+                "n_samples": len(group_data),
+                "accuracy": np.mean(group_data[self.true_label_col].values == group_data["pred_label"].values),
+                "auc": auc_score(group_data[self.true_label_col].values, probs) if probs is not None and probs.shape[1] > 1 else np.nan,
+            })
+
+        group_metrics_df = pd.DataFrame(rows)
+        print(f"\nPer-group metrics grouped by '{group_col}':")
+        print(group_metrics_df.to_string(index=False))
+        return group_metrics_df
+    
     def roc_curve(self):
         """ Plot ROC curves. """
         if self.y_true is None or self.y_probs is None:
@@ -280,6 +309,9 @@ class ABMILEvaluation:
             raise ValueError("No matched labels found. Call match_true_labels() first.")
         
         return per_class_pr_curves(self.y_true, self.y_probs)
+    
+    # TODO method to plot all roc curves ovr as the pr curves (same plot, different colors)
+
 
 
 if __name__ == "__main__":
