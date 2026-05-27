@@ -7,6 +7,8 @@ import pandas as pd
 import torch
 from wsidata import open_wsi
 from abmil import ZarrSlideDataset, load_checkpoint, confusion_matrix_report, auc_score, per_class_auc, plot_roc_curve, per_class_pr_curves
+from sklearn.metrics import roc_curve, roc_auc_score
+import seaborn as sns
 
 
 class ABMILInference:
@@ -310,7 +312,32 @@ class ABMILEvaluation:
         
         return per_class_pr_curves(self.y_true, self.y_probs)
     
-    # TODO method to plot all roc curves ovr as the pr curves (same plot, different colors)
+    def roc_curves_all(self):
+        """ Plot all per-class ROC curves (one-vs-rest) on one figure with distinct colors. """
+        if self.y_true is None or self.y_probs is None:
+            raise ValueError("No matched labels found. Call match_true_labels() first.")
+        
+        n_classes = self.y_probs.shape[1]
+        y_true_onehot = np.eye(n_classes)[self.y_true]  # one-hot encoding
+                
+        plt.figure(figsize=(8, 6))
+        colors = sns.color_palette("pastel", n_classes)
+        
+        for c in range(n_classes):
+            fpr, tpr, _ = roc_curve(y_true_onehot[:, c], self.y_probs[:, c])
+            roc_auc = roc_auc_score(y_true_onehot[:, c], self.y_probs[:, c])
+            plt.plot(fpr, tpr, color=colors[c], linewidth=2, label=f"Class {c} (AUC={roc_auc:.4f})")
+        
+        # Plot diagonal (random classifier)
+        plt.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=1, label="Random")
+        plt.xlabel("False Positive Rate")
+        plt.ylabel("True Positive Rate")
+        plt.title("Per-class ROC Curves (One-vs-Rest)")
+        plt.legend(title="Classes", loc="lower right")
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.tight_layout()
+        plt.show()
 
 
 
