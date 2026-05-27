@@ -585,7 +585,6 @@ class KFoldPipeline:
         pipeline = KFoldPipeline(df, 'path_col', 'label_col', 'features_key', 'tiles_key', 'zarr_dir')
         results = pipeline.kfold_cross_validation(n_splits=5, n_epochs=100, max_tiles=5000)
         pipeline.print_results()
-        pipeline.plot_fold_distribution()
     """
     
     def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir):
