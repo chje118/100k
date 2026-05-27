@@ -565,7 +565,6 @@ def per_class_pr_curves(all_labels, all_probs):
         recalls[c] = r
         ap_scores[c] = ap
 
-        # AP: area under the precision-recall curve, summarizing the tradeoff between precision and recall for this class
         plt.plot(r, p, color=colors[c], linewidth=2, label=f"Class {c} (AP={ap:.2f})")
 
     plt.xlabel("Recall")
