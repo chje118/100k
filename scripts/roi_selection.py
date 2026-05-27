@@ -5,7 +5,6 @@ import numpy as np
 import pandas as pd
 from wsidata import open_wsi
 import geopandas as gpd
-import napari
 
 class ROISelector:
     """ Handle ROI selection from cached ABMIL inference results. """
@@ -70,6 +69,33 @@ class ROISelector:
         for j in range(len(top_tiles_gdf), len(axes)):
             axes[j].axis("off")
 
+        plt.tight_layout()
+        plt.show()
+
+    def tiles_to_cut(self):
+        """ Plot the full slide and highlight the top-k tiles to cut. """
+        top_tiles_gdf = self.top_tiles_from_slide_data()
+        selected_tiles = top_tiles_gdf[top_tiles_gdf.geometry.notna()].copy()
+        wsi = self.get_wsi()
+        tile_key = self.slide_data["tile_key"]
+
+        fig, ax = plt.subplots(figsize=(12, 12))
+        zs.pl.tissue(
+            wsi,
+            ax=ax,
+            show_contours=True,
+        )
+        selected_tiles.plot(
+            ax=ax,
+            facecolor="#ff2d2d",
+            edgecolor="#b30000",
+            linewidth=1.5,
+            alpha=0.35,
+        )
+        selected_tiles.boundary.plot(ax=ax, color="#7f0000", linewidth=1.0)
+
+        ax.set_title(f"Top {len(selected_tiles)} tiles selected for cutting")
+        ax.axis("off")
         plt.tight_layout()
         plt.show()
 

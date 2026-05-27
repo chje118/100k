@@ -49,7 +49,7 @@ class SlideClassification:
     def get_similarity_adata(self):
         return self.wsi[self.SIMILARITY_KEY]
 
-    def get_MIL_scores(self, k: int = 10, agg_method="mean"):
+    def get_similarity_scores(self, k: int = 10, agg_method="mean"):
         sim_adata = self.get_similarity_adata()
         k_eff = min(k, sim_adata.n_obs)
         scores = zs.metrics.topk_score(sim_adata, k=k_eff, agg_method=agg_method)
@@ -105,11 +105,11 @@ class ClassifyMany:
         print("Embedding class prompts...")
         self.text_embeddings = zs.tl.text_embedding(self.classes, model=self.model)
 
-    def run_MIL(self, k: int = 10):
+    def run_classification(self, k: int = 10):
         slide_scores = {}
         valid_slides = set()
 
-        # ---- Compute MIL scores for each slide ----
+        # ---- Compute scores for each slide ----
         for wsi_path in tqdm(self.wsi_paths):
             slide_id = os.path.basename(wsi_path).replace(".mrxs", "")
             try:
@@ -127,7 +127,7 @@ class ClassifyMany:
             except Exception as e:
                 print(f"Skipping {slide_id}: {e}")
 
-        # ---- Convert MIL scores to DataFrame ----
+        # ---- Convert scores to DataFrame ----
         self.results_df = pd.DataFrame(slide_scores).T.astype(float)
 
         # ---- Prepare dataset for aggregation ----
@@ -159,7 +159,7 @@ class ClassifyMany:
         except Exception as e:
             raise RuntimeError(f"Aggregation failed: {e}")
 
-        # ---- Join MIL scores ----
+        # ---- Join scores ----
         self.agg_data.obs = self.agg_data.obs.join(
             self.results_df,
             on="Tissue Sample Id"

@@ -14,6 +14,7 @@ from torch.utils.data import Dataset, DataLoader
 from wsidata import open_wsi
 from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score, roc_curve
 from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.metrics import precision_recall_curve, average_precision_score
 import seaborn as sns
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -544,6 +545,34 @@ def plot_roc_curve(all_labels, all_probs):
     plt.tight_layout()
     plt.show()
 
+def per_class_pr_curves(all_labels, all_probs):
+    """ Plot all per-class PR curves on one figure with distinct colors and class legend. """
+    n_classes = all_probs.shape[1]
+    y_true = np.eye(n_classes)[all_labels]  # one-hot
+
+    precisions = {}
+    recalls = {}
+    ap_scores = {}
+
+    plt.figure(figsize=(8, 6))
+    # Use seaborn 'pastel' palette for consistent visuals across plots
+    colors = sns.color_palette("pastel", n_classes)
+
+    for c in range(n_classes):
+        p, r, _ = precision_recall_curve(y_true[:, c], all_probs[:, c])
+        ap = average_precision_score(y_true[:, c], all_probs[:, c])
+        precisions[c] = p
+        recalls[c] = r
+        ap_scores[c] = ap
+
+        plt.plot(r, p, color=colors[c], linewidth=2, label=f"Class {c} (AP={ap:.2f})")
+
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title("Per-class Precision–Recall curves (OvR)")
+    plt.legend(title="Classes")
+    plt.tight_layout()
+    plt.show()
 
 # ========== Training and Evaluation Pipelines ==========
 
@@ -555,7 +584,6 @@ class KFoldPipeline:
         pipeline = KFoldPipeline(df, 'path_col', 'label_col', 'features_key', 'tiles_key', 'zarr_dir')
         results = pipeline.kfold_cross_validation(n_splits=5, n_epochs=100, max_tiles=5000)
         pipeline.print_results()
-        pipeline.plot_fold_distribution()
     """
     
     def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir):

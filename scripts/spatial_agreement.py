@@ -229,60 +229,11 @@ class SpatialAgreement:
                 )
         return pd.DataFrame(rows)
 
-    def boxplot_slide_agreement(self, percent=True):
+    def summary_slide_agreement(self):
         """
-        Boxplot of slide-level agreement rates across slides.
-        """
-        df = self.overall_slide_agreement()
+        Compute summary statistics for agreement rates across all slides.
         
-        if percent:
-            df = df.copy()
-            df["agreement_rate"] = 100.0 * df["agreement_rate"]
-            ylab = "Agreement (%)"
-        else:
-            ylab = "Agreement"
-
-        fig, ax = plt.subplots(figsize=(6, 5))
-        
-        sns.boxplot(data=df, x="comparison", y="agreement_rate")
-        ax.set_xlabel("")
-        ax.set_ylabel(ylab)
-        ax.tick_params(axis="x", rotation=45)
-        plt.tight_layout()
-        plt.show()
-        
-    def stripplot_slide_agreement(self, percent=True):
-        """
-        Stripplot of slide-level agreement rates (one point per slide per comparison).
+        Returns a DataFrame with mean, std, min, 25%, 50%, 75%, max, and count.
         """
         df = self.overall_slide_agreement()
-        if percent:
-            df = df.copy()
-            df["agreement_rate"] = 100.0 * df["agreement_rate"]
-            ylab = "Agreement (%)"
-        else:
-            ylab = "Agreement"
-
-        fig, ax = plt.subplots(figsize=(6, 5))
-        
-        sns.boxplot(
-            data=df,
-            x="comparison",
-            y="agreement_rate",
-            ax=ax,
-            width=0.5,
-        )
-        sns.stripplot(
-            data=df,
-            x="comparison",
-            y="agreement_rate",
-            jitter=False,
-            size=5,
-            alpha=0.7,
-            ax=ax,
-        )
-        ax.set_xlabel("")
-        ax.set_ylabel(ylab)
-        ax.tick_params(axis="x", rotation=45)
-        plt.tight_layout()
-        plt.show()
+        return df.groupby("comparison")["agreement_rate"].describe()
