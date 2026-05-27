@@ -55,8 +55,8 @@ def open_wsi_with_recovery(wsi_paths, zarr_dir):
             open_wsi(path, zarr_path)
             print(f"Opened WSI with zarr cache: {zarr_path}")
             continue
-        except Exception:
-            print(f"Existing zarr at {zarr_path} failed to open; recreating it.")
+        except Exception as e:
+            print(f"Existing zarr at {zarr_path} failed to open: {e}; removing it.")
             remove_zarr_path(zarr_path)
             continue
 
@@ -266,14 +266,14 @@ class SegmentMany:
             version = self.version
             key = (slide_name, category, version)
 
-            if key in self.processed:
-                status = self.processed[key]
-                if status == "complete":
-                    print(f"Skipping {slide_name} ({category} {version}) — already successfully processed")
-                    continue
-                elif status.startswith("error:"):
-                    print(f"Skipping {slide_name} ({category} {version}) — previously failed: {status}")
-                    continue
+            #if key in self.processed:
+             #   status = self.processed[key]
+              #  if status == "complete":
+               #     print(f"Skipping {slide_name} ({category} {version}) — already successfully processed")
+                #    continue
+             #   elif status.startswith("error:"):
+              #      print(f"Skipping {slide_name} ({category} {version}) — previously failed: {status}")
+               #     continue
 
             try:
                 if category == "tissue":
