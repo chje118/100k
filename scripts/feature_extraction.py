@@ -126,19 +126,31 @@ class ExtractFeatures:
     def extract_features(self):
         try:
             if self.FEATURE_KEY not in self.wsi.tables:
-                start_time = datetime.now()
-                zs.tl.feature_extraction(
-                    self.wsi,
-                    model=self.model_name,
-                    tile_key=self.TILE_KEY,
-                    key_added=self.FEATURE_KEY,
-                    device="cuda" if torch.cuda.is_available() else 'cpu',
-                    amp=torch.cuda.is_available(),
-                    autocast_dtype=self.feature_autocast_dtype,
-                    batch_size=self.feature_batch_size,  # Larger batches keep the H100 busy
-                    num_workers=self.feature_num_workers,  # Overlap host preprocessing with GPU work
-                    )
-                self.elapsed_time = datetime.now() - start_time
+                if self.model_name == "conch":
+                    start_time = datetime.now()
+                    zs.tl.feature_extraction(
+                        self.wsi,
+                        model=self.model_name,
+                        tile_key=self.TILE_KEY,
+                        key_added=self.FEATURE_KEY,
+                        device='cpu',
+                        num_workers=self.feature_num_workers,  # Overlap host preprocessing with GPU work
+                        )
+                    self.elapsed_time = datetime.now() - start_time
+                else:                 
+                    start_time = datetime.now()
+                    zs.tl.feature_extraction(
+                        self.wsi,
+                        model=self.model_name,
+                        tile_key=self.TILE_KEY,
+                        key_added=self.FEATURE_KEY,
+                        device="cuda" if torch.cuda.is_available() else 'cpu',
+                        amp=torch.cuda.is_available(),
+                        autocast_dtype=self.feature_autocast_dtype,
+                        batch_size=self.feature_batch_size,  # Larger batches keep the H100 busy
+                        num_workers=self.feature_num_workers,  # Overlap host preprocessing with GPU work
+                        )
+                    self.elapsed_time = datetime.now() - start_time
             
             self.wsi.write(self.zarr_path)
             return self.wsi
@@ -188,8 +200,8 @@ class ExtractMany:
         if not os.path.exists(self.csv_path):
             return set()
         try:
-            df_existing = pd.read_csv(self.csv_path, usecols=["wsi_path", "model", "status"])
-            df_existing = df_existing[df_existing["model"] == self.model & (df_existing["status"] == "feature extraction complete")]
+            df_existing = pd.read_csv(self.csv_path, usecols=["wsi_path", "model"])
+            df_existing = df_existing[df_existing["model"] == self.model]
 
             return {os.path.abspath(str(p)) for p in df_existing["wsi_path"].dropna()}
 
