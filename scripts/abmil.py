@@ -10,6 +10,7 @@ import os
 import torch
 import torch.nn as nn
 import numpy as np
+import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from wsidata import open_wsi
 from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score, roc_curve
@@ -247,7 +248,7 @@ def create_label_mapping(df, label_col):
 # ========= Training and Validation Functions ==========
 
 def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epochs=10, 
-        early_stopping_patience=None, seed=None):
+    early_stopping_patience=None, seed=None, return_best_epoch=False):
     """
     Train ABMIL model with optional early stopping for best AUC comparability.
     
@@ -301,6 +302,7 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
     best_auc = -1.0
     epochs_no_improve = 0
     best_model_state = None
+    best_epoch = 0
     
     # Training Loop
     for epoch in tqdm(range(n_epochs), desc="Epochs"):
@@ -347,6 +349,7 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
             if val_auc > best_auc:
                 best_auc = val_auc
                 epochs_no_improve = 0
+                best_epoch = epoch + 1
                 # Use deep copy to avoid shallow copy issues where tensors may drift during training
                 best_model_state = copy.deepcopy(model.state_dict())
                 print(" (improved)", end="")
@@ -361,6 +364,13 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
                 break
         
         print()
+
+    # If no improvement found during training, set n_epochs as best_epoch for retraining on 100% of data
+    if val_dataset is not None and early_stopping_patience is not None and best_epoch == 0:
+        best_epoch = n_epochs
+
+    if return_best_epoch:
+        return model, best_model_state, best_epoch
 
     return model, best_model_state
 
@@ -575,6 +585,157 @@ def per_class_pr_curves(all_labels, all_probs):
     plt.show()
 
 # ========== Training and Evaluation Pipelines ==========
+
+class TrainABMILPipeline:
+    """ Train ABMIL with validation, then retrain on 100% of slides for the best epoch count. """
+
+    def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir, save_path):
+        self.df = df.copy()
+        self.filename_col = filename_col
+        self.label_col = label_col
+        self.feature_key = feature_key
+        self.tile_key = tile_key
+        self.zarr_dir = zarr_dir
+        self.save_path = save_path
+        self.label_mapping = create_label_mapping(self.df, self.label_col)
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        self.train_df = None
+        self.model = None
+        self.best_epoch = None
+        self.max_tiles = None
+        self.n_epochs = None
+        self.seed = None
+        self.validation_fraction = None
+        self.early_stopping_patience = None
+
+        print(f"TrainABMILPipeline initialized with {len(self.df)} slides on device: {self.device}")
+
+    def validate_slides(self):
+        """ Filter out slides that cannot be loaded. """
+        len_before = len(self.df)
+        print(f"\nValidating {len_before} slides...")
+        
+        temp_dataset = ZarrSlideDataset(
+            df=self.df,
+            filename_col=self.filename_col,
+            label_col=self.label_col,
+            feature_key=self.feature_key,
+            tile_key=self.tile_key,
+            zarr_dir=self.zarr_dir,
+        )
+
+        _, valid_indices = validate_dataset(temp_dataset)
+        self.df = self.df.iloc[valid_indices].reset_index(drop=True)
+        print(f"Validation complete: {len(self.df)} valid slides (removed {len_before - len(self.df)})")
+        return self.df
+
+    def train_abmil(self, max_tiles=50000, n_epochs=100, seed=42, validation_fraction=0.10, early_stopping_patience=5):
+        """ Fit on a 90/10 split and record the best epoch. """
+        self.max_tiles = max_tiles
+        self.n_epochs = n_epochs
+        self.seed = seed
+        self.validation_fraction = validation_fraction
+        self.early_stopping_patience = early_stopping_patience
+
+        df = self.df.copy()
+        df[self.label_col] = df[self.label_col].map(self.label_mapping).astype(int)
+
+        train_df, val_df = train_test_split(
+            df,
+            test_size=validation_fraction,
+            stratify=df[self.label_col],
+            random_state=seed,
+        )
+
+        train_dataset = ZarrSlideDataset(
+            df=train_df,
+            filename_col=self.filename_col,
+            label_col=self.label_col,
+            feature_key=self.feature_key,
+            tile_key=self.tile_key,
+            zarr_dir=self.zarr_dir,
+            max_tiles=max_tiles,
+            seed=seed,
+        )
+
+        val_dataset = ZarrSlideDataset(
+            df=val_df,
+            filename_col=self.filename_col,
+            label_col=self.label_col,
+            feature_key=self.feature_key,
+            tile_key=self.tile_key,
+            zarr_dir=self.zarr_dir,
+            max_tiles=max_tiles,
+            seed=seed,
+        )
+
+        self.model, _, self.best_epoch = train_ABMIL(
+            train_df=train_df,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            label_col=self.label_col,
+            n_epochs=n_epochs,
+            early_stopping_patience=early_stopping_patience,
+            seed=seed,
+            return_best_epoch=True,
+        )
+
+        return self.model, self.best_epoch
+
+    def save_abmil(self):
+        """ Retrain on 100% of slides for best_epoch epochs and save the checkpoint. """
+        
+        full_dataset = ZarrSlideDataset(
+            df=self.train_df,
+            filename_col=self.filename_col,
+            label_col=self.label_col,
+            feature_key=self.feature_key,
+            tile_key=self.tile_key,
+            zarr_dir=self.zarr_dir,
+            max_tiles=self.max_tiles,
+            seed=self.seed,
+        )
+
+        self.model, _ = train_ABMIL(
+            train_df=self.train_df,
+            train_dataset=full_dataset,
+            val_dataset=None,
+            label_col=self.label_col,
+            n_epochs=self.best_epoch,
+            early_stopping_patience=None,
+            seed=self.seed,
+        )
+
+        self.config = {
+            "in_dim": self.model.classifier.in_features,
+            "n_classes": self.model.classifier.out_features,
+            "hidden_dim": self.model.attn[0].out_features,
+            "feature_key": self.feature_key,
+            "tile_key": self.tile_key,
+            "max_tiles": self.max_tiles,
+            "n_epochs": self.best_epoch,
+            "seed": self.seed,
+            "validation_fraction": self.validation_fraction,
+            "early_stopping_patience": self.early_stopping_patience,
+            "best_epoch": self.best_epoch,
+        }
+
+        os.makedirs(os.path.dirname(self.save_path) or ".", exist_ok=True)
+        save_checkpoint(self.model, self.config, self.label_mapping, self.save_path)
+       
+        return self.model, self.label_mapping, self.save_path
+
+    def run_pipeline(self, max_tiles=50000, n_epochs=10, seed=42, validation_fraction=0.10, early_stopping_patience=5):
+        self.validate_slides()
+        self.train_abmil(
+            max_tiles=max_tiles,
+            n_epochs=n_epochs,
+            seed=seed,
+            validation_fraction=validation_fraction,
+            early_stopping_patience=early_stopping_patience,
+        )
+        return self.save_abmil()
 
 class KFoldPipeline:
     """
