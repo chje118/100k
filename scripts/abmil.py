@@ -67,7 +67,13 @@ class ZarrSlideDataset(Dataset):
             feats = feats[indices]
             tile_ids = tile_ids[indices] 
         
-        label = torch.tensor(row[self.label_col]).long() # slide label as a long integer (for classification)
+        # Safely handle missing/None labels (inference uses label=None)
+        label_val = row.get(self.label_col) if isinstance(row, (dict,)) else row[self.label_col]
+        if label_val is None:
+            # Return a dummy label tensor for compatibility with training/evaluation pipelines
+            label = torch.tensor(0, dtype=torch.long)
+        else:
+            label = torch.tensor(int(label_val), dtype=torch.long)
 
         return feats, tile_ids, label
 
@@ -683,28 +689,28 @@ class TrainABMILPipeline:
 
         return self.model, self.best_epoch
 
-    def save_abmil(self):
+    def save_abmil(self, max_tiles=50000, n_epochs=100, seed=42):
         """ Retrain on 100% of slides for best_epoch epochs and save the checkpoint. """
         
         full_dataset = ZarrSlideDataset(
-            df=self.train_df,
+            df=self.df,
             filename_col=self.filename_col,
             label_col=self.label_col,
             feature_key=self.feature_key,
             tile_key=self.tile_key,
             zarr_dir=self.zarr_dir,
-            max_tiles=self.max_tiles,
-            seed=self.seed,
+            max_tiles=max_tiles,
+            seed=seed,
         )
 
         self.model, _ = train_ABMIL(
-            train_df=self.train_df,
+            train_df=self.df,
             train_dataset=full_dataset,
             val_dataset=None,
             label_col=self.label_col,
-            n_epochs=self.best_epoch,
+            n_epochs=self.best_epoch if n_epochs is None else n_epochs,
             early_stopping_patience=None,
-            seed=self.seed,
+            seed=seed,
         )
 
         self.config = {
@@ -713,12 +719,9 @@ class TrainABMILPipeline:
             "hidden_dim": self.model.attn[0].out_features,
             "feature_key": self.feature_key,
             "tile_key": self.tile_key,
-            "max_tiles": self.max_tiles,
-            "n_epochs": self.best_epoch,
-            "seed": self.seed,
-            "validation_fraction": self.validation_fraction,
-            "early_stopping_patience": self.early_stopping_patience,
-            "best_epoch": self.best_epoch,
+            "max_tiles": max_tiles,
+            "n_epochs": self.best_epoch if n_epochs is None else n_epochs,
+            "seed": seed,
         }
 
         os.makedirs(os.path.dirname(self.save_path) or ".", exist_ok=True)
