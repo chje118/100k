@@ -21,8 +21,15 @@ class ABMILInference:
         self._slide_cache = {}
         self._skipped_slides = []
 
-        # Load cache
-        if self.cache_path and os.path.exists(self.cache_path):
+        # Ensure cache file exists (create empty cache if missing) and load it
+        if self.cache_path:
+            cache_dir = os.path.dirname(self.cache_path) or "."
+            os.makedirs(cache_dir, exist_ok=True)
+            if not os.path.exists(self.cache_path):
+                # create an empty cache file
+                with open(self.cache_path, "wb") as f:
+                    pickle.dump({}, f)
+
             loaded_cache = self.load_cache(self.cache_path)
             if isinstance(loaded_cache, dict) and "slide_cache" in loaded_cache:
                 self._slide_cache = loaded_cache.get("slide_cache", {})
@@ -49,6 +56,52 @@ class ABMILInference:
             max_tiles=None,
             seed=None,
         )
+
+    def validate_slides(self, verbose: bool = True):
+        """Validate all slides in `self.slides`.
+
+        Checks that the zarr file can be opened, the requested `feature_key`
+        and `tile_key` exist, and that the feature array is not empty.
+
+        Populates `self._skipped_slides` with error info and returns a list
+        of valid slide paths.
+        """
+        valid = []
+        self._skipped_slides = []
+
+        for slide_path in self.slides:
+            try:
+                zarr_path = os.path.join(self.zarr_dir, os.path.basename(slide_path).replace(".mrxs", ".zarr"))
+                if not os.path.exists(zarr_path):
+                    raise FileNotFoundError(f"Zarr path not found: {zarr_path}")
+
+                wsi = open_wsi(slide_path, zarr_path)
+
+                # feature table exists and non-empty
+                if self.feature_key not in wsi.tables:
+                    raise KeyError(f"Feature key '{self.feature_key}' not found in zarr tables")
+                feats = wsi.tables[self.feature_key].X
+                if feats is None or getattr(feats, 'size', 0) == 0:
+                    raise ValueError("Empty feature array")
+
+                # tile table exists
+                if self.tile_key not in wsi.shapes:
+                    raise KeyError(f"Tile key '{self.tile_key}' not found in zarr shapes")
+
+                valid.append(slide_path)
+            except Exception as e:
+                self._skipped_slides.append({
+                    "slide_path": slide_path,
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                })
+                if verbose:
+                    print(f"Skipping slide {slide_path}: {type(e).__name__}: {e}")
+
+        if verbose:
+            print(f"Validation complete: {len(valid)}/{len(self.slides)} valid slides; {len(self._skipped_slides)} skipped.")
+
+        return valid
 
     def _infer_slide(self, slide_path: str):
         """ Infer one slide once and cache the full result. """
@@ -99,6 +152,12 @@ class ABMILInference:
 
     def save_cache(self):
         """ Save the full slide cache to a pickle file. """
+        if not self.cache_path:
+            return self._slide_cache
+
+        cache_dir = os.path.dirname(self.cache_path) or "."
+        os.makedirs(cache_dir, exist_ok=True)
+
         with open(self.cache_path, "wb") as f:
             pickle.dump(self._slide_cache, f)
         return self._slide_cache
@@ -109,11 +168,20 @@ class ABMILInference:
         with open(input_path, "rb") as f:
             return pickle.load(f)
 
-    def process_slides(self):
-        """ Batch process slides, save cache after each slide. """
-        self._skipped_slides = []
+    def process_slides(self, validate: bool = True):
+        """Batch process slides, save cache after each slide.
+
+        If `validate` is True (default), run `validate_slides()` first and only
+        process slides that passed validation.
+        """
+        # Optionally validate slides first
+        slides_to_process = self.slides
+        if validate:
+            valid = self.validate_slides(verbose=True)
+            slides_to_process = valid
+
         processed_count = 0
-        for slide_path in self.slides:
+        for slide_path in slides_to_process:
             try:
                 self._infer_slide(slide_path)
                 processed_count += 1
@@ -124,9 +192,8 @@ class ABMILInference:
                     "error_message": str(e),
                 })
                 print(f"Skipping slide {slide_path}: {type(e).__name__}: {e}")
-        print(
-            f"Processed {processed_count}/{len(self.slides)} slides. Cache saved to {self.cache_path}."
-        )
+
+        print(f"Processed {processed_count}/{len(slides_to_process)} slides. Cache saved to {self.cache_path}.")
         if self._skipped_slides:
             print(f"Skipped {len(self._skipped_slides)} slides due to errors.")
 
