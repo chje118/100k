@@ -24,10 +24,14 @@ import glob
 import copy
 import random
 
-# ========== Dataset and Model Definitions ==========
+# ----------------------------------------
+# Dataset definition
+# ----------------------------------------
 
 class ZarrSlideDataset(Dataset):
-    def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir, max_tiles=None, seed=None):
+    """ PyTorch Dataset for loading WSI features from Zarr files. """
+
+    def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir, max_tiles=None, seed=None, require_labels = True):
         self.df = df.reset_index(drop=True)
         self.filename_col = filename_col
         self.label_col = label_col
@@ -35,8 +39,9 @@ class ZarrSlideDataset(Dataset):
         self.tile_key = tile_key
         self.zarr_dir = zarr_dir
         self.max_tiles = max_tiles  # Maximum number of tiles per slide (None = no limit)
-        self.seed = seed  # Seed for deterministic tile sampling (if max_tiles is set)
-    
+        self.seed = seed    # Seed for deterministic tile sampling (if max_tiles is set)
+        self.require_labels = require_labels # labels required for training/evaluation; if False, label can be None (e.g., inference)
+
     def __len__(self):
         return len(self.df)
 
@@ -51,7 +56,7 @@ class ZarrSlideDataset(Dataset):
 
         feats = torch.from_numpy(adata.X).float() # tile features as a PyTorch tensor
         tile_ids = np.array(adata.obs['tile_id']) # save tile IDs for visualization
-        
+
         # Apply max_tiles limit with deterministic, norm-biased sampling
         if self.max_tiles is not None and feats.shape[0] > self.max_tiles:
             if self.seed is not None:
@@ -59,7 +64,7 @@ class ZarrSlideDataset(Dataset):
             else:
                 local_rng = np.random.RandomState(idx)
 
-            # Slightly bias sampling toward high-information tiles
+            # Slight sampling bias toward high-information tiles
             norms = torch.linalg.norm(feats, dim=1).cpu().numpy()
             probs = norms / norms.sum() if norms.sum() > 0 else None
 
@@ -67,28 +72,39 @@ class ZarrSlideDataset(Dataset):
             feats = feats[indices]
             tile_ids = tile_ids[indices] 
         
-        # Safely handle missing/None labels (inference uses label=None)
-        label_val = row.get(self.label_col) if isinstance(row, (dict,)) else row[self.label_col]
-        if label_val is None:
-            # Return a dummy label tensor for compatibility with training/evaluation pipelines
-            label = torch.tensor(0, dtype=torch.long)
-        else:
+        # Handle missing labels (inference uses label=none)
+        if self.require_labels:
+            label_val = row[self.label_col]
+            if pd.isna(label_val):
+                raise ValueError(f"Missing label for slide: {slide_path}")
             label = torch.tensor(int(label_val), dtype=torch.long)
+        else:
+            label = None
 
         return feats, tile_ids, label
 
+# ----------------------------------------
+# Model definition
+# ----------------------------------------
+
 class ABMIL(nn.Module):
+    """ Attention-Based Multiple Instance Learning for WSI Classification. """
     def __init__(self, in_dim, n_classes, hidden_dim=256, n_heads=4):
         """
         in_dim: feature size per tile (e.g. 512, 768, 1024)
         n_classes: number of output classes
         hidden_dim: size of attention hidden layer
-        n_heads: number of attention heads (default=1 for single-head attention)
+        n_heads: number of attention heads
         """
         super().__init__()
 
+        self.in_dim = in_dim
+        self.n_classes = n_classes
+        self.hidden_dim = hidden_dim
+        self.n_heads = n_heads
+
         # Attention mechanism, producing one attention score per tile
-        # Gated attention, A = V * U (tanh * sigmoid)
+        # Gated attention: A = V * U (tanh * sigmoid)
         self.attn_V = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.Tanh()
@@ -113,7 +129,7 @@ class ABMIL(nn.Module):
         - logits: used for training (CrossEntropyLoss)
         - A: attention weights (for interpretability)
         """
-        # Compute attention scores
+        # Compute attention scores: A = V * U (gated attention)
         V = self.attn_V(x)      # [n_tiles, hidden_dim] (tanh)
         U = self.attn_U(x)      # [n_tiles, hidden_dim] (sigmoid)
         H = V * U               # elementwise gating
@@ -131,7 +147,9 @@ class ABMIL(nn.Module):
 
         return logits, A
 
-# ========= Helper Functions for Training and Evaluation ==========
+# ----------------------------------------
+# Helper functions
+# ----------------------------------------
 
 def set_seed(seed):
     """ Set seeds for reproducibility.
@@ -172,17 +190,17 @@ def validate_dataset(dataset):
     
     return filtered_dataset, valid_indices
 
-def _create_dataloader(dataset, batch_size=1, shuffle=False, device=None, worker_init_fn=None):
-    """ Create DataLoader with standard configuration. """
-    kwargs = {"batch_size": batch_size, "shuffle": shuffle}
-    if worker_init_fn is not None:
-        kwargs["worker_init_fn"] = worker_init_fn
-    if isinstance(device, str) and device.startswith("cuda"):
-        kwargs["pin_memory"] = True
-    return DataLoader(dataset, **kwargs)
+def require_cuda():
+    """ Raise an error if CUDA is not available. """
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for this ABMIL pipeline, but no CUDA device is available.")
+    return "cuda"
 
 def _configure_gpu_optimization():
-    """Configure GPU for modern CUDA GPUs."""
+    """
+    Enable optional CUDA performance settings for training/inference on 
+    supported NVIDIA GPUs.
+    """
     if not torch.cuda.is_available():
         return
     try:
@@ -194,37 +212,19 @@ def _configure_gpu_optimization():
     if hasattr(torch.backends.cuda, "cudnn"):
         torch.backends.cuda.cudnn.allow_tf32 = True
 
-def _preprocess_batch(feats, tile_ids, label, device):
-    """ Preprocess batch tensors before forward pass. """
-    if feats.dim() == 3:
-        feats = feats.squeeze(0)
-    if tile_ids.ndim == 2:
-        tile_ids = tile_ids.squeeze(0)
-    feats = feats.to(device, non_blocking=True)
-    label = label.to(device, non_blocking=True)
-    return feats, tile_ids, label
-
 def save_checkpoint(model, config, label_mapping, path):
+    """ Save model checkpoint with configuration and label mapping. """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     checkpoint = {
         "model_state_dict": model.state_dict(),
-        "config": config,  # model + dataset config
+        "config": config,
         "label_mapping": label_mapping,
     }
     torch.save(checkpoint, path)
     print(f"Saved checkpoint to {path}")
 
 def load_checkpoint(path):
-    """
-    Load a checkpoint with model, config, and label mapping.
-    
-    Parameters:
-    - path: Path to checkpoint file
-    
-    Returns:
-    - model: Loaded ABMIL model
-    - config: Dictionary with model and dataset configuration
-    - label_mapping: Dictionary mapping label strings to class indices
-    """
+    """ Load a checkpoint with model, config, and label mapping. """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     checkpoint = torch.load(path, map_location=device, weights_only=False)
 
@@ -236,36 +236,29 @@ def load_checkpoint(path):
         in_dim=config["in_dim"],
         n_classes=config["n_classes"],
         hidden_dim=config["hidden_dim"],
+        n_heads=config["n_heads"]
     ).to(device)
 
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
     print(f"Loaded checkpoint from {path}")
-    print(f"Model config: in_dim={config['in_dim']}, n_classes={config['n_classes']}, hidden_dim={config['hidden_dim']}")
+    print(f"Model config: in_dim={config['in_dim']}, n_classes={config['n_classes']}, hidden_dim={config['hidden_dim']}, n_heads = {config['n_heads']}")
     print(f"Label mapping: {label_mapping}")
     
     return model, config, label_mapping
 
 def create_label_mapping(df, label_col):
-    """
-    Create a mapping from label strings to class indices.
-    
-    Parameters:
-    - df: DataFrame with labels
-    - label_col: Column name for labels
-    
-    Returns:
-    - label_mapping: Dictionary {label: class_index}
-    """
+    """ Map class labels to integer indices. """
     return {label: i for i, label in enumerate(sorted(df[label_col].unique()))}
 
-
-# ========= Training and Validation Functions ==========
+# ----------------------------------------
+# Training and validation functions
+# ----------------------------------------
 
 def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epochs=10, 
-    early_stopping_patience=None, seed=None, return_best_epoch=False):
-    """
+    early_stopping_patience=None, seed=None):
+    """ 
     Train ABMIL model with optional early stopping for best AUC comparability.
     
     Parameters:
@@ -284,31 +277,30 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
     if seed is not None:
         set_seed(seed)
     
-    # Device setup
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
+    device = require_cuda()
+
     # DataLoader: handles shuffling and batching
-    train_loader = _create_dataloader(
-        train_dataset, 
-        batch_size=1, 
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=1,
         shuffle=True,
-        device=device,
-        worker_init_fn = lambda worker_id: set_seed(seed + worker_id) if seed is not None else None
+        num_workers=0,
+        pin_memory=True,
+        worker_init_fn=(lambda worker_id: set_seed(seed + worker_id) if seed is not None else None),
     )
 
-    # Extract Feature Dimension and Number of Classes
+    # Extract feature dimension and number of classes
     sample_feats, _, _ = train_dataset[0]
     feat_dim = sample_feats.shape[1]
     n_classes = train_df[label_col].nunique()
 
-    # Create the ABMIL Model
+    # Create the ABMIL model
     model = ABMIL(feat_dim, n_classes).to(device)
 
     # Enable TF32 / high matmul precision on modern GPUs (e.g. H100)
-    if device == "cuda":
-        _configure_gpu_optimization()
+    _configure_gpu_optimization()
      
-    # Create Optimizer and Loss Function
+    # Create optimizer and loss function
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     
     # Loss function: CrossEntropyLoss for multi-class classification
@@ -316,9 +308,9 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
 
     # Early stopping setup
     best_auc = -1.0
-    epochs_no_improve = 0
     best_model_state = None
     best_epoch = 0
+    epochs_no_improve = 0
     
     # Training Loop
     for epoch in tqdm(range(n_epochs), desc="Epochs"):
@@ -327,10 +319,19 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
 
         # Loop over slides
         for feats, tile_ids, label in tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs}", leave=False):
-            feats, tile_ids, label = _preprocess_batch(feats, tile_ids, label, device)
-        
+            # Preprocess batch
+            if feats.dim() == 3:
+                feats = feats.squeeze(0)
+            if tile_ids.ndim == 2:
+                tile_ids = tile_ids.squeeze(0)
+
+            feats = feats.to(device, non_blocking=True)
+            label = label.to(device, non_blocking=True)
+
             if feats.shape[0] == 0:
                 continue
+
+            optimizer.zero_grad() # Clear gradients
 
             # Forward pass with mixed precision on CUDA
             with torch.autocast(device_type="cuda", dtype=torch.float16):
@@ -341,41 +342,31 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
                 G = A.T @ A                                 # off-diagonal entries tell how similar two heads are
                 I = torch.eye(G.size(0), device=A.device)   # compare with identity matrix
                 div_loss = ((G - I) ** 2).mean()            # computes loss, smaller when more independent
-
                 loss = ce_loss + 0.05 * div_loss    # 0.05 can be tuned
 
-            # Clear gradients
-            optimizer.zero_grad()
-            
-            # Backpropagation
-            loss.backward()
-
-            # Update weights
-            optimizer.step()
-
-            # Accumulate loss
-            total_loss += loss.item()
+            loss.backward() # Backpropagation
+            optimizer.step() # Update weights
+            total_loss += loss.item() # Accumulate loss
 
         print(f"Epoch {epoch+1}/{n_epochs} | Loss: {total_loss:.4f}", end="")
         
         # Early stopping: evaluate on validation set if provided
         if val_dataset is not None and early_stopping_patience is not None:
-            all_labels, _, all_probs = validate_ABMIL(model=model, val_dataset=val_dataset)
+            all_labels, _, all_probs = validate_ABMIL(model, val_dataset)
             val_auc = auc_score(all_labels, all_probs)
             print(f" | Val AUC: {val_auc:.4f}", end="")
-            
+
             # Check if validation AUC improved
             if val_auc > best_auc:
                 best_auc = val_auc
-                epochs_no_improve = 0
-                best_epoch = epoch + 1
-                # Use deep copy to avoid shallow copy issues where tensors may drift during training
                 best_model_state = copy.deepcopy(model.state_dict())
+                best_epoch = epoch + 1
+                epochs_no_improve = 0
                 print(" (improved)", end="")
             else:
                 epochs_no_improve += 1
                 print(f" (no improve: {epochs_no_improve}/{early_stopping_patience})", end="")
-            
+
             # Early stopping
             if epochs_no_improve >= early_stopping_patience:
                 print(f"\nEarly stopping at epoch {epoch+1}")
@@ -384,21 +375,24 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
         
         print()
 
-    # If no improvement found during training, set n_epochs as best_epoch for retraining on 100% of data
     if val_dataset is not None and early_stopping_patience is not None and best_epoch == 0:
         best_epoch = n_epochs
 
-    if return_best_epoch:
-        return model, best_model_state, best_epoch
+    return model, best_model_state, best_epoch
 
-    return model, best_model_state
 
 def validate_ABMIL(model, val_dataset):
-    device = next(model.parameters()).device
+    device = require_cuda()
     
     # Validation DataLoader
-    val_loader = _create_dataloader(val_dataset, batch_size=1, shuffle=False, device=device)
-
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+    )
+    
     model.eval() # Evaluation mode (disables dropout, batch norm updates)
 
     all_labels = []
@@ -407,81 +401,36 @@ def validate_ABMIL(model, val_dataset):
 
     with torch.no_grad():
         for feats, tile_ids, label in tqdm(val_loader, desc="Validation", leave=False):
-            feats, tile_ids, label = _preprocess_batch(feats, tile_ids, label, device)
+            # Preprocess batch 
+            if feats.dim() == 3:
+                feats = feats.squeeze(0)
+            if tile_ids.ndim == 2:
+                tile_ids = tile_ids.squeeze(0)
+
+            feats = feats.to(device, non_blocking=True)
+            label = label.to(device, non_blocking=True)
 
             if feats.shape[0] == 0:
                 continue
 
             # Forward pass with mixed precision on CUDA
-            if device == "cuda":
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    logits, _ = model(feats)
-            else:
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
                 logits, _ = model(feats)
-    
+            
             # Compute predicted class and probabilities
             probs = torch.softmax(logits.float(), dim=0).cpu().numpy()
             pred = torch.argmax(logits, dim=0).item()
-            
+
             all_labels.append(label.item())
             all_preds.append(pred)
             all_probs.append(probs)
 
-    all_probs = np.array(all_probs)
-    
-    return all_labels, all_preds, all_probs
+    return all_labels, all_preds, np.array(all_probs)
 
 
-# ======== Model Saving and Loading ==========
-
-def save_model(model, model_name):
-    """
-    Save the trained ABMIL model to disk with auto-generated filename including model parameters.
-    
-    Parameters:
-    - model (ABMIL): Trained ABMIL model
-    - model_name (str): Base name for the model (e.g., 'abmil_placenta')
-    """
-    in_dim = model.classifier.in_features
-    n_classes = model.classifier.out_features
-    hidden_dim = model.attn[0].out_features
-
-    filename = f"{model_name}_{in_dim}_{n_classes}_{hidden_dim}.pth"
-    save_path = os.path.join("models/", filename)
-    os.makedirs("models/", exist_ok=True)
-    torch.save(model.state_dict(), save_path)
-    print(f"Model saved to {save_path}")
-
-def _parse_model_dimensions(model_path):
-    """ Parse dimensions from model filename: `..._<in_dim>_<n_classes>_<hidden_dim>.pth`. """
-    base = os.path.basename(model_path)
-    parsed = re.search(r"_(\d+)_(\d+)_(\d+)\.pth$", base)
-    if not parsed:
-        raise ValueError(
-            f"Could not parse dimensions from model filename '{base}'. "
-            "Expected suffix like '_<in_dim>_<n_classes>_<hidden_dim>.pth'."
-        )
-    return int(parsed.group(1)), int(parsed.group(2)), int(parsed.group(3))
-
-def load_model(model_path):
-    """
-    Load a trained ABMIL model. 
-    Expects filename in format: `..._<in_dim>_<n_classes>_<hidden_dim>.pth`.
-    """
-    in_dim, n_classes, hidden_dim = _parse_model_dimensions(model_path)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Loading model from {model_path} on device: {device}")
-
-    # Initialize model and load state dict
-    model = ABMIL(in_dim, n_classes, hidden_dim).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.eval()  # Set to evaluation mode
-    print(f"Model successfully loaded")
-    return model, {"in_dim": in_dim, "n_classes": n_classes, "hidden_dim": hidden_dim}
-
-
-# ========= Evaluation Methods ==========
+# ----------------------------------------
+# ABMIL evaluation methods
+# ----------------------------------------
 
 def confusion_matrix_report(all_labels, all_preds):
     """
