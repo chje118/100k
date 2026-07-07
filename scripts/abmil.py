@@ -78,11 +78,12 @@ class ZarrSlideDataset(Dataset):
         return feats, tile_ids, label
 
 class ABMIL(nn.Module):
-    def __init__(self, in_dim, n_classes, hidden_dim=256):
+    def __init__(self, in_dim, n_classes, hidden_dim=256, n_heads=1):
         """
         in_dim: feature size per tile (e.g. 512, 768, 1024)
         n_classes: number of output classes
         hidden_dim: size of attention hidden layer
+        n_heads: number of attention heads (default=1 for single-head attention)
         """
         super().__init__()
 
@@ -90,7 +91,7 @@ class ABMIL(nn.Module):
         self.attn = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.Tanh(),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(hidden_dim, n_heads)
         ) 
 
         # Classifier layer, maps final slide embedding to class scores
