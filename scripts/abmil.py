@@ -78,7 +78,7 @@ class ZarrSlideDataset(Dataset):
         return feats, tile_ids, label
 
 class ABMIL(nn.Module):
-    def __init__(self, in_dim, n_classes, hidden_dim=256, n_heads=2):
+    def __init__(self, in_dim, n_classes, hidden_dim=256, n_heads=4):
         """
         in_dim: feature size per tile (e.g. 512, 768, 1024)
         n_classes: number of output classes
@@ -333,13 +333,16 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
                 continue
 
             # Forward pass with mixed precision on CUDA
-            if device == "cuda":
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    logits, _ = model(feats)
-                    loss = loss_fn(logits.unsqueeze(0), label)
-            else:
-                logits, _ = model(feats)
-                loss = loss_fn(logits.unsqueeze(0), label)
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                logits, A = model(feats)
+                ce_loss = loss_fn(logits.unsqueeze(0), label)
+
+                # Diversity loss to encourage different attention maps
+                G = A.T @ A                                 # off-diagonal entries tell how similar two heads are
+                I = torch.eye(G.size(0), device=A.device)   # compare with identity matrix
+                div_loss = ((G - I) ** 2).mean()            # computes loss, smaller when more independent
+
+                loss = ce_loss + 0.05 * div_loss    # 0.05 can be tuned
 
             # Clear gradients
             optimizer.zero_grad()
