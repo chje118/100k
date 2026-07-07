@@ -78,7 +78,7 @@ class ZarrSlideDataset(Dataset):
         return feats, tile_ids, label
 
 class ABMIL(nn.Module):
-    def __init__(self, in_dim, n_classes, hidden_dim=256, n_heads=1):
+    def __init__(self, in_dim, n_classes, hidden_dim=256, n_heads=2):
         """
         in_dim: feature size per tile (e.g. 512, 768, 1024)
         n_classes: number of output classes
@@ -88,11 +88,16 @@ class ABMIL(nn.Module):
         super().__init__()
 
         # Attention mechanism, producing one attention score per tile
-        self.attn = nn.Sequential(
+        # Gated attention, A = V * U (tanh * sigmoid)
+        self.attn_V = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, n_heads)
-        ) 
+            nn.Tanh()
+        )
+        self.attn_U = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.Sigmoid()
+        )
+        self.attn_w = nn.Linear(hidden_dim, n_heads) 
 
         # Classifier layer, maps final slide embedding to class scores
         self.classifier = nn.Linear(in_dim, n_classes)
@@ -109,13 +114,17 @@ class ABMIL(nn.Module):
         - A: attention weights (for interpretability)
         """
         # Compute attention scores
-        A = self.attn(x)
+        V = self.attn_V(x)      # [n_tiles, hidden_dim] (tanh)
+        U = self.attn_U(x)      # [n_tiles, hidden_dim] (sigmoid)
+        H = V * U               # elementwise gating
+        A = self.attn_w(H)      # [n_tiles, n_heads] (attention)
 
         # Normalize with softmax (sums to 1)
         A = torch.softmax(A, dim=0)
 
-        # Weighted sum of features (MIL pooling)
-        M = torch.sum(A * x, dim=0)
+        # MIL pooling, for multiple attention heads
+        M = A.T @ x         # [n_heads, feat_dim]
+        M = M.mean(dim=0)   
 
         # Multiclass predictions
         logits = self.classifier(M)
