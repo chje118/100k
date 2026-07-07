@@ -432,82 +432,78 @@ def validate_ABMIL(model, val_dataset):
 # ABMIL evaluation methods
 # ----------------------------------------
 
-def confusion_matrix_report(all_labels, all_preds):
-    """
-    Generate a confusion matrix report.
- 
-    Parameters:
-    - all_labels: list of true labels
-    - all_preds: list of predicted labels
-    """
+def plot_confusion_matrix(all_labels, all_preds, class_names=None):
+    """ Compute and plot confusion matrix. """
     cm = confusion_matrix(all_labels, all_preds)
-    print(classification_report(all_labels, all_preds))
-
-    plt.figure(figsize=(6,5))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=class_names,
+        yticklabels=class_names,
+    )
     plt.xlabel("Predicted")
     plt.ylabel("True")
+    plt.title("Confusion Matrix")
+    plt.tight_layout()
     plt.show()
+    return cm
 
+def get_classification_report(all_labels, all_preds, class_names=None):
+    """ Return and print classification report. """
+    if class_names is None:
+        report = classification_report(all_labels, all_preds)
+    else:
+        report = classification_report(all_labels, all_preds, target_names=class_names)
+    print(report)
+    return report
 
 def auc_score(all_labels, all_probs):
     """
-    Compute macro AUC score for multi-class classification (pathology benchmark).
-    
-    For the pathology benchmark, macro AUC is computed as the unweighted mean of 
-    one-vs-rest AUC scores across all classes. This metric is class-balanced and 
+    Compute macro AUC score for multi-class classification, as the unweighted mean 
+    of one-vs-rest AUC scores across all classes. This metric is class-balanced and 
     appropriate for multi-class problems where all classes are equally important.
     
     Formula: macro AUC = mean(AUC_class_i for i in 1..n_classes)
-    where each AUC_class_i is computed using the one-vs-rest approach.
-    
-    Parameters:
-    - all_labels: list of true labels (class indices)
-    - all_probs: array of predicted probabilities (shape: [n_samples, n_classes])
-    
-    Returns:
-    - macro AUC score (float, range [0, 1])
+    where each AUC_class_i is computed using the one-vs-rest approach.    
     """
+    all_labels = np.asarray(all_labels)
+    all_probs = np.asarray(all_probs)
+
     # Convert true labels to one-hot encoding for multi-class AUC computation
     n_classes = all_probs.shape[1]
-    onehot_labels = np.eye(n_classes)[all_labels]
+    y_true = np.eye(n_classes)[all_labels]
 
-    # Compute macro AUC: unweighted mean of one-vs-rest AUC for each class
+    # Compute macro AUC: unweighted mean of one-vs-rest AUC for each class 
     try:
-        auc = roc_auc_score(onehot_labels, all_probs, average="macro", multi_class="ovr")
-    except ValueError as e:
-        print(f"Error computing AUC: {e}")
-        auc = np.nan  # Return NaN if AUC cannot be computed (e.g., only one class present)
-    return auc
+        return roc_auc_score(y_true, all_probs, average="macro", multi_class="ovr")
+    except ValueError:
+        return np.nan
 
 def per_class_auc(all_labels, all_probs):
+    """ Compute one-vs-rest AUC for each class. """
+    all_labels = np.asarray(all_labels)
+    all_probs = np.asarray(all_probs)
+
     n_classes = all_probs.shape[1]
-    onehot_labels = np.eye(n_classes)[all_labels]
-    
+    y_true = np.eye(n_classes)[all_labels]
+
     try:
-        aucs = roc_auc_score(onehot_labels, all_probs, average=None, multi_class="ovr")
+        return roc_auc_score(y_true, all_probs, average=None, multi_class="ovr")
     except ValueError:
-        aucs = [np.nan] * n_classes
-    
-    return aucs
+        return np.full(n_classes, np.nan)
 
 def plot_roc_curve(all_labels, all_probs):
-    """
-    Plot ROC curve for binary classification only.
-    
-    ROC curves are most interpretable for binary classification. For multi-class problems,
-    use macro AUC (computed via auc_score) instead.
-    
-    Parameters:
-    - all_labels: list of true labels (must be binary: 0 and 1)
-    - all_probs: array of predicted probabilities (shape: [n_samples, 2])
-    """
-    n_classes = all_probs.shape[1]
-    
-    if n_classes != 2:
+    """ Plot ROC curve for binary classification. """
+    all_labels = np.asarray(all_labels)
+    all_probs = np.asarray(all_probs)
+
+    if all_probs.shape[1] != 2:
         raise ValueError(
             f"plot_roc_curve only supports binary classification. "
-            f"Found {n_classes} classes. Use auc_score() with macro averaging for multi-class."
+            f"Found {all_probs.shape[1]} classes."
         )
 
     fpr, tpr, _ = roc_curve(all_labels, all_probs[:, 1])
@@ -523,26 +519,41 @@ def plot_roc_curve(all_labels, all_probs):
     plt.tight_layout()
     plt.show()
 
-def per_class_pr_curves(all_labels, all_probs):
-    """ Plot all per-class PR curves on one figure with distinct colors and class legend. """
+def per_class_roc_curves(all_labels, all_probs):
+    """ Plot one-vs-rest ROC curves for all classes. """
     n_classes = all_probs.shape[1]
-    y_true = np.eye(n_classes)[all_labels]  # one-hot
-
-    precisions = {}
-    recalls = {}
-    ap_scores = {}
+    y_true = np.eye(n_classes)[all_labels]
 
     plt.figure(figsize=(8, 6))
-    # Use seaborn 'pastel' palette for consistent visuals across plots
+    colors = sns.color_palette("pastel", n_classes)
+
+    for c in range(n_classes):
+        fpr, tpr, _ = roc_curve(y_true[:, c], all_probs[:, c])
+        auc_c = roc_auc_score(y_true[:, c], all_probs[:, c])
+        plt.plot(fpr, tpr, color=colors[c], lw=2, label=f"Class {c} (AUC={auc_c:.4f})")
+
+    plt.plot([0, 1], [0, 1], linestyle="--", color="gray", lw=1, label="Random")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("One-vs-Rest ROC Curves")
+    plt.legend(loc="lower right")
+    plt.tight_layout()
+    plt.show()
+
+def per_class_pr_curves(all_labels, all_probs):
+    """ Plot one-vs-rest precision-recall curves for all classes. """
+    all_labels = np.asarray(all_labels)
+    all_probs = np.asarray(all_probs)
+
+    n_classes = all_probs.shape[1]
+    y_true = np.eye(n_classes)[all_labels]
+
+    plt.figure(figsize=(8, 6))
     colors = sns.color_palette("pastel", n_classes)
 
     for c in range(n_classes):
         p, r, _ = precision_recall_curve(y_true[:, c], all_probs[:, c])
         ap = average_precision_score(y_true[:, c], all_probs[:, c])
-        precisions[c] = p
-        recalls[c] = r
-        ap_scores[c] = ap
-
         plt.plot(r, p, color=colors[c], linewidth=2, label=f"Class {c} (AP={ap:.2f})")
 
     plt.xlabel("Recall")
@@ -550,7 +561,8 @@ def per_class_pr_curves(all_labels, all_probs):
     plt.title("Per-class Precision–Recall curves (OvR)")
     plt.legend(title="Classes")
     plt.tight_layout()
-    plt.show()
+    plt.show()    
+
 
 # ========== Training and Evaluation Pipelines ==========
 
