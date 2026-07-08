@@ -566,7 +566,7 @@ def per_class_pr_curves(all_labels, all_probs):
     plt.show()    
 
 # ----------------------------------------
-# Training and evaluation pipelines
+# Training, inference and evaluation pipelines
 # ----------------------------------------
 
 class TrainABMILPipeline:
@@ -1185,14 +1185,9 @@ class ABMILInference:
                 **{col: cached.get(col) for col in cached if col.startswith("prob_")},
             })
         return pd.DataFrame(rows)
-    
-
-
-
-
 
 class ABMILEvaluation:
-    """ Evaluates ABMIL inference results by matching predictions with true labels via filenames."""
+    """ Evaluate slide-level ABMIL inference results against metadata labels. """
     def __init__(self, results_df: pd.DataFrame, metadata_df: pd.DataFrame, true_label_col: str):
         self.results_df = results_df.copy()
         self.metadata_df = metadata_df.copy()
@@ -1202,167 +1197,175 @@ class ABMILEvaluation:
         self.y_pred = None
         self.y_probs = None
         self.matched_df = None
-    
-    def _extract_slide_id(self, slide_path: str) -> str:
-        """ Extract slide identifier from slide_path (basename without extension). """
-        return os.path.basename(slide_path).replace(".mrxs", "")
-    
+        self.label_to_idx = None
+        self.idx_to_label = None
+
+    @staticmethod
+    def _extract_slide_id(slide_path):
+        """ Extract slide identifier from a path or filename. """
+        return os.path.basename(str(slide_path)).replace(".mrxs", "")
+
     def match_true_labels(self, slide_id_col: str = "filename", results_path_col: str = "slide_path"):
-        """ Match predicted results with true labels from metadata. """
-        # Extract slide IDs from results paths
-        self.results_df["_slide_id_results"] = self.results_df[results_path_col].apply(self._extract_slide_id)
-        
-        # Extract slide IDs from metadata paths
-        self.metadata_df["_slide_id_metadata"] = self.metadata_df[slide_id_col].apply(self._extract_slide_id)
-        
+        """ Match predictions with ground-truth labels using slide identifiers. """
+        if results_path_col not in self.results_df.columns:
+            raise ValueError(f"Column '{results_path_col}' not found in results_df.")
+        if slide_id_col not in self.metadata_df.columns:
+            raise ValueError(f"Column '{slide_id_col}' not found in metadata_df.")
+        if self.true_label_col not in self.metadata_df.columns:
+            raise ValueError(f"Column '{self.true_label_col}' not found in metadata_df.")
+
+        results_df = self.results_df.copy()
+        metadata_df = self.metadata_df.copy()
+
+        # Extract slide IDs from results paths and metadata paths
+        results_df["_slide_id_results"] = results_df[results_path_col].apply(self._extract_slide_id)
+        metadata_df["_slide_id_metadata"] = metadata_df[slide_id_col].apply(self._extract_slide_id)
+
         # Merge results with metadata on slide_id
-        self.matched_df = pd.merge(
-            self.results_df,
-            self.metadata_df[["_slide_id_metadata", self.true_label_col]],
+        matched_df = pd.merge(
+            results_df,
+            metadata_df[["_slide_id_metadata", self.true_label_col]],
             left_on="_slide_id_results",
             right_on="_slide_id_metadata",
             how="inner"
         )
         
-        if self.matched_df.empty:
+        if matched_df.empty:
             raise ValueError("No matches found between results and metadata.")
-        
+
         # Clean up temporary columns
-        self.matched_df = self.matched_df.drop(columns=["_slide_id_results", "_slide_id_metadata"])
+        matched_df = matched_df.drop(columns=["_slide_id_results", "_slide_id_metadata"])
+        self.matched_df = matched_df
         
-        # Extract labels and probabilities
-        self.y_true = self.matched_df[self.true_label_col].values
-        self.y_pred = self.matched_df["pred_label"].values
-        
+        # True and predicted labels as strings
+        pred_labels = matched_df["pred_label"].astype(str).values
+        true_labels = matched_df[self.true_label_col].astype(str).values
+
+        all_labels = sorted(set(pred_labels) | set(true_labels))
+        self.label_to_idx = {label: idx for idx, label in enumerate(all_labels)}
+        self.idx_to_label = {idx: label for label, idx in self.label_to_idx.items()}
+
+        # True and predicted labels as indices
+        self.y_true = np.array([self.label_to_idx[label] for label in true_labels], dtype=int)
+        self.y_pred = np.array([self.label_to_idx[label] for label in pred_labels], dtype=int)
+
         # Extract probability columns (all columns starting with "prob_")
-        prob_cols = sorted([col for col in self.matched_df.columns if col.startswith("prob_")])
+        prob_cols = [col for col in matched_df.columns if col.startswith("prob_")]
         if prob_cols:
-            self.y_probs = self.matched_df[prob_cols].values
+            # Converts each column name into its class label
+            prob_label_map = {col: col.replace("prob_", "", 1) for col in prob_cols}
+            # Creates empty array of shape (n_samples, n_classes) to hold probabilities
+            y_probs = np.zeros((len(matched_df), len(all_labels)), dtype=float)
+            
+            # Copies probabilities from matched_df into y_probs based on label mapping
+            for col in prob_cols:
+                label = prob_label_map[col]
+                if label in self.label_to_idx:
+                    y_probs[:, self.label_to_idx[label]] = matched_df[col].to_numpy(dtype=float)
+            self.y_probs = y_probs
+
         else:
-            # Fallback: create one-hot encoded probs from predictions
-            unique_labels = sorted(set(self.y_pred) | set(self.y_true))
-            self.y_probs = np.zeros((len(self.matched_df), len(unique_labels)))
-            for i, label in enumerate(self.y_pred):
-                label_idx = unique_labels.index(label)
-                self.y_probs[i, label_idx] = 1.0
+            # Create empty array of shape (n_samples, n_classes) to hold probabilities
+            y_probs = np.zeros((len(matched_df), len(all_labels)), dtype=float)
+            
+            # Set the predicted class index to 1.0 for each sample (one-hot encoding)
+            # Placeholder probabilities if no probability columns are present
+            for i, pred_idx in enumerate(self.y_pred):
+                y_probs[i, pred_idx] = 1.0
+            self.y_probs = y_probs
         
         print(
             f"Matched {len(self.matched_df)} slides. "
-            f"y_true shape: {self.y_true.shape}, y_pred shape: {self.y_pred.shape}, "
+            f"y_true shape: {self.y_true.shape}, "
+            f"y_pred shape: {self.y_pred.shape}, "
             f"y_probs shape: {self.y_probs.shape}"
         )
         return self.matched_df
-    
+
     def assessment_report(self):
-        """ Compute confusion matrix and classification report from matched results. """
+        """ Print confusion matrix and classification report using shared helper. """
         if self.y_true is None or self.y_pred is None:
             raise ValueError("No matched labels found. Call match_true_labels() first.")
 
-        confusion_matrix_report(self.y_true, self.y_pred)
-        return {"results_df": self.results_df}
+        class_names = [self.idx_to_label[i] for i in range(len(self.idx_to_label))]
+        cm = plot_confusion_matrix(self.y_true, self.y_pred, class_names=class_names)
+        report = get_classification_report(self.y_true, self.y_pred, class_names=class_names)
+        return {"confusion_matrix": cm, "classification_report": report}
 
     def compute_metrics(self):
-        """ Compute AUC and per-class AUC scores. """
+        """ Compute macro AUC and per-class AUC using shared helpers. """
         if self.y_true is None or self.y_probs is None:
             raise ValueError("No matched labels found. Call match_true_labels() first.")
-        
-        auc = auc_score(self.y_true, self.y_probs)
-        per_class_aucs = per_class_auc(self.y_true, self.y_probs)
-        return {"auc": auc, "per_class_aucs": per_class_aucs}
 
-    def group_by_metrics(self, group_col: str):
-        """Compute metrics grouped by a metadata column."""
+        return {
+            "auc": auc_score(self.y_true, self.y_probs),
+            "per_class_aucs": per_class_auc(self.y_true, self.y_probs),
+        }
+
+    def group_by_metrics(self, group_col, slide_id_col="filename", results_path_col="slide_path"):
+        """ Compute accuracy and AUC grouped by a metadata column. """
         if self.matched_df is None or self.matched_df.empty:
             raise ValueError("No matched labels found. Call match_true_labels() first.")
         if group_col not in self.metadata_df.columns:
             raise ValueError(f"Column '{group_col}' not found in metadata_df.")
+        if slide_id_col not in self.metadata_df.columns:
+            raise ValueError(f"Column '{slide_id_col}' not found in metadata_df.")
+        if results_path_col not in self.matched_df.columns:
+            raise ValueError(f"Column '{results_path_col}' not found in matched_df.")
 
         grouped_df = self.matched_df.copy()
-        grouped_df["_slide_id"] = grouped_df["slide_path"].apply(self._extract_slide_id)
-        metadata = self.metadata_df[[group_col]].copy()
-        metadata["_slide_id"] = self.metadata_df["filename"].apply(self._extract_slide_id)
-        grouped_df = grouped_df.merge(metadata, on="_slide_id", how="left")
+        grouped_df["_slide_id"] = grouped_df[results_path_col].apply(self._extract_slide_id)
 
-        prob_cols = [col for col in grouped_df.columns if col.startswith("prob_")]
+        metadata_subset = self.metadata_df[[slide_id_col, group_col]].copy()
+        metadata_subset["_slide_id"] = metadata_subset[slide_id_col].apply(self._extract_slide_id)
+
+        grouped_df = grouped_df.merge(
+            metadata_subset[["_slide_id", group_col]],
+            on="_slide_id",
+            how="left",
+        )
+        
         rows = []
         for group_val, group_data in grouped_df.groupby(group_col, dropna=False):
-            probs = group_data[prob_cols].to_numpy() if prob_cols else None
+            y_true_group = np.array([self.label_to_idx[str(label)] for label in group_data[self.true_label_col].astype(str).values], dtype=int)
+            y_pred_group = np.array([self.label_to_idx[str(label)] for label in group_data["pred_label"].astype(str).values], dtype=int)
+
+            prob_cols = [col for col in group_data.columns if col.startswith("prob_")]
+            if prob_cols:
+                y_probs_group = np.zeros((len(group_data), len(self.label_to_idx)), dtype=float)
+                for col in prob_cols:
+                    label = col.replace("prob_", "", 1)
+                    if label in self.label_to_idx:
+                        y_probs_group[:, self.label_to_idx[label]] = group_data[col].to_numpy(dtype=float)
+            else:
+                y_probs_group = None
+
             rows.append({
                 group_col: group_val,
                 "n_samples": len(group_data),
-                "accuracy": np.mean(group_data[self.true_label_col].values == group_data["pred_label"].values),
-                "auc": auc_score(group_data[self.true_label_col].values, probs) if probs is not None and probs.shape[1] > 1 else np.nan,
+                "accuracy": float(np.mean(y_true_group == y_pred_group)),
+                "auc": float(auc_score(y_true_group, y_probs_group)) if y_probs_group is not None and y_probs_group.shape[1] > 1 else np.nan,
             })
-
+        
         group_metrics_df = pd.DataFrame(rows)
         print(f"\nPer-group metrics grouped by '{group_col}':")
         print(group_metrics_df.to_string(index=False))
         return group_metrics_df
-    
+
     def roc_curve(self):
-        """ Plot ROC curves. """
+        """ Plot ROC curve for binary classification using shared helper. """
         if self.y_true is None or self.y_probs is None:
             raise ValueError("No matched labels found. Call match_true_labels() first.")
-        
-        plot_roc_curve(self.y_true, self.y_probs)
+        return plot_roc_curve(self.y_true, self.y_probs)
 
     def pr_curves(self):
-        """ Plot precision-recall curves. """
+        """ Plot per-class precision-recall curves using shared helper. """
         if self.y_true is None or self.y_probs is None:
             raise ValueError("No matched labels found. Call match_true_labels() first.")
-        
         return per_class_pr_curves(self.y_true, self.y_probs)
-    
-    def roc_curves_all(self):
-        """ Plot all per-class ROC curves (one-vs-rest) on one figure with distinct colors. """
+
+    def ovr_roc_curves(self):
+        """ Plot one-vs-rest ROC curves for all classes using shared helper. """
         if self.y_true is None or self.y_probs is None:
             raise ValueError("No matched labels found. Call match_true_labels() first.")
-        
-        n_classes = self.y_probs.shape[1]
-        y_true_onehot = np.eye(n_classes)[self.y_true]  # one-hot encoding
-                
-        plt.figure(figsize=(8, 6))
-        colors = sns.color_palette("pastel", n_classes)
-        
-        for c in range(n_classes):
-            fpr, tpr, _ = roc_curve(y_true_onehot[:, c], self.y_probs[:, c])
-            roc_auc = roc_auc_score(y_true_onehot[:, c], self.y_probs[:, c])
-            plt.plot(fpr, tpr, color=colors[c], linewidth=2, label=f"Class {c} (AUC={roc_auc:.4f})")
-        
-        # Plot diagonal (random classifier)
-        plt.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=1, label="Random")
-        plt.xlabel("False Positive Rate")
-        plt.ylabel("True Positive Rate")
-        plt.title("Per-class ROC Curves (One-vs-Rest)")
-        plt.legend(title="Classes", loc="lower right")
-        plt.xlim([0.0, 1.0])
-        plt.ylim([0.0, 1.05])
-        plt.tight_layout()
-        plt.show()
-
-
-
-if __name__ == "__main__":
-    """Example usage for running this module directly.
-
-    Update the file paths and column names below to match your data.
-    """
-    # Example: inference on a batch of slides
-    # inference = ABMILInference(
-    #     checkpoint_path="/path/to/checkpoint.pt",
-    #     zarr_dir="/path/to/zarr_cache",
-    #     slides=[
-    #         "/path/to/slide_001.mrxs",
-    #         "/path/to/slide_002.mrxs",
-    #     ],
-    #     cache_path="/path/to/abmil_cache.pkl",
-    # )
-    # inference.process_slides()
-    # results_df = inference.results_dataframe()
-
-    # Example: evaluation against metadata
-    # metadata_df = pd.read_csv("/path/to/metadata.csv")
-    # evaluator = ABMILEvaluation(results_df, metadata_df, true_label_col="diagnosis")
-    # evaluator.match_true_labels(slide_id_col="filename", results_path_col="slide_path")
-    # evaluator.assessment_report()
-    # metrics = evaluator.compute_metrics()
+        return per_class_roc_curves(self.y_true, self.y_probs)
