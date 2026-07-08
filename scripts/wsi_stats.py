@@ -38,16 +38,20 @@ class WSIStatsCache:
 
     def scan_files(self):
         cached_files = set(stat.filename for stat in self.stats)
-        new_stats = []
+        new_count = 0
+        pbar = tqdm(desc="Scanning files")
         for dirpath, dirnames, filenames in os.walk(self.root_dir):
             for fname in filenames:
+                pbar.update(1)
                 if fname.lower().endswith('.mrxs'):
                     fpath = os.path.join(dirpath, fname)
                     if fpath not in cached_files:
-                        new_stats.append(WSIStats(fpath))
-        if new_stats:
-            print(f"Found {len(new_stats)} new files.")
-        self.stats.extend(new_stats)
+                        self.stats.append(WSIStats(fpath))
+                        self.save_cache()
+                        new_count += 1
+                        pbar.set_description(f"Found {new_count} new files")
+        pbar.close()
+        print(f"Scan complete. Found {new_count} new files.")
 
     def save_cache(self):
         with open(self.cache_file, "wb") as f:
@@ -82,7 +86,6 @@ class FindWSIData:
         self.col = col
         self._index_folders()
         self.df_results = self.get_df_results()
-        # TODO cache files
 
     def _index_folders(self):
         folder_index = {}
