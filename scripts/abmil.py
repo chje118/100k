@@ -563,11 +563,18 @@ def per_class_pr_curves(all_labels, all_probs):
     plt.tight_layout()
     plt.show()    
 
-
-# ========== Training and Evaluation Pipelines ==========
+# ----------------------------------------
+# Training and evaluation pipelines
+# ----------------------------------------
 
 class TrainABMILPipeline:
-    """ Train ABMIL with validation, then retrain on 100% of slides for the best epoch count. """
+    """ 
+    Train ABMIL with validation, then retrain on all valid slides for the best epoch count and save checkpoint. 
+    
+    Usage: 
+    pipeline = TrainABMILPipeline(df, 'path_col', 'label_col', 'features_key', 'tiles_key', 'zarr_dir', 'save_path')
+    pipeline.run_pipeline(max_tiles=50000, n_epochs=100, seed=42, validation_fraction=0.10, early_stopping_patience=5)
+    """
 
     def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir, save_path):
         self.df = df.copy()
@@ -580,47 +587,48 @@ class TrainABMILPipeline:
         self.label_mapping = create_label_mapping(self.df, self.label_col)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        self.train_df = None
         self.model = None
         self.best_epoch = None
-        self.max_tiles = None
-        self.n_epochs = None
-        self.seed = None
-        self.validation_fraction = None
-        self.early_stopping_patience = None
 
         print(f"TrainABMILPipeline initialized with {len(self.df)} slides on device: {self.device}")
+
+    def _make_dataset(self, df, max_tiles=None, seed=None):
+        return ZarrSlideDataset(
+            df=df,
+            filename_col=self.filename_col,
+            label_col=self.label_col,
+            feature_key=self.feature_key,
+            tile_key=self.tile_key,
+            zarr_dir=self.zarr_dir,
+            max_tiles=max_tiles,
+            seed=seed,
+        )
+
+    def _map_labels(self, df):
+        mapped = df.copy()
+        mapped[self.label_col] = mapped[self.label_col].map(self.label_mapping)
+        if mapped[self.label_col].isna().any():
+            missing = mapped.loc[mapped[self.label_col].isna(), self.label_col].unique().tolist()
+            raise ValueError(f"Unmapped labels found: {missing}")
+        mapped[self.label_col] = mapped[self.label_col].astype(int)
+        return mapped
 
     def validate_slides(self):
         """ Filter out slides that cannot be loaded. """
         len_before = len(self.df)
         print(f"\nValidating {len_before} slides...")
         
-        temp_dataset = ZarrSlideDataset(
-            df=self.df,
-            filename_col=self.filename_col,
-            label_col=self.label_col,
-            feature_key=self.feature_key,
-            tile_key=self.tile_key,
-            zarr_dir=self.zarr_dir,
-        )
-
+        temp_dataset = self._make_dataset(self.df)
         _, valid_indices = validate_dataset(temp_dataset)
         self.df = self.df.iloc[valid_indices].reset_index(drop=True)
+
         print(f"Validation complete: {len(self.df)} valid slides (removed {len_before - len(self.df)})")
         return self.df
 
     def train_abmil(self, max_tiles=50000, n_epochs=100, seed=42, validation_fraction=0.10, early_stopping_patience=5):
-        """ Fit on a 90/10 split and record the best epoch. """
-        self.max_tiles = max_tiles
-        self.n_epochs = n_epochs
-        self.seed = seed
-        self.validation_fraction = validation_fraction
-        self.early_stopping_patience = early_stopping_patience
-
-        df = self.df.copy()
-        df[self.label_col] = df[self.label_col].map(self.label_mapping).astype(int)
-
+        """ Fit on a train/validation split and record the best epoch. """
+        df = self._map_labels(self.df)
+        
         train_df, val_df = train_test_split(
             df,
             test_size=validation_fraction,
@@ -628,27 +636,8 @@ class TrainABMILPipeline:
             random_state=seed,
         )
 
-        train_dataset = ZarrSlideDataset(
-            df=train_df,
-            filename_col=self.filename_col,
-            label_col=self.label_col,
-            feature_key=self.feature_key,
-            tile_key=self.tile_key,
-            zarr_dir=self.zarr_dir,
-            max_tiles=max_tiles,
-            seed=seed,
-        )
-
-        val_dataset = ZarrSlideDataset(
-            df=val_df,
-            filename_col=self.filename_col,
-            label_col=self.label_col,
-            feature_key=self.feature_key,
-            tile_key=self.tile_key,
-            zarr_dir=self.zarr_dir,
-            max_tiles=max_tiles,
-            seed=seed,
-        )
+        train_dataset = self._make_dataset(train_df, max_tiles=max_tiles, seed=seed)
+        val_dataset = self._make_dataset(val_df, max_tiles=max_tiles, seed=seed)
 
         self.model, _, self.best_epoch = train_ABMIL(
             train_df=train_df,
@@ -658,52 +647,49 @@ class TrainABMILPipeline:
             n_epochs=n_epochs,
             early_stopping_patience=early_stopping_patience,
             seed=seed,
-            return_best_epoch=True,
         )
 
         return self.model, self.best_epoch
 
-    def save_abmil(self, max_tiles=50000, n_epochs=100, seed=42):
-        """ Retrain on 100% of slides for best_epoch epochs and save the checkpoint. """
+    def save_abmil(self, max_tiles=50000, seed=42, n_epochs=None):
+        """ Retrain on all valid slides for best_epoch epochs and save the checkpoint. """
         
-        full_dataset = ZarrSlideDataset(
-            df=self.df,
-            filename_col=self.filename_col,
-            label_col=self.label_col,
-            feature_key=self.feature_key,
-            tile_key=self.tile_key,
-            zarr_dir=self.zarr_dir,
-            max_tiles=max_tiles,
-            seed=seed,
-        )
+        if self.best_epoch is None:
+            raise ValueError("best_epoch is not set. Run train_abmil() first.")
+
+        df = self._map_labels(self.df)
+        full_dataset = self._make_dataset(df, max_tiles=max_tiles, seed=seed)
+
+        epochs = self.best_epoch if n_epochs is None else n_epochs
 
         self.model, _ = train_ABMIL(
-            train_df=self.df,
+            train_df=df,
             train_dataset=full_dataset,
             val_dataset=None,
             label_col=self.label_col,
-            n_epochs=self.best_epoch if n_epochs is None else n_epochs,
+            n_epochs=epochs,
             early_stopping_patience=None,
             seed=seed,
         )
 
         self.config = {
-            "in_dim": self.model.classifier.in_features,
-            "n_classes": self.model.classifier.out_features,
-            "hidden_dim": self.model.attn[0].out_features,
+            "in_dim": self.model.in_dim,
+            "n_classes": self.model.n_classes,
+            "hidden_dim": self.model.hidden_dim,
+            "n_heads": self.model.n_heads,
             "feature_key": self.feature_key,
             "tile_key": self.tile_key,
             "max_tiles": max_tiles,
-            "n_epochs": self.best_epoch if n_epochs is None else n_epochs,
+            "n_epochs": epochs,
             "seed": seed,
         }
 
         os.makedirs(os.path.dirname(self.save_path) or ".", exist_ok=True)
         save_checkpoint(self.model, self.config, self.label_mapping, self.save_path)
-       
+
         return self.model, self.label_mapping, self.save_path
 
-    def run_pipeline(self, max_tiles=50000, n_epochs=10, seed=42, validation_fraction=0.10, early_stopping_patience=5):
+    def run_pipeline(self, max_tiles=50000, n_epochs=100, seed=42, validation_fraction=0.10, early_stopping_patience=5):
         self.validate_slides()
         self.train_abmil(
             max_tiles=max_tiles,
@@ -712,18 +698,15 @@ class TrainABMILPipeline:
             validation_fraction=validation_fraction,
             early_stopping_patience=early_stopping_patience,
         )
-        return self.save_abmil()
+        return self.save_abmil(max_tiles=max_tiles, seed=seed)
+
 
 class KFoldPipeline:
     """
     K-fold cross-validation pipeline for ABMIL model evaluation.
     
     Usage:
-        pipeline = KFoldPipeline(df, 'path_col', 'label_col', 'features_key', 'tiles_key', 'zarr_dir')
-        results = pipeline.kfold_cross_validation(n_splits=5, n_epochs=100, max_tiles=5000)
-        pipeline.print_results()
     """
-    
     def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir):
         """
         Parameters:
@@ -741,59 +724,81 @@ class KFoldPipeline:
         self.tile_key = tile_key
         self.zarr_dir = zarr_dir
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"KFoldPipeline initialized on device: {self.device}")
         self.results = None
-    
+
+        print(f"KFoldPipeline initialized on device: {self.device}")
+
+    def _make_dataset(self, df, max_tiles=None, seed=None):
+        return ZarrSlideDataset(
+            df=df,
+            filename_col=self.filename_col,
+            label_col=self.label_col,
+            feature_key=self.feature_key,
+            tile_key=self.tile_key,
+            zarr_dir=self.zarr_dir,
+            max_tiles=max_tiles,
+            seed=seed,
+        )
+
+    def _map_labels(self, df):
+        mapped = df.copy()
+        label_mapping = create_label_mapping(self.df, self.label_col)
+        mapped[self.label_col] = mapped[self.label_col].map(label_mapping)
+        if mapped[self.label_col].isna().any():
+            missing = mapped.loc[mapped[self.label_col].isna(), self.label_col].unique().tolist()
+            raise ValueError(f"Unmapped labels found: {missing}")
+        mapped[self.label_col] = mapped[self.label_col].astype(int)
+        return mapped, label_mapping
+
+    def _evaluate_fold(self, model, eval_dataset):
+        all_labels, all_preds, all_probs = validate_ABMIL(model=model, val_dataset=eval_dataset)
+        fold_auc = auc_score(all_labels, all_probs)
+        fold_accuracy = np.mean(np.array(all_labels) == np.array(all_preds))
+        fold_per_class_aucs = per_class_auc(all_labels, all_probs)
+        return all_labels, all_preds, all_probs, fold_auc, fold_accuracy, fold_per_class_aucs
+
     def validate_slides(self):
         """ Filter out invalid slides causing errors during loading. """
         len_before = len(self.df)
         print(f"\nValidating {len_before} slides...")
         
-        temp_dataset = ZarrSlideDataset(
-            df=self.df,
-            filename_col=self.filename_col,
-            label_col=self.label_col,
-            feature_key=self.feature_key,
-            tile_key=self.tile_key,
-            zarr_dir=self.zarr_dir
-        )
-        
-        filtered_dataset, valid_indices = validate_dataset(temp_dataset)
+        temp_dataset = self._make_dataset(self.df)
+        _, valid_indices = validate_dataset(temp_dataset)
         self.df = self.df.iloc[valid_indices].reset_index(drop=True)
+
         print(f"Validation complete: {len(self.df)} valid slides (removed {len_before - len(self.df)})")
-        
         return self.df
-    
+
     def kfold_cross_validation(self, n_splits=5, n_epochs=10, early_stopping_patience=5, max_tiles=None, 
             random_state=42, resume_from_checkpoints=False, checkpoint_dir="checkpoints/"):
-        """ Run k-fold cross-validation.
+        """ 
+        Run stratified k-fold cross-validation with internal validation.
         
         Parameters:
-        - n_splits: Number of folds
-        - n_epochs: Maximum epochs per fold
-        - early_stopping_patience: Patience for early stopping
-        - max_tiles: Maximum tiles per slide (None = no limit)
-        - random_state: Random seed for reproducibility
-        - resume_from_checkpoints: If True, detect completed folds from checkpoint files and continue from next fold
-        - checkpoint_dir: Directory containing fold checkpoints (fold_{n}_auc_*.pt)
-        
-        Returns:
-        - Dictionary with cross-validation results
+        - n_splits: number of folds
+        - n_epochs: maximum epochs per fold
+        - early_stopping_patience: patience for early stopping
+        - max_tiles: maximum tiles per slide (None = no limit)
+        - random_state: random seed for reproducibility
+        - resume_from_checkpoints: if True, detect completed folds from checkpoint files and continue from next fold
+        - checkpoint_dir: directory containing fold checkpoints (fold_{n}_auc_*.pt)
         """
         set_seed(random_state)
         print(f"Random seed set to {random_state} for reproducibility")
     
+        df, label_mapping = self._map_labels(self.df)
         skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     
-        fold_auc_scores = []
+        fold_ovr_auc_scores = []
+        fold_per_class_aucs = []
         fold_accuracies = []
-        fold_class_aucs = []
         fold_all_labels = []
         fold_all_preds = []
         fold_all_probs = []
-    
+
         print(f"Starting {n_splits}-fold cross-validation with early stopping (patience={early_stopping_patience})...")
-        print(f"Data leakage prevention: Train (80%) (90% Training | 10% Internal Val → Early stopping) | Test (20%) → Final evaluation")
+        print(f"Train (80%) → 90% training / 10% internal val | Test (20%) → final evaluation")
+
 
         start_fold = 1
         checkpoint_by_fold = {}
@@ -817,7 +822,7 @@ class KFoldPipeline:
 
             print(f"Resume mode enabled. Found checkpoints for folds: {sorted(checkpoint_by_fold.keys())}")
             print(f"Will train from fold {start_fold}/{n_splits}")
-    
+
         for fold_idx, (train_idx, test_idx) in enumerate(skf.split(self.df, self.df[self.label_col])):
             fold_num = fold_idx + 1
             print(f"\n{'='*60}")
@@ -840,72 +845,35 @@ class KFoldPipeline:
             print(f"Train subset: {len(train_subset_df)} samples")
             print(f"Internal val: {len(internal_val_df)} samples")
             print(f"Test set: {len(test_df)} samples")
-            
+
             # Use fold-specific seed for deterministic tile sampling
             fold_seed = random_state + fold_num
         
             # Create datasets with deterministic tile sampling
-            train_dataset = ZarrSlideDataset(
-                df=train_subset_df,
-                filename_col=self.filename_col,
-                label_col=self.label_col,
-                feature_key=self.feature_key,
-                tile_key=self.tile_key,
-                zarr_dir=self.zarr_dir,
-                max_tiles=max_tiles,
-                seed=fold_seed
-            )
-        
-            internal_val_dataset = ZarrSlideDataset(
-                df=internal_val_df,
-                filename_col=self.filename_col,
-                label_col=self.label_col,
-                feature_key=self.feature_key,
-                tile_key=self.tile_key,
-                zarr_dir=self.zarr_dir,
-                max_tiles=max_tiles,
-                seed=fold_seed
-            )
-        
-            test_dataset = ZarrSlideDataset(
-                df=test_df,
-                filename_col=self.filename_col,
-                label_col=self.label_col,
-                feature_key=self.feature_key,
-                tile_key=self.tile_key,
-                zarr_dir=self.zarr_dir,
-                max_tiles=max_tiles,
-                seed=fold_seed
-            )
+            train_dataset = self._make_dataset(train_subset_df, max_tiles=max_tiles, seed=fold_seed)
+            internal_val_dataset = self._make_dataset(internal_val_df, max_tiles=max_tiles, seed=fold_seed)
+            test_dataset = self._make_dataset(test_df, max_tiles=max_tiles, seed=fold_seed)
 
             if resume_from_checkpoints and fold_num < start_fold:
                 checkpoint_path = checkpoint_by_fold.get(fold_num)
                 if checkpoint_path is None:
-                    raise FileNotFoundError(
-                        f"Missing checkpoint for fold {fold_num} in {checkpoint_dir}."
-                    )
+                    raise FileNotFoundError(f"Missing checkpoint for fold {fold_num} in {checkpoint_dir}.")
+
                 print(f"Using existing checkpoint for fold {fold_num}: {checkpoint_path}")
                 model, _, _ = load_checkpoint(checkpoint_path)
 
-                all_labels, all_preds, all_probs = validate_ABMIL(
-                    model=model,
-                    val_dataset=test_dataset,
-                )
+                all_labels, all_preds, all_probs, fold_auc, fold_accuracy, fold_per_class_aucs = self._evaluate_fold(model, test_dataset)
 
-                fold_auc = auc_score(all_labels, all_probs)
-                fold_accuracy = np.mean(np.array(all_labels) == np.array(all_preds))
-                fold_per_class_aucs = per_class_auc(all_labels, all_probs)
-
-                fold_auc_scores.append(fold_auc)
+                fold_ovr_auc_scores.append(fold_auc)
+                fold_per_class_aucs.append(fold_per_class_aucs)
                 fold_accuracies.append(fold_accuracy)
-                fold_class_aucs.append(fold_per_class_aucs)
                 fold_all_labels.append(list(all_labels))
                 fold_all_preds.append(list(all_preds))
                 fold_all_probs.append(all_probs.tolist())
 
                 print(f"Fold {fold_num} (checkpoint) - Test AUC: {fold_auc:.4f}, Test Accuracy: {fold_accuracy:.4f}")
                 continue
-        
+
             # Train model on train_subset with early stopping on internal_val
             # Use fold-specific seed derived from random_state for reproducibility
             model, _ = train_ABMIL(
@@ -919,59 +887,45 @@ class KFoldPipeline:
             )
 
             # Validate on test set for final evaluation of this fold
-            all_labels, all_preds, all_probs = validate_ABMIL(
-                model=model,
-                val_dataset=test_dataset,
-            )
-        
-            # Compute AUC and accuracy for this fold
-            fold_auc = auc_score(all_labels, all_probs)
-            fold_accuracy = np.mean(np.array(all_labels) == np.array(all_preds))
-            fold_per_class_aucs = per_class_auc(all_labels, all_probs)
-        
-            fold_auc_scores.append(fold_auc)
+            all_labels, all_preds, all_probs, fold_auc, fold_accuracy, fold_per_class_aucs = self._evaluate_fold(model, test_dataset)
+
+            fold_ovr_auc_scores.append(fold_auc)
+            fold_per_class_aucs.append(fold_per_class_aucs)
             fold_accuracies.append(fold_accuracy)
-            fold_class_aucs.append(fold_per_class_aucs)
             fold_all_labels.append(list(all_labels))
             fold_all_preds.append(list(all_preds))
             fold_all_probs.append(all_probs.tolist())
         
             print(f"Fold {fold_num} - Test AUC: {fold_auc:.4f}, Test Accuracy: {fold_accuracy:.4f}")
-            
+
             # Save checkpoint for this fold
             config = {
-                "in_dim": model.classifier.in_features,
-                "hidden_dim": model.attn[0].out_features,
-                "n_classes": model.classifier.out_features,
+                "in_dim": model.in_dim,
+                "hidden_dim": model.hidden_dim,
+                "n_classes": model.n_classes,
+                "n_heads": model.n_heads,
                 "feature_key": self.feature_key,
                 "tile_key": self.tile_key,
                 "max_tiles": max_tiles,
+                "n_epochs": n_epochs,
+                "random_state": fold_seed,
             }
-            label_mapping = create_label_mapping(self.df, self.label_col)
-            
             os.makedirs(checkpoint_dir, exist_ok=True)
             checkpoint_path = os.path.join(checkpoint_dir, f"fold_{fold_num}_auc_{fold_auc:.4f}.pt")
             save_checkpoint(model, config, label_mapping, checkpoint_path)
 
         # Compute mean and std across folds
-        mean_auc = np.mean(fold_auc_scores)
-        std_auc = np.std(fold_auc_scores)
-        mean_accuracy = np.mean(fold_accuracies)
-        std_accuracy = np.std(fold_accuracies)
-        class_aucs = np.array(fold_class_aucs, dtype=float)
-        mean_per_class_auc = np.nanmean(class_aucs, axis=0)
-        std_per_class_auc = np.nanstd(class_aucs, axis=0)
-    
+        per_class_aucs = np.array(fold_per_class_aucs, dtype=float)
         results_dict = {
-            'fold_auc_scores': fold_auc_scores,
-            'mean_auc': mean_auc,
-            'std_auc': std_auc,
+            "fold_ovr_auc_scores": fold_ovr_auc_scores,
+            "mean_ovr_auc": float(np.mean(fold_ovr_auc_scores)) if fold_ovr_auc_scores else np.nan,
+            "std_ovr_auc": float(np.std(fold_ovr_auc_scores)) if fold_ovr_auc_scores else np.nan,        
             'fold_accuracies': fold_accuracies,
-            'mean_accuracy': mean_accuracy,
-            'std_accuracy': std_accuracy,
-            'fold_class_aucs': fold_class_aucs,
-            'mean_per_class_auc': mean_per_class_auc.tolist(),
-            'std_per_class_auc': std_per_class_auc.tolist(),
+            "mean_accuracy": float(np.mean(fold_accuracies)) if fold_accuracies else np.nan,
+            "std_accuracy": float(np.std(fold_accuracies)) if fold_accuracies else np.nan,
+            'fold_per_class_aucs': fold_per_class_aucs,
+            "mean_per_class_auc": np.nanmean(per_class_aucs, axis=0).tolist() if len(per_class_aucs) else [],
+            "std_per_class_auc": np.nanstd(per_class_aucs, axis=0).tolist() if len(per_class_aucs) else [],
             'fold_all_labels': fold_all_labels,
             'fold_all_preds': fold_all_preds,
             'fold_all_probs': fold_all_probs,
@@ -979,9 +933,9 @@ class KFoldPipeline:
         }    
         self.results = results_dict
         return self.results
-    
+
     def print_results(self):
-        """ Print cross-validation results summary."""
+        """ Print cross-validation result summary. """
         if self.results is None:
             print("No results available. Run the pipeline first with .kfold_cross_validation()")
             return
@@ -989,66 +943,10 @@ class KFoldPipeline:
         print(f"\n{'='*60}")
         print(f"K-Fold Cross-Validation Results ({self.results['n_splits']} folds)")
         print(f"{'='*60}")
-        print(f"Mean AUC: {self.results['mean_auc']:.4f} ± {self.results['std_auc']:.4f}")
+        print(f"Mean AUC: {self.results['mean_ovr_auc']:.4f} ± {self.results['std_ovr_auc']:.4f}")
         print(f"Mean Accuracy: {self.results['mean_accuracy']:.4f} ± {self.results['std_accuracy']:.4f}")
-        print(f"\nPer-fold AUC: {[f'{auc:.4f}' for auc in self.results['fold_auc_scores']]}")
+        print(f"\nPer-fold AUC: {[f'{auc:.4f}' for auc in self.results['fold_ovr_auc_scores']]}")
         print(f"Per-fold Accuracy: {[f'{acc:.4f}' for acc in self.results['fold_accuracies']]}")
         print("Per-class AUC (mean ± std):")
-        for class_idx, (mean_auc, std_auc) in enumerate(
-            zip(self.results['mean_per_class_auc'], self.results['std_per_class_auc'])
-        ):
+        for class_idx, (mean_auc, std_auc) in enumerate(zip(self.results['mean_per_class_auc'], self.results['std_per_class_auc'])):
             print(f"  Class {class_idx}: {mean_auc:.4f} ± {std_auc:.4f}")
-
-    def _get_evaluation_data(self, fold_idx=None):
-        """Return labels, predictions, and probabilities for one fold or all folds."""
-        if self.results is None:
-            raise ValueError("No results available. Run .kfold_cross_validation() first.")
-
-        fold_all_labels = self.results.get('fold_all_labels', [])
-        fold_all_preds = self.results.get('fold_all_preds', [])
-        fold_all_probs = self.results.get('fold_all_probs', [])
-
-        if not fold_all_labels or not fold_all_preds or not fold_all_probs:
-            raise ValueError("Evaluation outputs are missing from self.results.")
-
-        if fold_idx is None:
-            all_labels = [label for fold_labels in fold_all_labels for label in fold_labels]
-            all_preds = [pred for fold_preds in fold_all_preds for pred in fold_preds]
-            all_probs = np.concatenate([np.asarray(fold_probs) for fold_probs in fold_all_probs], axis=0)
-            return all_labels, all_preds, all_probs
-
-        if fold_idx < 1 or fold_idx > len(fold_all_labels):
-            raise IndexError(f"fold_idx must be between 1 and {len(fold_all_labels)}")
-
-        index = fold_idx - 1
-        return list(fold_all_labels[index]), list(fold_all_preds[index]), np.asarray(fold_all_probs[index])
-
-    def plot_confusion_matrix(self, fold_idx=None):
-        """Plot a confusion matrix for one fold or all folds combined."""
-        all_labels, all_preds, _ = self._get_evaluation_data(fold_idx=fold_idx)
-        confusion_matrix_report(all_labels, all_preds)
-
-    def plot_roc_curve(self, fold_idx=None):
-        """Plot ROC curve for binary classification for one fold or all folds combined."""
-        all_labels, _, all_probs = self._get_evaluation_data(fold_idx=fold_idx)
-        n_classes = all_probs.shape[1]
-        title_suffix = f"Fold {fold_idx}" if fold_idx is not None else "All folds"
-
-        if n_classes != 2:
-            raise ValueError(
-                f"plot_roc_curve only supports binary classification. Found {n_classes} classes."
-            )
-
-        fpr, tpr, _ = roc_curve(all_labels, all_probs[:, 1])
-        roc_auc = roc_auc_score(all_labels, all_probs[:, 1])
-
-        plt.figure(figsize=(6, 5))
-        plt.plot(fpr, tpr, label=f"AUC = {roc_auc:.4f}")
-        plt.plot([0, 1], [0, 1], linestyle="--", color="gray")
-        plt.xlabel("False Positive Rate")
-        plt.ylabel("True Positive Rate")
-        plt.title(f"ROC Curve ({title_suffix})")
-        plt.legend(loc="lower right")
-        plt.tight_layout()
-        plt.show()
-    
