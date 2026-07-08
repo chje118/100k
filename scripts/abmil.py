@@ -7,12 +7,14 @@ Computes macro AUC (one-vs-rest, class-balanced)
 """
 
 import os
+import pickle
 import torch
 import torch.nn as nn
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from wsidata import open_wsi
+import lazyslide as zs
 from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score, roc_curve
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.metrics import precision_recall_curve, average_precision_score
@@ -950,3 +952,236 @@ class KFoldPipeline:
         print("Per-class AUC (mean ± std):")
         for class_idx, (mean_auc, std_auc) in enumerate(zip(self.results['mean_per_class_auc'], self.results['std_per_class_auc'])):
             print(f"  Class {class_idx}: {mean_auc:.4f} ± {std_auc:.4f}")
+
+class ABMILInference:
+    """ Run slide-level ABMIL inference from cached tile features and store attention outputs. """
+    def __init__(self, checkpoint_path, zarr_dir, slides, cache_path=None):
+        self.checkpoint_path = checkpoint_path
+        self.zarr_dir = zarr_dir
+        self.slides = list(slides)
+        self.cache_path = cache_path
+        self._slide_cache = {}
+        self._skipped_slides = []
+
+        # Ensure cache file exists (create empty cache if missing) and load it
+        # CHECK load cache
+        if self.cache_path and os.path.exists(self.cache_path):
+            loaded_cache = self.load_cache(self.cache_path)
+            if isinstance(loaded_cache, dict):
+                self._slide_cache = loaded_cache
+
+        # Load the trained model
+        self.model, self.config, self.label_mapping = load_checkpoint(self.checkpoint_path)
+        self.device = next(self.model.parameters()).device
+        self.feature_key = self.config.get("feature_key")
+        self.tile_key = self.config.get("tile_key")
+        self.idx_to_label = {v: k for k, v in self.label_mapping.items()} if self.label_mapping else {}
+
+    def save_cache(self):
+        """ Save cached inference results to disk. """
+        if not self.cache_path:
+            return self._slide_cache
+        os.makedirs(os.path.dirname(self.cache_path) or ".", exist_ok=True)
+        with open(self.cache_path, "wb") as f:
+            pickle.dump(self._slide_cache, f)
+        return self._slide_cache
+
+    @staticmethod
+    def load_cache(input_path):
+        """ Load a pickle cache file. """
+        with open(input_path, "rb") as f:
+            return pickle.load(f)
+
+    def _single_slide_dataset(self, slide_path):
+        """ Build a one-row dataset for a single slide. """
+        df = pd.DataFrame({"slide_path": [slide_path], "label": [None]})
+        return ZarrSlideDataset(
+            df=df,
+            filename_col="slide_path",
+            label_col="label",
+            feature_key=self.feature_key,
+            tile_key=self.tile_key,
+            zarr_dir=self.zarr_dir,
+            max_tiles=None,
+            seed=None,
+            require_labels=False,
+        )
+
+    def validate_slides(self):
+        """ Validate slide/zarr availability and required feature/tile keys. """
+        valid = []
+        self._skipped_slides = []
+
+        for slide_path in self.slides:
+            try:
+                zarr_path = os.path.join(self.zarr_dir, os.path.basename(slide_path).replace(".mrxs", ".zarr"))
+                if not os.path.exists(zarr_path):
+                    raise FileNotFoundError(f"Zarr path not found: {zarr_path}")
+
+                wsi = open_wsi(slide_path, zarr_path)
+
+                # Feature table exists and non-empty
+                if self.feature_key not in wsi.tables:
+                    raise KeyError(f"Feature key '{self.feature_key}' not found in zarr tables")
+                feats = wsi.tables[self.feature_key].X
+                if feats is None or getattr(feats, 'size', 0) == 0:
+                    raise ValueError("Empty feature array")
+
+                # Tile table exists
+                if self.tile_key not in wsi.shapes:
+                    raise KeyError(f"Tile key '{self.tile_key}' not found in zarr shapes")
+
+                valid.append(slide_path)
+
+            except Exception as e:
+                self._skipped_slides.append({
+                    "slide_path": slide_path,
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                })
+                print(f"Skipping slide {slide_path}: {type(e).__name__}: {e}")
+
+        print(f"Validation complete: {len(valid)}/{len(self.slides)} valid slides; {len(self._skipped_slides)} skipped.")
+        return valid
+
+    def _infer_slide(self, slide_path: str):
+        """ Infer one slide and cache result. """
+        if slide_path in self._slide_cache:
+            return self._slide_cache[slide_path]
+
+        # Load features and tile information for one slide.
+        dataset = self._single_slide_dataset(slide_path)
+        feats, _, _ = dataset[0]
+
+        if feats.shape[0] == 0:
+            raise ValueError(f"No tiles found for slide: {slide_path}")
+
+        feats = feats.to(self.device)
+        with torch.no_grad():
+            logits, attention = self.model(feats)
+
+        probs = torch.softmax(logits.float(), dim=0).detach().cpu().numpy()
+        pred_idx = int(np.argmax(probs))
+        attention = attention.detach().cpu().numpy()
+        if attention.ndim == 2 and attention.shape[1] == 1:
+            attention = attention.squeeze(1)
+
+        zarr_path = os.path.join(self.zarr_dir, os.path.basename(slide_path).replace(".mrxs", ".zarr"))
+        wsi = open_wsi(slide_path, zarr_path)
+
+        if attention.ndim == 1:
+            attention_for_table = attention
+        else:
+            attention_for_table = attention.mean(axis=1)
+
+        # Build a tile table with attention scores and geometries
+        wsi.tables[self.feature_key].obs["attention"] = attention_for_table
+        attention_df = wsi.tables[self.feature_key].obs[["tile_id", "attention"]].copy()
+        tile_df = wsi.shapes[self.tile_key][["tile_id", "geometry"]].copy()
+        tile_table = pd.merge(attention_df, tile_df, on="tile_id", how="inner")
+
+        slide_data = {
+            "slide_path": slide_path,
+            "zarr_path": zarr_path,
+            "feature_key": self.feature_key,
+            "tile_key": self.tile_key,
+            "attention": attention,
+            "tile_table": tile_table,
+            "pred_idx": pred_idx,
+            "pred_label": self.idx_to_label.get(pred_idx, pred_idx),
+            "confidence": float(probs[pred_idx]),
+        }
+        slide_data.update({f"prob_{self.idx_to_label.get(i, i)}": float(prob) for i, prob in enumerate(probs)})
+
+        self._slide_cache[slide_path] = slide_data
+        self.save_cache()
+        return slide_data
+
+
+    def process_slides(self, validate: bool = True):
+        """ Batch process slides and cache results. """
+        slides_to_process = self.validate_slides() if validate else self.slides
+        processed_count = 0
+
+        for slide_path in slides_to_process:
+            try:
+                self._infer_slide(slide_path)
+                processed_count += 1
+            except Exception as e:
+                self._skipped_slides.append({
+                    "slide_path": slide_path,
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                })
+                print(f"Skipping slide {slide_path}: {type(e).__name__}: {e}")
+
+        print(f"Processed {processed_count}/{len(slides_to_process)} slides.")
+        if self.cache_path:
+            print(f"Cache saved to {self.cache_path}.")
+        if self._skipped_slides:
+            print(f"Skipped {len(self._skipped_slides)} slides due to errors.")
+
+    def attention_heatmap(self, slide_path: str):
+        """ Plot the attention heatmap for one cached slide. """
+        slide_data = self._slide_cache.get(slide_path)
+        if not slide_data:
+            print(f"No cached data found for slide: {slide_path}")
+            return None
+
+        wsi = open_wsi(slide_path, slide_data["zarr_path"])
+        attention = np.asarray(slide_data["attention"], dtype=float)
+
+        if attention.ndim > 1:
+            attention = attention.mean(axis=1)
+
+        if attention.size:
+            low, high = np.percentile(attention, [5, 99])
+            if high > low:
+                # Scale attention to [0, 1] for visualization, clipping extreme values
+                attention_display = np.clip((attention - low) / (high - low + 1e-8), 0.0, 1.0)
+            else:
+                attention_display = attention.copy()
+        else:
+            attention_display = attention
+
+        print(
+            f"Attention stats for {os.path.basename(slide_path)}: "
+            f"min={attention.min():.4f}, p5={np.percentile(attention, 5):.4f}, "
+            f"median={np.median(attention):.4f}, p99={np.percentile(attention, 99):.4f}, "
+            f"max={attention.max():.4f}"
+        )
+
+        wsi.tables[slide_data["feature_key"]].obs["attention_display"] = attention_display
+
+        fig, ax = plt.subplots(figsize=(10, 10))
+        zs.pl.tiles(
+            wsi,
+            tile_key=slide_data["tile_key"],
+            feature_key=slide_data["feature_key"],
+            color="attention_display",
+            cmap="hot",
+            vmin=0,
+            vmax=1,
+            show_contours=True,
+            ax=ax,
+        )
+        ax.set_title(f"Attention heatmap: {os.path.basename(slide_path)}, Predicted: {slide_data['pred_label']} (Conf: {slide_data['confidence']:.2f})")
+        ax.axis("off")
+        plt.show()
+
+    def results_dataframe(self):
+        """ Return one row per cached slide with predictions and class probabilities. """
+        if not self._slide_cache:
+            print("No cached results found. Run process_slides() first.")
+            return pd.DataFrame()
+    
+        rows = []
+        for slide_path, cached in self._slide_cache.items():
+            rows.append({
+                "slide_path": slide_path,
+                "pred_idx": cached.get("pred_idx"),
+                "pred_label": cached.get("pred_label"),
+                "confidence": cached.get("confidence"),
+                **{col: cached.get(col) for col in cached if col.startswith("prob_")},
+            })
+        return pd.DataFrame(rows)
