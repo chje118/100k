@@ -8,45 +8,47 @@ from datetime import datetime
 import pickle
 import shutil
 
-def load_big_cache(cache_file):
+# --------------------
+# Cache handling
+# --------------------
+
+def _load_cache(cache_file):
+    """ Load segmentation cache from pickle file. Returns empty dict if file doesn't exist. """
     if os.path.exists(cache_file):
         with open(cache_file, "rb") as f:
             return pickle.load(f)
     return {}
 
-def save_big_cache(big_cache, cache_file):
+def _save_cache(data, cache_file):
+    """ Atomically save segmentation cache to pickle file using temp file. """
     tmp_file = cache_file + ".tmp"
     with open(tmp_file, "wb") as f:
-        pickle.dump(big_cache, f)
+        pickle.dump(data, f)
     os.replace(tmp_file, cache_file)
 
-def already_processed(big_cache):
-    """Return a dict of {(slide_name, category, version): status} for all processed entries."""
+def _get_processed_entries(cache):
+    """Extract all processed (slide, category, version) entries from cache with their statuses.
+    
+    Returns:
+        dict: {(slide_name, category, version): status}
+    """
     processed = {}
-    for slide, categories in big_cache.items():
+    for slide, categories in cache.items():
         for category, versions in categories.items():
             for version, data in versions.items():
                 status = data.get("status", "unknown")
                 processed[(slide, category, version)] = status
     return processed
 
-def is_empty_array(arr):
-        if arr is None:
-            return True
-        if hasattr(arr, "is_empty"):
-            return arr.is_empty.all()
-        try:
-            return arr.sum() == 0
-        except Exception:
-            return len(arr) == 0
-
-def remove_zarr_path(zarr_path):
+def _remove_zarr_path(zarr_path):
+    """ Remove Zarr directory or file. """
     if os.path.isdir(zarr_path):
         shutil.rmtree(zarr_path)
     elif os.path.exists(zarr_path):
         os.remove(zarr_path)
 
-def open_wsi_with_recovery(wsi_paths, zarr_dir):
+def validate_zarr_caches(wsi_paths, zarr_dir):
+    """ Validate and recover Zarr caches for all WSI paths. Removes corrupted caches. """
     for path in wsi_paths:
         zarr_path = os.path.join(zarr_dir, os.path.basename(path).replace(".mrxs", ".zarr"))
         if not os.path.exists(zarr_path):
@@ -57,14 +59,35 @@ def open_wsi_with_recovery(wsi_paths, zarr_dir):
             continue
         except Exception as e:
             print(f"Existing zarr at {zarr_path} failed to open: {e}; removing it.")
-            remove_zarr_path(zarr_path)
+            _remove_zarr_path(zarr_path)
             continue
 
+def is_empty_array(arr) -> bool:
+    """ Check if array/geometry collection is empty. Handles None, empty geometries, and zero arrays. """
+    if arr is None:
+        return True
+    if hasattr(arr, "is_empty"):
+        return arr.is_empty.all()
+    try:
+        return arr.sum() == 0
+    except Exception:
+        return len(arr) == 0
+
+# --------------------
+# Tissue Segmentation
+# --------------------
+ 
 class SegmentTissue:
-    def __init__(self, wsi_path, local_zarr_dir, version="default"):
+    """ 
+    Tissue segmentation for a single WSI. 
+    Supports multiple segmentation versions: 'default', 'grandqc', 'threshold'.
+    """
+    VALID_VERSIONS = ["default", "grandqc", "threshold"]
+    
+    def __init__(self, wsi_path, zarr_dir, version="default"):
         self.wsi_path = wsi_path
-        self.zarr_path = os.path.join(local_zarr_dir, os.path.basename(wsi_path).replace(".mrxs", ".zarr"))
-        os.makedirs(local_zarr_dir, exist_ok=True)
+        self.zarr_path = os.path.join(zarr_dir, os.path.basename(wsi_path).replace(".mrxs", ".zarr"))
+        os.makedirs(zarr_dir, exist_ok=True)
         self.wsi = open_wsi(wsi_path, self.zarr_path) if os.path.exists(self.zarr_path) else open_wsi(wsi_path)
         if version not in ["default", "grandqc", "threshold",'threshold2']:
             raise ValueError("version must be one of ['default', 'grandqc', 'threshold','threshold2']")
