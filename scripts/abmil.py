@@ -372,9 +372,9 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
             # Early stopping
             if epochs_no_improve >= early_stopping_patience:
                 print(f"\nEarly stopping at epoch {epoch+1}")
-                model.load_state_dict(best_model_state)
-                break
-        
+                if best_model_state is not None:
+                    model.load_state_dict(best_model_state)
+                break        
         print()
 
     if val_dataset is not None and early_stopping_patience is not None and best_epoch == 0:
