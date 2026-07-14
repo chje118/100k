@@ -1,16 +1,23 @@
 import os
-from wsidata import open_wsi
-import lazyslide as zs
 from datetime import datetime
-import pandas as pd
 import geopandas as gpd
+import pandas as pd
 import torch
 from tqdm import tqdm
+import lazyslide as zs
 import gc
+from tissue_artifact_segmentation import is_empty_array
+from wsidata import open_wsi
+
+# --------------------
+# Nvidia H100 Optimizations
+# --------------------
+
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 def _configure_h100() -> None:
+    """Enable GPU settings that improve throughput on H100-class hardware."""
     if not torch.cuda.is_available():
         print("CUDA is not available. Running on CPU.")
         return
@@ -28,65 +35,62 @@ def _configure_h100() -> None:
 _configure_h100()
 
 
+# --------------------
+# Feature extraction
+# --------------------
+
 class ExtractFeatures:
+    """Extract tile embeddings and aggregate slide-level features for a single WSI."""
+
     def __init__(
         self,
         wsi_path,
-        local_zarr_dir,
-        model,
+        zarr_dir,
+        foundation_model,
         remove_artifacts=False,
         feature_batch_size=512,
         feature_num_workers=None,
         feature_autocast_dtype=None,
     ):
         self.wsi_path = wsi_path
-        self.zarr_path = os.path.join(local_zarr_dir, os.path.basename(wsi_path).replace(".mrxs", ".zarr"))
-        os.makedirs(local_zarr_dir, exist_ok=True)
+        self.zarr_path = os.path.join(zarr_dir, os.path.basename(wsi_path).replace(".mrxs", ".zarr"))
+        os.makedirs(zarr_dir, exist_ok=True)
         self.wsi = open_wsi(self.wsi_path, self.zarr_path)
-        self.model_name = model
+        self.foundation_model = foundation_model
         self.remove_artifacts = remove_artifacts
-        
-        # Configure feature extraction parameters, with sensible defaults for H100
-        self.feature_batch_size = feature_batch_size
+
         cpu_count = os.cpu_count() or 8
-        self.feature_num_workers = feature_num_workers if feature_num_workers is not None else max(4, min(16, cpu_count // 2))
-        self.feature_autocast_dtype = feature_autocast_dtype or torch.bfloat16  # bf16 is ideal on H100 tensor cores
-        
-        if remove_artifacts: 
-            self.TILE_KEY = "clean_tiles_224"
-            self.FEATURE_KEY = f'clean_features_{self.model_name}'
-        else:
-            self.TILE_KEY = "tiles_224"
-            self.FEATURE_KEY = f'features_{self.model_name}'
+        self.feature_batch_size = feature_batch_size
+        self.feature_num_workers = (
+            feature_num_workers if feature_num_workers is not None else max(4, min(16, cpu_count // 2))
+        )
+        self.feature_autocast_dtype = feature_autocast_dtype or torch.bfloat16
+
+        self.TILE_KEY = "clean_tiles_224" if remove_artifacts else "tiles_224"
+        self.FEATURE_KEY = (f"clean_features_{self.foundation_model}" if remove_artifacts else f"features_{self.foundation_model}")
         self.elapsed_time = None
+
         self.process_slide()
-    
-    def is_empty_array(self, arr):
-        if arr is None:
-            return True
-        if hasattr(arr, "is_empty"):
-            return arr.is_empty.all()
-        try:
-            return len(arr) == 0
-        except Exception:
-            pass
-        try:
-            return arr.sum() == 0
-        except Exception:
-            return False
+
+    def _find_tissue_key(self):
+        """Locate available tissue segmentation key."""
+        tissue_candidates = [key for key in ['tissue_default', 'tissue_grandqc', 'tissue_threshold'] if key in self.wsi.shapes]
+        if not tissue_candidates:
+            raise KeyError("No tissue key found. ")
+        return tissue_candidates
 
     def process_slide(self):
         try:
-            # TODO allow threshold key as fallback
-            default_key = 'tissue_default'
-            if default_key in self.wsi.shapes:
-                self.TISSUE_KEY = default_key
+            tissue_keys = self._find_tissue_key()
+            for key in tissue_keys:
+                tissue = self.wsi.get(key)
+                if not is_empty_array(tissue):
+                    self.tissue_key = key
+                    print(f"Using tissue key: {self.tissue_key}")
+                    break
             else:
                 raise RuntimeError(f"No tissue key found")
 
-            tissue = self.wsi.get(self.TISSUE_KEY)
-            if self.is_empty_array(tissue):
-                raise RuntimeError(f"No tissue detected")
 
             if self.TILE_KEY not in self.wsi.shapes:
                 self.tile_tissue()
@@ -126,11 +130,11 @@ class ExtractFeatures:
     def extract_features(self):
         try:
             if self.FEATURE_KEY not in self.wsi.tables:
-                if self.model_name == "conch":
+                if self.foundation_model == "conch":
                     start_time = datetime.now()
                     zs.tl.feature_extraction(
                         self.wsi,
-                        model=self.model_name,
+                        model=self.foundation_model,
                         tile_key=self.TILE_KEY,
                         key_added=self.FEATURE_KEY,
                         device='cpu',
@@ -141,7 +145,7 @@ class ExtractFeatures:
                     start_time = datetime.now()
                     zs.tl.feature_extraction(
                         self.wsi,
-                        model=self.model_name,
+                        model=self.foundation_model,
                         tile_key=self.TILE_KEY,
                         key_added=self.FEATURE_KEY,
                         device="cuda" if torch.cuda.is_available() else 'cpu',

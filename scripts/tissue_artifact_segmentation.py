@@ -60,7 +60,6 @@ def validate_zarr_caches(wsi_paths, zarr_dir):
             _remove_zarr_path(zarr_path)
             continue
 
-
 def is_empty_array(arr) -> bool:
     """Check if array/geometry collection is empty. Handles None, empty geometries, and zero arrays."""
     if arr is None:
