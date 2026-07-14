@@ -1,9 +1,7 @@
 from wsidata import open_wsi
 import lazyslide as zs
 import os
-import pandas as pd
 from tqdm import tqdm
-import gc
 from datetime import datetime
 import pickle
 import shutil
