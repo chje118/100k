@@ -204,7 +204,6 @@ class ExtractMany:
             df_existing = df_existing[df_existing["model"] == self.model]
 
             return {os.path.abspath(str(p)) for p in df_existing["wsi_path"].dropna()}
-
         except Exception:
             return set()
 
@@ -215,7 +214,7 @@ class ExtractMany:
         print(f"Found {len(processed_slides)} slides already processed.")
         print(f"{len(remaining_paths)} remaining to process.")
 
-        for path in tqdm(remaining_paths, desc="feature extraction progress"):
+        for path in tqdm(self.wsi_paths, desc="feature extraction progress"):
             slide_name = os.path.basename(path)
             print(f"\nProcessing {slide_name}...")
             try:
