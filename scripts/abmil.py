@@ -372,12 +372,14 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
             # Early stopping
             if epochs_no_improve >= early_stopping_patience:
                 print(f"\nEarly stopping at epoch {epoch+1}")
-                model.load_state_dict(best_model_state)
-                break
-        
+                if best_model_state is not None:
+                    model.load_state_dict(best_model_state)
+                break        
         print()
 
     if val_dataset is not None and early_stopping_patience is not None and best_epoch == 0:
+        best_epoch = n_epochs
+    elif val_dataset is None or early_stopping_patience is None:
         best_epoch = n_epochs
 
     return model, best_model_state, best_epoch
@@ -664,7 +666,7 @@ class TrainABMILPipeline:
 
         epochs = self.best_epoch if n_epochs is None else n_epochs
 
-        self.model, _ = train_ABMIL(
+        self.model, _, _ = train_ABMIL(
             train_df=df,
             train_dataset=full_dataset,
             val_dataset=None,
@@ -790,7 +792,7 @@ class KFoldPipeline:
     
         df, label_mapping = self._map_labels(self.df)
         skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-    
+
         fold_ovr_auc_scores = []
         fold_per_class_aucs = []
         fold_accuracies = []
@@ -800,7 +802,6 @@ class KFoldPipeline:
 
         print(f"Starting {n_splits}-fold cross-validation with early stopping (patience={early_stopping_patience})...")
         print(f"Train (80%) → 90% training / 10% internal val | Test (20%) → final evaluation")
-
 
         start_fold = 1
         checkpoint_by_fold = {}
@@ -825,16 +826,16 @@ class KFoldPipeline:
             print(f"Resume mode enabled. Found checkpoints for folds: {sorted(checkpoint_by_fold.keys())}")
             print(f"Will train from fold {start_fold}/{n_splits}")
 
-        for fold_idx, (train_idx, test_idx) in enumerate(skf.split(self.df, self.df[self.label_col])):
+        for fold_idx, (train_idx, test_idx) in enumerate(skf.split(df, df[self.label_col])):
             fold_num = fold_idx + 1
             print(f"\n{'='*60}")
             print(f"Fold {fold_num}/{n_splits}")
             print(f"{'='*60}")
-        
+
             # Split fold into 80% train + 20% test
-            fold_df = self.df.iloc[train_idx].reset_index(drop=True)
-            test_df = self.df.iloc[test_idx].reset_index(drop=True)
-        
+            fold_df = df.iloc[train_idx].reset_index(drop=True)
+            test_df = df.iloc[test_idx].reset_index(drop=True)
+
             # Further split train into 90% train_subset + 10% internal_val (use fold-specific seed)
             split_seed = random_state + fold_num
             train_subset_df, internal_val_df = train_test_split(
@@ -878,7 +879,7 @@ class KFoldPipeline:
 
             # Train model on train_subset with early stopping on internal_val
             # Use fold-specific seed derived from random_state for reproducibility
-            model, _ = train_ABMIL(
+            model, _, _ = train_ABMIL(
                 train_df=train_subset_df,
                 train_dataset=train_dataset,
                 val_dataset=internal_val_dataset, 
