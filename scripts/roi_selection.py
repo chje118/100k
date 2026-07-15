@@ -8,10 +8,11 @@ import geopandas as gpd
 
 class ROISelector:
     """ Handle ROI selection from cached ABMIL inference results. """
-    def __init__(self, cache_path: str, slide_path: str, top_k: int = 100):
+    def __init__(self, cache_path: str, slide_path: str, top_k: int = 20, bottom_k: int = 10):
         self.cache_path = cache_path
         self.slide_path = slide_path
         self.top_k = top_k
+        self.bottom_k = bottom_k
         self.slide_cache = self.load_cache(cache_path)
         self.slide_data = self.get_slide_data()
 
@@ -27,17 +28,20 @@ class ROISelector:
             raise KeyError(f"No cached data found for slide: {self.slide_path}")
         return slide_data
 
-    def top_tiles_from_slide_data(self) -> gpd.GeoDataFrame:
-        """ Return the top-k tiles from cached slide data. """
+    def tiles_from_slide_data(self, top: bool = True) -> gpd.GeoDataFrame:
+        """ Return the top-k or bottom-k tiles from cached slide data. """
         tile_table = self.slide_data.get("tile_table")
         if tile_table is None:
             raise KeyError("slide_data must contain 'tile_table'")
-        top_tiles = tile_table.sort_values("attention", ascending=False).head(self.top_k).copy()
-        return gpd.GeoDataFrame(top_tiles, geometry="geometry")
+        if top:
+            tiles = tile_table.sort_values("attention", ascending=False).head(self.top_k).copy()
+        else:
+            tiles = tile_table.sort_values("attention", ascending=True).head(self.bottom_k).copy()
+        return gpd.GeoDataFrame(tiles, geometry="geometry")
 
-    def zoomed_view(self, margin: int = 0, max_tiles: int = 4):
+    def zoomed_view(self, margin: int = 0, max_tiles: int = 4, top: bool = True):
         """ Plot zoomed tiles (grid) for review from cached slide data. """
-        top_tiles_gdf = self.top_tiles_from_slide_data()
+        top_tiles_gdf = self.tiles_from_slide_data(top=top)
         if max_tiles is not None:
             top_tiles_gdf = top_tiles_gdf.head(max_tiles)
 
@@ -73,11 +77,10 @@ class ROISelector:
         plt.show()
 
     def tiles_to_cut(self):
-        """ Plot the full slide and highlight the top-k tiles to cut. """
-        top_tiles_gdf = self.top_tiles_from_slide_data()
-        selected_tiles = top_tiles_gdf[top_tiles_gdf.geometry.notna()].copy()
+        """ Plot the full slide and highlight the top-k and bottom-k tiles to cut with red and blue. """
+        top_tiles_gdf = self.tiles_from_slide_data(top=True)
+        bottom_tiles_gdf = self.tiles_from_slide_data(top=False)
         wsi = self.get_wsi()
-        tile_key = self.slide_data["tile_key"]
 
         fig, ax = plt.subplots(figsize=(12, 12))
         zs.pl.tissue(
@@ -85,16 +88,21 @@ class ROISelector:
             ax=ax,
             show_contours=True,
         )
-        selected_tiles.plot(
+        top_tiles_gdf.plot(
             ax=ax,
             facecolor="#ff2d2d",
             edgecolor="#b30000",
             linewidth=1.5,
             alpha=0.35,
         )
-        selected_tiles.boundary.plot(ax=ax, color="#7f0000", linewidth=1.0)
-
-        ax.set_title(f"Top {len(selected_tiles)} tiles selected for cutting")
+        bottom_tiles_gdf.plot(
+            ax=ax,
+            facecolor="#2d2dff",
+            edgecolor="#0000b3",
+            linewidth=1.5,
+            alpha=0.35,
+        )
+        ax.set_title(f"Top {len(top_tiles_gdf)} (red) and bottom {len(bottom_tiles_gdf)} (blue) tiles selected for cutting")
         ax.axis("off")
         plt.tight_layout()
         plt.show()
@@ -111,10 +119,16 @@ class ROISelector:
 
     def napari_polygons(self):
         """ Return list of polygon coordinate arrays suitable for Napari `add_shapes`."""
-        top_tiles_gdf = self.top_tiles_from_slide_data()
-        polygons = [
+        top_tiles_gdf = self.tiles_from_slide_data(top=True)
+        bottom_tiles_gdf = self.tiles_from_slide_data(top=False)
+        polygons_top = [
             np.array(g.exterior.coords)
             for g in top_tiles_gdf.geometry
             if g.geom_type == "Polygon"
         ]
-        return polygons
+        polygons_bottom = [
+            np.array(g.exterior.coords)
+            for g in bottom_tiles_gdf.geometry
+            if g.geom_type == "Polygon"
+        ]
+        return polygons_top, polygons_bottom
