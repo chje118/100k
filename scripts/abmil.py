@@ -1098,7 +1098,6 @@ class ABMILInference:
         self.save_cache()
         return slide_data
 
-
     def process_slides(self, validate: bool = True):
         """ Batch process slides and cache results. """
         slides_to_process = self.validate_slides() if validate else self.slides
