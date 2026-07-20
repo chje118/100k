@@ -28,7 +28,7 @@ class ROISelector:
             raise KeyError(f"No cached data found for slide: {self.slide_path}")
         return slide_data
 
-    def tiles_from_slide_data(self, top: bool = True) -> gpd.GeoDataFrame:
+    def get_tiles_gdf(self, top: bool = True) -> gpd.GeoDataFrame:
         """ Return the top-k or bottom-k tiles from cached slide data. """
         tile_table = self.slide_data.get("tile_table")
         if tile_table is None:
@@ -41,7 +41,7 @@ class ROISelector:
 
     def zoomed_view(self, margin: int = 0, max_tiles: int = 4, top: bool = True):
         """ Plot zoomed tiles (grid) for review from cached slide data. """
-        top_tiles_gdf = self.tiles_from_slide_data(top=top)
+        top_tiles_gdf = self.get_tiles_gdf(top=top)
         if max_tiles is not None:
             top_tiles_gdf = top_tiles_gdf.head(max_tiles)
 
@@ -78,8 +78,8 @@ class ROISelector:
 
     def tiles_to_cut(self):
         """ Plot the full slide and highlight the top-k and bottom-k tiles to cut with red and blue. """
-        top_tiles_gdf = self.tiles_from_slide_data(top=True)
-        bottom_tiles_gdf = self.tiles_from_slide_data(top=False)
+        top_tiles_gdf = self.get_tiles_gdf(top=True)
+        bottom_tiles_gdf = self.get_tiles_gdf(top=False)
         wsi = self.get_wsi()
 
         fig, ax = plt.subplots(figsize=(12, 12))
@@ -119,8 +119,8 @@ class ROISelector:
 
     def napari_polygons(self):
         """ Return list of polygon coordinate arrays suitable for Napari `add_shapes`."""
-        top_tiles_gdf = self.tiles_from_slide_data(top=True)
-        bottom_tiles_gdf = self.tiles_from_slide_data(top=False)
+        top_tiles_gdf = self.get_tiles_gdf(top=True)
+        bottom_tiles_gdf = self.get_tiles_gdf(top=False)
         polygons_top = [
             np.array(g.exterior.coords)
             for g in top_tiles_gdf.geometry
