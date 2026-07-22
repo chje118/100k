@@ -28,20 +28,18 @@ class ROISelector:
             raise KeyError(f"No cached data found for slide: {self.slide_path}")
         return slide_data
 
-    def get_tiles_gdf(self, top: bool = True) -> gpd.GeoDataFrame:
+    def get_tiles_gdf(self):
         """ Return the top-k or bottom-k tiles from cached slide data. """
         tile_table = self.slide_data.get("tile_table")
         if tile_table is None:
             raise KeyError("slide_data must contain 'tile_table'")
-        if top:
-            tiles = tile_table.sort_values("attention", ascending=False).head(self.top_k).copy()
-        else:
-            tiles = tile_table.sort_values("attention", ascending=True).head(self.bottom_k).copy()
-        return gpd.GeoDataFrame(tiles, geometry="geometry")
+        top_tiles = tile_table.sort_values("attention", ascending=False).head(self.top_k).copy()
+        bottom_tiles = tile_table.sort_values("attention", ascending=True).head(self.bottom_k).copy()
+        return gpd.GeoDataFrame(top_tiles, geometry="geometry"), gpd.GeoDataFrame(bottom_tiles, geometry="geometry")
 
     def zoomed_view(self, margin: int = 0, max_tiles: int = 4, top: bool = True):
         """ Plot zoomed tiles (grid) for review from cached slide data. """
-        top_tiles_gdf = self.get_tiles_gdf(top=top)
+        top_tiles_gdf, bottom_tiles_gdf = self.get_tiles_gdf()
         if max_tiles is not None:
             top_tiles_gdf = top_tiles_gdf.head(max_tiles)
 
@@ -78,8 +76,7 @@ class ROISelector:
 
     def tiles_to_cut(self):
         """ Plot the full slide and highlight the top-k and bottom-k tiles to cut with red and blue. """
-        top_tiles_gdf = self.get_tiles_gdf(top=True)
-        bottom_tiles_gdf = self.get_tiles_gdf(top=False)
+        top_tiles_gdf, bottom_tiles_gdf = self.get_tiles_gdf()
         wsi = self.get_wsi()
 
         fig, ax = plt.subplots(figsize=(12, 12))
@@ -119,8 +116,7 @@ class ROISelector:
 
     def napari_polygons(self):
         """ Return list of polygon coordinate arrays suitable for Napari `add_shapes`."""
-        top_tiles_gdf = self.get_tiles_gdf(top=True)
-        bottom_tiles_gdf = self.get_tiles_gdf(top=False)
+        top_tiles_gdf, bottom_tiles_gdf = self.get_tiles_gdf()
         polygons_top = [
             np.array(g.exterior.coords)
             for g in top_tiles_gdf.geometry
