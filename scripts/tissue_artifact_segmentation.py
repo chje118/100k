@@ -25,18 +25,26 @@ def _save_cache(data, cache_file):
     os.replace(tmp_file, cache_file)
 
 def _get_processed_entries(cache):
-    """Extract all processed (slide, category, version) entries from cache with their statuses.
+    """Extract all processed (slide, category, model) entries from cache.
     
     Returns:
-        dict: {(slide_name, category, version): status}
+        dict: {(slide_name, category, model): entry_data}
     """
     processed = {}
-    for slide, categories in cache.items():
-        for category, versions in categories.items():
-            for version, data in versions.items():
-                status = data.get("status", "unknown")
-                processed[(slide, category, version)] = status
+    for slide_name, categories in cache.items():
+        if not isinstance(categories, dict):
+            continue
+        for category, models in categories.items():
+            if not isinstance(models, dict):
+                continue
+            for model, data in models.items():
+                if isinstance(data, dict):
+                    processed[(slide_name, category, model)] = data
     return processed
+
+def _store_processed_entry(cache, slide_name, category, model, data):
+    """Store a processed entry using the slide -> category -> model layout."""
+    cache.setdefault(slide_name, {}).setdefault(category, {})[model] = data
 
 def _remove_zarr_path(zarr_path):
     """Safely remove Zarr directory or file."""
@@ -276,39 +284,64 @@ class SegmentMany:
             slide_name = os.path.basename(path)
             cache_key = (slide_name, self.segmentation_type, self.version)
 
-            if cache_key in self.processed and self.processed[cache_key] == "complete":
+            if cache_key in self.processed and self.processed[cache_key].get("status") == "complete":
                 print(f"Skipping {slide_name} — already processed")
                 continue
 
-            if cache_key in self.processed and self.processed[cache_key].startswith("error:") and not self.retry_on_previos_errors:
-                print(f"Skipping {slide_name} — previously failed: {self.processed[cache_key]}. Enable retry with retry_on_previos_errors=True.")
+            if (
+                cache_key in self.processed
+                and str(self.processed[cache_key].get("status", "")).startswith("error:")
+                and not self.retry_on_previos_errors
+            ):
+                print(
+                    f"Skipping {slide_name} — previously failed: {self.processed[cache_key].get('status')}. "
+                    f"Enable retry with retry_on_previos_errors=True."
+                )
                 continue
 
             try:
                 if self.segmentation_type == "tissue":
                     wsiobj = SegmentTissue(path, self.zarr_dir, version=self.version)
                     slide_data = {
+                        "slide": slide_name,
+                        "wsi_path": path,
+                        "category": self.segmentation_type,
+                        "model": self.version,
                         "size": wsiobj.get_full_tissue_area(),
                         "elapsed_time": wsiobj.elapsed_time,
+                        "tissue_key": wsiobj.tissue_key,
                         "status": "complete"
                     }
                 elif self.segmentation_type == "artifact":
                     wsiobj = SegmentArtifacts(path, self.zarr_dir, version=self.version)
                     slide_data = {
+                        "slide": slide_name,
+                        "wsi_path": path,
+                        "category": self.segmentation_type,
+                        "model": self.version,
                         "pct": wsiobj.get_artifact_percentage(),
                         "df": wsiobj.get_artifact_dataframe(),
                         "elapsed_time": wsiobj.elapsed_time,
+                        "tissue_key": wsiobj.tissue_key,
+                        "tile_key": wsiobj.tile_key,
+                        "artifact_key": wsiobj.artifact_key,
                         "status": "complete"
                     }
 
-                self.cache.setdefault(slide_name, {}).setdefault(self.segmentation_type, {})[self.version] = slide_data
+                _store_processed_entry(self.cache, slide_name, self.segmentation_type, self.version, slide_data)
                 _save_cache(self.cache, self.cache_path)
                 del wsiobj
 
             except Exception as e:
                 print(f"Error processing {slide_name}: {e}")
-                slide_data = {"status": f"error: {str(e)}"}
-                self.cache.setdefault(slide_name, {}).setdefault(self.segmentation_type, {})[self.version] = slide_data
+                slide_data = {
+                    "slide": slide_name,
+                    "wsi_path": path,
+                    "category": self.segmentation_type,
+                    "model": self.version,
+                    "status": f"error: {str(e)}",
+                }
+                _store_processed_entry(self.cache, slide_name, self.segmentation_type, self.version, slide_data)
                 _save_cache(self.cache, self.cache_path)
 
 
