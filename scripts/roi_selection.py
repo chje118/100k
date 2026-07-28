@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 from wsidata import open_wsi
 import geopandas as gpd
+from spatialdata.models import ShapesModel
 
 class ROISelector:
     """ Handle ROI selection from cached ABMIL inference results. """
@@ -110,20 +111,25 @@ class ROISelector:
         self.wsi = open_wsi(slide_path, zarr_path)
         return self.wsi
     
-    def get_sdata(self):
+    def get_sdata_lmd(self):
         self.sdata = self.wsi.to_spatialdata()
-        return self.sdata
+        top_gdf, bottom_gdf = self.get_tiles_gdf()
+        self.sdata.shapes["top_tiles"] = ShapesModel.parse(top_gdf)
+        self.sdata.shapes["bottom_tiles"] = ShapesModel.parse(bottom_gdf)
+        export_layers = ["wsi_thumbnail", "top_tiles", "bottom_tiles"]
+        sdata_lmd = self.sdata.subset(element_names=export_layers)
+        return sdata_lmd
 
     def napari_polygons(self):
         """ Return list of polygon coordinate arrays suitable for Napari `add_shapes`."""
         top_tiles_gdf, bottom_tiles_gdf = self.get_tiles_gdf()
         polygons_top = [
-            np.array(g.exterior.coords)
+            np.array(g.exterior.coords)[:, [1, 0]]
             for g in top_tiles_gdf.geometry
             if g.geom_type == "Polygon"
         ]
         polygons_bottom = [
-            np.array(g.exterior.coords)
+            np.array(g.exterior.coords)[:, [1, 0]]
             for g in bottom_tiles_gdf.geometry
             if g.geom_type == "Polygon"
         ]
