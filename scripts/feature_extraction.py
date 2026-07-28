@@ -7,7 +7,13 @@ import pickle
 import torch
 from tqdm import tqdm
 import lazyslide as zs
-from tissue_artifact_segmentation import is_empty_array, _load_cache, _save_cache, _get_processed_entries
+from tissue_artifact_segmentation import (
+    is_empty_array,
+    _load_cache,
+    _save_cache,
+    _get_processed_entries,
+    _store_processed_entry,
+)
 from wsidata import open_wsi
 
 # --------------------
@@ -210,7 +216,7 @@ class ExtractMany:
         
         # Load cache and track processed slides
         self.cache = _load_cache(cache_path)
-        self.processed = _get_processed_entries(cache_path, self.foundation_model)
+        self.processed = _get_processed_entries(self.cache)
         
         self.extract_features()
 
@@ -219,11 +225,13 @@ class ExtractMany:
         skipped = 0
         for path in tqdm(self.wsi_paths, desc="feature extraction progress"):
             slide_name = os.path.basename(path)
-            abs_path = os.path.abspath(path)
+            feature_key = f"features_{self.foundation_model}"
+            tile_key = "clean_tiles_224" if self.remove_artifacts else "tiles_224"
             
             # Check if already processed
-            if abs_path in self.processed:
-                status = self.processed[abs_path].get("status")
+            cache_key = (slide_name, "features", self.foundation_model)
+            if cache_key in self.processed:
+                status = self.processed[cache_key].get("status")
                 if status == "complete":
                     print(f"Skipping {slide_name} — already processed")
                     skipped += 1
@@ -248,24 +256,34 @@ class ExtractMany:
                 )
                 features = wsiobj.get_features()
                 elapsed_time = wsiobj.elapsed_time
+                feature_key = wsiobj.FEATURE_KEY
+                tile_key = wsiobj.TILE_KEY
+                feature_summary = {
+                    "n_tiles": int(features.n_obs),
+                    "feature_dim": int(features.n_vars),
+                }
                 status = "complete"
                 del wsiobj
             except Exception as e:
                 print(f"Error processing {slide_name}: {e}")
-                features = None
                 elapsed_time = None
+                feature_summary = {}
                 status = f"error: {str(e)}"
             
-            # Store result in cache indexed by model and absolute path
+            # Store result in the unified slide-first cache layout
             slide_data = {
                 "slide": slide_name,
                 "wsi_path": path,
-                "features": features,
+                "category": "features",
+                "model": self.foundation_model,
+                "feature_key": feature_key,
+                "tile_key": tile_key,
                 "elapsed_time": elapsed_time,
+                **feature_summary,
                 "status": status,
             }
-            self.cache.setdefault(self.foundation_model, {})[abs_path] = slide_data
-            _save_cache(self.cache_path, self.cache)
+            _store_processed_entry(self.cache, slide_name, "features", self.foundation_model, slide_data)
+            _save_cache(self.cache, self.cache_path)
             
             print(f"Saved result for {slide_name} → {self.cache_path}")
             gc.collect()
