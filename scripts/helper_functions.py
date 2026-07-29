@@ -2,13 +2,8 @@
 
 import pandas as pd
 import ast
-import matplotlib.pyplot as plt
-from collections import Counter
-from typing import Optional, Dict
-import math
 import re
 from tissue_artifact_segmentation import _load_cache, _get_processed_entries
-import os
 
 # ---------- General helper functions ----------
 
