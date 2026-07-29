@@ -67,6 +67,32 @@ def subset_df_list(df, col, val):
     df_subset = df[df[col].apply(lambda x: val in x)].copy()
     return df_subset
 
+def contains_word(cell, word):
+    """ Check if `word` (case-insensitive) is present in `cell`."""
+    # Normalize search term
+    w = str(word).lower()
+
+    # Missing values
+    if pd.isnull(cell):
+        return False
+
+    # Iterable containers (list/tuple/set)
+    if isinstance(cell, (list, tuple, set)):
+        for item in cell:
+            if item is None:
+                continue
+            if w in str(item).lower():
+                return True
+        return False
+
+    # Strings or other scalar types (use str fallback)
+    return w in str(cell).lower()
+
+def subset_df_word(df, col, word):
+    """ Return rows where `word` (case-insensitive) appears in `col`. """
+    mask = df[col].apply(contains_word, args=(word,))
+    return df[mask].copy()
+
 # ---------- SNOMED Helper Functions ----------
 
 def extract_snomed_codes(df, valid_codes, main_letters=("T", "M")):
