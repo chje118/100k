@@ -7,7 +7,7 @@ from collections import Counter
 from typing import Optional, Dict
 import math
 import re
-from tissue_artifact_segmentation import load_big_cache, already_processed
+from tissue_artifact_segmentation import _load_cache, _get_processed_entries
 import os
 
 # ---------- General Helper Function ----------
@@ -92,6 +92,7 @@ def subset_df_word(df, col, word):
     """ Return rows where `word` (case-insensitive) appears in `col`. """
     mask = df[col].apply(contains_word, args=(word,))
     return df[mask].copy()
+
 
 # ---------- SNOMED Helper Functions ----------
 
@@ -195,8 +196,8 @@ def find_team(row, team_column, text_columns, valid_teams):
 # ---------- Generate Subset ----------
 
 def with_tissue_artifact(df, cache_file, segmentation_type, status="complete", version="default"):
-    cache = load_big_cache(cache_file)
-    processed = already_processed(cache)
+    cache = _load_cache(cache_file)
+    processed = _get_processed_entries(cache)
 
     def lookup_status(path):
         slide_name = os.path.basename(path)
