@@ -965,7 +965,6 @@ class ABMILInference:
         self._skipped_slides = []
 
         # Ensure cache file exists (create empty cache if missing) and load it
-        # CHECK load cache
         if self.cache_path and os.path.exists(self.cache_path):
             loaded_cache = self.load_cache(self.cache_path)
             if isinstance(loaded_cache, dict):
@@ -979,7 +978,7 @@ class ABMILInference:
         self.idx_to_label = {v: k for k, v in self.label_mapping.items()} if self.label_mapping else {}
 
     def save_cache(self):
-        """ Save cached inference results to disk. """
+        """Save cached inference results to disk."""
         if not self.cache_path:
             return self._slide_cache
         os.makedirs(os.path.dirname(self.cache_path) or ".", exist_ok=True)
@@ -989,86 +988,45 @@ class ABMILInference:
 
     @staticmethod
     def load_cache(input_path):
-        """ Load a pickle cache file. """
+        """Load a pickle cache file."""
         with open(input_path, "rb") as f:
             return pickle.load(f)
-
-    def _single_slide_dataset(self, slide_path):
-        """ Build a one-row dataset for a single slide. """
-        df = pd.DataFrame({"slide_path": [slide_path], "label": [None]})
-        return ZarrSlideDataset(
-            df=df,
-            filename_col="slide_path",
-            label_col="label",
-            feature_key=self.feature_key,
-            tile_key=self.tile_key,
-            zarr_dir=self.zarr_dir,
-            max_tiles=None,
-            seed=None,
-            require_labels=False,
-        )
-
-    def validate_slides(self):
-        """ Validate slide/zarr availability and required feature/tile keys. """
-        valid = []
-        self._skipped_slides = []
-
-        for slide_path in self.slides:
-            try:
-                zarr_path = os.path.join(self.zarr_dir, os.path.basename(slide_path).replace(".mrxs", ".zarr"))
-                if not os.path.exists(zarr_path):
-                    raise FileNotFoundError(f"Zarr path not found: {zarr_path}")
-
-                wsi = open_wsi(slide_path, zarr_path)
-
-                # Feature table exists and non-empty
-                if self.feature_key not in wsi.tables:
-                    raise KeyError(f"Feature key '{self.feature_key}' not found in zarr tables")
-                feats = wsi.tables[self.feature_key].X
-                if feats is None or getattr(feats, 'size', 0) == 0:
-                    raise ValueError("Empty feature array")
-
-                # Tile table exists
-                if self.tile_key not in wsi.shapes:
-                    raise KeyError(f"Tile key '{self.tile_key}' not found in zarr shapes")
-
-                valid.append(slide_path)
-
-            except Exception as e:
-                self._skipped_slides.append({
-                    "slide_path": slide_path,
-                    "error_type": type(e).__name__,
-                    "error_message": str(e),
-                })
-                print(f"Skipping slide {slide_path}: {type(e).__name__}: {e}")
-
-        print(f"Validation complete: {len(valid)}/{len(self.slides)} valid slides; {len(self._skipped_slides)} skipped.")
-        return valid
-
+    
     def _infer_slide(self, slide_path: str):
-        """ Infer one slide and cache result. """
+        """Infer one slide and cache result."""
         if slide_path in self._slide_cache:
             return self._slide_cache[slide_path]
 
-        # Load features and tile information for one slide.
-        dataset = self._single_slide_dataset(slide_path)
-        feats, _, _ = dataset[0]
+        zarr_path = os.path.join(self.zarr_dir, os.path.basename(slide_path).replace(".mrxs", ".zarr"))
+        wsi = open_wsi(slide_path, zarr_path)
+
+        if self.feature_key not in wsi.tables:
+            raise KeyError(f"Feature key '{self.feature_key}' not found in zarr tables")
+        if self.tile_key not in wsi.shapes:
+            raise KeyError(f"Tile key '{self.tile_key}' not found in zarr shapes")
+
+        adata = wsi.tables[self.feature_key]
+        feats = torch.from_numpy(adata.X).float()
+        tile_ids = np.asarray(adata.obs["tile_id"])
 
         if feats.shape[0] == 0:
             raise ValueError(f"No tiles found for slide: {slide_path}")
 
-        feats = feats.to(self.device)
+        feats = feats.to(self.device, non_blocking=True)
+
         with torch.no_grad():
-            logits, attention = self.model(feats)
+            if self.device.type == "cuda":
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    logits, attention = self.model(feats)
+            else:
+                logits, attention = self.model(feats)
 
         probs = torch.softmax(logits.float(), dim=0).detach().cpu().numpy()
         pred_idx = int(np.argmax(probs))
         attention = attention.detach().cpu().numpy()
+
         if attention.ndim == 2 and attention.shape[1] == 1:
             attention = attention.squeeze(1)
-
-        zarr_path = os.path.join(self.zarr_dir, os.path.basename(slide_path).replace(".mrxs", ".zarr"))
-        wsi = open_wsi(slide_path, zarr_path)
 
         if attention.ndim == 1:
             attention_for_table = attention
@@ -1076,8 +1034,10 @@ class ABMILInference:
             attention_for_table = attention.mean(axis=1)
 
         # Build a tile table with attention scores and geometries
-        wsi.tables[self.feature_key].obs["attention"] = attention_for_table
-        attention_df = wsi.tables[self.feature_key].obs[["tile_id", "attention"]].copy()
+        attention_df = pd.DataFrame({
+            "tile_id": tile_ids,
+            "attention": attention_for_table,
+        })
         tile_df = wsi.shapes[self.tile_key][["tile_id", "geometry"]].copy()
         tile_table = pd.merge(attention_df, tile_df, on="tile_id", how="inner")
 
@@ -1095,15 +1055,17 @@ class ABMILInference:
         slide_data.update({f"prob_{self.idx_to_label.get(i, i)}": float(prob) for i, prob in enumerate(probs)})
 
         self._slide_cache[slide_path] = slide_data
-        self.save_cache()
         return slide_data
 
-    def process_slides(self, validate: bool = True):
-        """ Batch process slides and cache results. """
-        slides_to_process = self.validate_slides() if validate else self.slides
+    def process_slides(self):
+        """Process slides sequentially, skipping failures and continuing."""
         processed_count = 0
 
-        for slide_path in slides_to_process:
+        for slide_path in tqdm(self.slides, desc="Running ABMIL inference..."):
+            if slide_path in self._slide_cache:
+                processed_count += 1
+                continue
+
             try:
                 self._infer_slide(slide_path)
                 processed_count += 1
@@ -1115,14 +1077,18 @@ class ABMILInference:
                 })
                 print(f"Skipping slide {slide_path}: {type(e).__name__}: {e}")
 
-        print(f"Processed {processed_count}/{len(slides_to_process)} slides.")
+        self.save_cache()
+
+        print(f"Processed {processed_count}/{len(self.slides)} slides.")
         if self.cache_path:
             print(f"Cache saved to {self.cache_path}.")
         if self._skipped_slides:
             print(f"Skipped {len(self._skipped_slides)} slides due to errors.")
 
+        return self._slide_cache
+
     def attention_heatmap(self, slide_path: str):
-        """ Plot the attention heatmap for one cached slide. """
+        """Plot the attention heatmap for one cached slide."""
         slide_data = self._slide_cache.get(slide_path)
         if not slide_data:
             print(f"No cached data found for slide: {slide_path}")
@@ -1165,12 +1131,16 @@ class ABMILInference:
             show_contours=True,
             ax=ax,
         )
-        ax.set_title(f"Attention heatmap: {os.path.basename(slide_path)}, Predicted: {slide_data['pred_label']} (Conf: {slide_data['confidence']:.2f})")
+        ax.set_title(
+            f"Attention heatmap: {os.path.basename(slide_path)}, "
+            f"Predicted: {slide_data['pred_label']} "
+            f"(Conf: {slide_data['confidence']:.2f})"
+        )
         ax.axis("off")
         plt.show()
 
     def results_dataframe(self):
-        """ Return one row per cached slide with predictions and class probabilities. """
+        """Return one row per cached slide with predictions and class probabilities."""
         if not self._slide_cache:
             print("No cached results found. Run process_slides() first.")
             return pd.DataFrame()
@@ -1185,6 +1155,11 @@ class ABMILInference:
                 **{col: cached.get(col) for col in cached if col.startswith("prob_")},
             })
         return pd.DataFrame(rows)
+
+    def get_skipped_slides(self):
+        """Return skipped slides as a DataFrame."""
+        return pd.DataFrame(self._skipped_slides)
+
 
 class ABMILEvaluation:
     """ Evaluate slide-level ABMIL inference results against metadata labels. """
