@@ -1,319 +1,186 @@
 import os
+import gc
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from typing import Optional
-import matplotlib.pyplot as plt
-import gc
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+from sklearn.metrics import silhouette_score
+from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
+from wsidata import open_wsi
+
+from helper_functions import subset_df_processed
+
 try:
     import torch
     _TORCH_AVAILABLE = True
 except Exception:
     _TORCH_AVAILABLE = False
-from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.metrics import silhouette_score, davies_bouldin_score
-from tissue_artifact_segmentation import load_big_cache, save_big_cache
-from wsidata import open_wsi
-from tqdm import tqdm
-
-
-class FeatureDataBuilder:
-    def __init__(self, filenames, df_metadata: pd.DataFrame, zarr_dir: str, cache_file: str, models: list[str]):
-        self.filenames = filenames
-        self.df_metadata = df_metadata
-        self.zarr_dir = zarr_dir
-        self.cache_file = cache_file
-        self.models = models
-        self.cached_data = load_big_cache(cache_file)
-        self.df_merged = ()
-        self.run()
-        
-    def subset_metadata(self):
-        return self.df_metadata[self.df_metadata["filename"].isin(self.filenames)].copy()    
-
-    def extract_from_cache(self):
-        rows = []
-        for slide, categories in self.cached_data.items():
-            row = {"filename": slide}
-        
-            # Tissue size
-            tissue_default = categories.get("tissue", {}).get("default")
-            if tissue_default and tissue_default.get("status") == "complete":
-                row["tissue_default_size"] = tissue_default.get("size")
-            else:
-                row["tissue_default_size"] = None
-        
-            # Artifact percentage
-            artifact_default = categories.get("artifact", {}).get("default")
-            if artifact_default and artifact_default.get("status") == "complete":
-                row["artifact_default_pct"] = artifact_default.get("pct")
-            else:
-                row["artifact_default_pct"] = None
-        
-        rows.append(row)
-        return pd.DataFrame(rows)
-
-    def extract_features(self):
-        rows = []
-        for slide_path in tqdm(self.filenames, desc="Extracting features"):
-            basename = os.path.basename(slide_path)
-            row = {"filename": slide_path}
-            try:
-                zarr_path = os.path.join(self.zarr_dir, basename.replace(".mrxs", ".zarr"))
-                wsi = open_wsi(slide_path, zarr_path)
-                for model in self.models:
-                    feature_key = (f"features_{model}")
-                    adata = wsi[feature_key]
-                    row[f"features_{model}"] = adata
-            except Exception as e:
-                row["error"] = str(e)
-
-            rows.append(row)
-        return pd.DataFrame(rows)
-    
-    def run(self):
-        df_sub = self.subset_metadata()
-        df_cache = self.extract_from_cache()
-        df_features = self.extract_features()
-        self.df_merged = (df_sub
-            .merge(df_cache, on="filename", how="left")
-            .merge(df_features, on="filename", how="left")
-        )
-        return self.df_merged 
 
 
 class FeatureVisualizer:
-    def __init__(self, df: pd.DataFrame, label_col: str, features_col: str = "features", artifact_col: Optional[str] = None, use_gpu: bool = True, mixed_precision: bool = True):
-        self.df = df
+    def __init__(self, df: pd.DataFrame, zarr_dir: str, cache_path: str, model: str, label_col: str, aggregated: bool = True, filename_col: str = "filename"):
+        self.df = df.copy()
+        self.zarr_dir = zarr_dir
+        self.cache_path = cache_path
+        self.model = str(model)
+        self.feature_key = f"features_{self.model}"
         self.label_col = label_col
-        self.features_col = features_col
-        self.artifact_col = artifact_col
-        self.use_gpu = use_gpu and _TORCH_AVAILABLE
-        self.mixed_precision = mixed_precision
-        self._cache = {}
+        self.aggregated = aggregated
+        self.filename_col = filename_col
 
-        for col in [label_col, features_col]:
-            if col not in df.columns:
-                raise KeyError(f"Missing column: {col}")
+    def processed_entries(self):
+        return subset_df_processed(
+            self.df,
+            self.cache_path,
+            category="features",
+            status="complete",
+            model=self.model,
+            filename_col=self.filename_col,
+        ).reset_index(drop=True)
 
-        if artifact_col and artifact_col not in df.columns:
-            raise KeyError(f"Missing artifact column: {artifact_col}")
-        
-        self.df[label_col] = self.df[label_col].apply(self._normalize_label)
+    def _load_adata(self, wsi_path: str):
+        zarr_path = os.path.join(self.zarr_dir, os.path.basename(wsi_path).replace(".mrxs", ".zarr"))
+        wsi = open_wsi(wsi_path, zarr_path) if os.path.exists(zarr_path) else open_wsi(wsi_path)
+        return wsi.tables[self.feature_key]
 
-    def _normalize_label(self, lbl):
-        if isinstance(lbl, list):
-            return " / ".join(map(str, lbl))
-        return lbl
+    def _get_slide_embedding(self, adata) -> np.ndarray:
+        if "agg_slide" not in adata.varm:
+            raise KeyError(f"'agg_slide' not found in {self.feature_key}.varm")
+        emb = np.asarray(adata.varm["agg_slide"]).ravel().astype(np.float32)
+        return emb
 
-    def _extract_embeddings(self):
-        """ Return slide-level aggregated embedding matrix and labels. """
-        if "agg" in self._cache:
-            return self._cache["agg"]
+    def _get_tile_embeddings(self, adata, every_nth: int = 1) -> np.ndarray:
+        X = np.asarray(adata.X, dtype=np.float32)
+        if every_nth > 1:
+            X = X[::every_nth]
+        return X
+
+    def build_embedding_table(self, mode: str = "aggregated", every_nth: int = 1):
+        df_proc = self.processed_entries()
 
         embeddings = []
         labels = []
-        artifacts = []
+        slide_paths = []
 
-        for _, row in self.df.iterrows():
-            adata = row[self.features_col]
-            emb = np.ravel(adata.varm["agg_slide"])
+        for _, row in tqdm(df_proc.iterrows(), total=len(df_proc), desc="Loading embeddings..."):
+            wsi_path = row[self.filename_col]
+            label = row[self.label_col]
+            # TODO remove memory after loading each slide to avoid memory issues with large datasets
+            try:
+                adata = self._load_adata(wsi_path)
 
-            embeddings.append(emb)
-            labels.append(row[self.label_col])
-            
-            if self.artifact_col is None:
-                artifact_pct = 0.0
-            else:
-                val = row[self.artifact_col]
-                artifact_pct = 0.0 if pd.isna(val) else float(val)
+                if mode == "aggregated":
+                    emb = self._get_slide_embedding(adata)
+                    embeddings.append(emb)
+                    labels.append(label)
+                    slide_paths.append(wsi_path)
 
-            artifacts.append(artifact_pct)
+                elif mode == "tile":
+                    X = self._get_tile_embeddings(adata, every_nth=every_nth)
+                    if len(X) == 0:
+                        continue
+                    embeddings.append(X)
+                    labels.extend([label] * len(X))
+                    slide_paths.extend([wsi_path] * len(X))
 
-        # ensure float32 to reduce memory pressure
-        embeddings = np.vstack(embeddings).astype(np.float32)
-        labels = np.array(labels)
-        artifacts = np.array(artifacts, dtype=np.float32)
-        
-        self._cache["agg"] = (embeddings, labels, artifacts)
-        
-        return self._cache["agg"]
+                else:
+                    raise ValueError("mode must be 'aggregated' or 'tile'")
 
-    def _standardize_features(self, emb):
-        # GPU path if requested and available
-        if self.use_gpu and _TORCH_AVAILABLE:
-            device = torch.device("cuda")
-            t = torch.from_numpy(emb.astype(np.float32)).to(device)
-            mean = t.mean(dim=0, keepdim=True)
-            std = t.std(dim=0, unbiased=False, keepdim=True)
-            std = std.clamp_min(1e-6)
-            t = (t - mean) / std
-            out = t.cpu().numpy()
-            # free GPU memory
-            del t, mean, std
-            torch.cuda.empty_cache()
-            gc.collect()
-            return out
-        
-        # Fallback to numpy
-        if "scaler" not in self._cache:
-            self._cache["scaler"] = StandardScaler().fit(emb)
-        return self._cache["scaler"].transform(emb)
+            except Exception as e:
+                print(f"Skipping {os.path.basename(wsi_path)}: {type(e).__name__}: {e}")
 
-    def _encode_labels(self, lbls):
-        if "label_encoder" not in self._cache:
-            self._cache["label_encoder"] = LabelEncoder().fit(lbls)
-        return self._cache["label_encoder"].transform(lbls)
+        if not embeddings:
+            raise ValueError("No embeddings could be loaded.")
 
-    def _auto_pca_components(self, features_scaled, var_threshold=0.95)-> int:
-        pca_temp = PCA().fit(features_scaled)
-        cum_var = np.cumsum(pca_temp.explained_variance_ratio_)
-        n = int(np.searchsorted(cum_var, var_threshold) + 1)
-        return max(2, n)
-    
-    def _auto_tsne_perplexity(self, n_samples: int) -> int:
-        return int(max(5, min(50, n_samples // 3)))
-
-    def pca_plot(self, figsize=(8, 10)):
-        emb, labels, artifacts = self._extract_embeddings()
-        emb_scaled = self._standardize_features(emb)
-
-        n_components = self._auto_pca_components(emb_scaled)
-
-        # GPU path if requested and available
-        if self.use_gpu:
-            device = torch.device("cuda")
-            # Move normalized embeddings to GPU as float32
-            t = torch.from_numpy(emb_scaled.astype(np.float32)).to(device)
-            with torch.no_grad():
-                try:
-                    # Perform SVD on GPU for faster computation
-                    u, s, v = torch.linalg.svd(t, full_matrices=False)
-                    # Project onto principal components: U * Sigma
-                    reduced = (u[:, :n_components] * s[:n_components]).cpu().numpy()
-                    # Clean up GPU memory
-                    del t, u, s, v
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                except RuntimeError:
-                    # Fallback to sklearn if GPU SVD fails
-                    pca = PCA(n_components=n_components, svd_solver="randomized")
-                    reduced = pca.fit_transform(emb_scaled)
-                    del t
-                    torch.cuda.empty_cache()
-                    gc.collect()
+        if mode == "aggregated":
+            emb = np.vstack(embeddings).astype(np.float32)
         else:
-            # CPU fallback: use sklearn's randomized SVD
-            pca = PCA(n_components=n_components, svd_solver="randomized")
-            reduced = pca.fit_transform(emb_scaled)
+            emb = np.concatenate(embeddings, axis=0).astype(np.float32)
 
-        alpha_vals = 1 - artifacts
+        out = pd.DataFrame({
+            "slide_path": slide_paths,
+            self.label_col: labels,
+        })
 
-        unique_labels = np.unique(labels)
-        cmap = plt.get_cmap("tab20")
-        
-        plt.figure(figsize=figsize)
-        
-        for i, lbl in enumerate(unique_labels):
-            idx = labels == lbl
-            plt.scatter(
-                reduced[idx, 0],
-                reduced[idx, 1],
-                alpha=alpha_vals[idx],
-                color=cmap(i % cmap.N),
-                label=str(lbl),
-                s=40
-            )
-        plt.title("PCA Visualization")
-        plt.xlabel("PC1")
-        plt.ylabel("PC2")
-        plt.legend(
-            title=self.label_col,
-            bbox_to_anchor=(1.04, 1),
-            loc="upper left"
-        )
-        plt.show()      
+        return emb, out
 
-    def tsne_plot(self, figsize=(8, 10)):
-        emb, labels, artifacts = self._extract_embeddings()
-        emb_scaled = self._standardize_features(emb)
+    def _reduce_pca(self, emb: np.ndarray, n_components: int = 2):
+        emb_scaled = StandardScaler().fit_transform(emb)
+        reduced = PCA(n_components=n_components, svd_solver="randomized").fit_transform(emb_scaled)
+        return reduced
 
-        perplexity = self._auto_tsne_perplexity(len(emb_scaled))
+    def _reduce_tsne(self, emb: np.ndarray, n_components: int = 2, perplexity: int | None = None):
+        emb_scaled = StandardScaler().fit_transform(emb)
 
-        # Note: sklearn's TSNE does not have GPU support; runs on CPU
-        tsne = TSNE(
-            n_components=2,
+        if perplexity is None:
+            perplexity = max(5, min(30, len(emb_scaled) // 3))
+
+        reduced = TSNE(
+            n_components=n_components,
             perplexity=perplexity,
             learning_rate="auto",
-            init="pca"
-        )
-        reduced = tsne.fit_transform(emb_scaled)
+            init="pca",
+            random_state=42,
+        ).fit_transform(emb_scaled)
 
-        alpha_vals = 1 - artifacts
+        return reduced
 
-        unique_labels = np.unique(labels)
+    def _reduce_umap(self, emb: np.ndarray, n_components: int = 2):
+        # TODO implement UMAP reduction
+        raise NotImplementedError("UMAP reduction is not yet implemented.")
+    
+    def plot_embeddings(self, method: str = "pca", mode: str = "aggregated", every_nth: int = 1):
+        emb, meta = self.build_embedding_table(mode=mode, every_nth=every_nth)
+
+        if method == "pca":
+            reduced = self._reduce_pca(emb, n_components=2)
+            xlab, ylab = "PC1", "PC2"
+            title = f"PCA ({mode}, silhouette score: {self.silhouette_score():.3f})"
+        elif method == "tsne":
+            reduced = self._reduce_tsne(emb, n_components=2)
+            xlab, ylab = "Dim 1", "Dim 2"
+            title = f"t-SNE ({mode}, silhouette score: {self.silhouette_score():.3f})"
+        elif method == "umap":
+            reduced = self._reduce_umap(emb, n_components=2)
+            xlab, ylab = "UMAP 1", "UMAP 2"
+            title = f"UMAP ({mode}, silhouette score: {self.silhouette_score():.3f})"
+        else:
+            raise ValueError("method must be 'pca' or 'tsne' or 'umap'")
+
+        labels = meta[self.label_col].to_numpy()
+        unique_labels = pd.unique(labels)
         cmap = plt.get_cmap("tab20")
-        
-        plt.figure(figsize=figsize)
+
+        plt.figure(figsize=(8, 8))
         
         for i, lbl in enumerate(unique_labels):
             idx = labels == lbl
             plt.scatter(
                 reduced[idx, 0],
                 reduced[idx, 1],
-                alpha=alpha_vals[idx],
+                s=20,
+                alpha=0.8,
                 color=cmap(i % cmap.N),
                 label=str(lbl),
-                s=40
             )
-        plt.title("t-SNE Visualization")
-        plt.xlabel("Dim 1")
-        plt.ylabel("Dim 2")
-        plt.legend(
-            title=self.label_col,
-            bbox_to_anchor=(1.04, 1),
-            loc="upper left"
-        )
+
+        plt.title(title)
+        plt.xlabel(xlab)
+        plt.ylabel(ylab)
+        plt.legend(title=self.label_col, bbox_to_anchor=(1.04, 1), loc="upper left")
+        plt.tight_layout()
         plt.show()
 
-    def label_separation_score(self):
+    def silhouette_score(self):
         emb, labels, _ = self._extract_embeddings()
         emb_scaled = self._standardize_features(emb)
         labels_encoded = self._encode_labels(labels)
 
-        # 1) Silhouette Score (higher = better)
         if len(np.unique(labels_encoded)) > 1:
             sil = silhouette_score(emb_scaled, labels_encoded)
         else:
             sil = np.nan
-        
-        # 2) Davies–Bouldin Score (lower = better)
-        if len(np.unique(labels_encoded)) > 1:
-            db = davies_bouldin_score(emb_scaled, labels_encoded)
-        else:
-            db = np.nan
 
-        # 3) Fisher ratio (higher = better)
-        overall_mean = emb_scaled.mean(axis=0)
-        between_var = 0
-        within_var = 0
-
-        for cls in np.unique(labels_encoded):
-            cls_emb = emb_scaled[labels_encoded == cls]
-            cls_mean = cls_emb.mean(axis=0)
-
-            n = len(cls_emb)
-        
-            between_var += n * np.sum((cls_mean - overall_mean) ** 2)
-            within_var += np.sum((cls_emb - cls_mean) ** 2)
-
-        fisher_ratio = between_var / within_var if within_var > 0 else np.nan
-
-        return sil, db, fisher_ratio
-
-    def print_score(self):
-        sil, db, fisher_ratio = self.label_separation_score()
-        print(f"Silhouette: {sil:.3f} (−1 to 1, higher → better separation)")
-        print(f"Davies–Bouldin: {db:.3f} (0 to ∞, lower → better clustering)")
-        print(f"Fisher Ratio: {fisher_ratio:.3f} (higher → better separation)")
+        return sil
