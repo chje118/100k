@@ -6,17 +6,11 @@ import pandas as pd
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.metrics import silhouette_score
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from tqdm import tqdm
 from wsidata import open_wsi
 
 from helper_functions import subset_df_processed
-
-try:
-    import torch
-    _TORCH_AVAILABLE = True
-except Exception:
-    _TORCH_AVAILABLE = False
 
 
 class FeatureVisualizer:
@@ -67,7 +61,7 @@ class FeatureVisualizer:
         for _, row in tqdm(df_proc.iterrows(), total=len(df_proc), desc="Loading embeddings..."):
             wsi_path = row[self.filename_col]
             label = row[self.label_col]
-            # TODO remove memory after loading each slide to avoid memory issues with large datasets
+
             try:
                 adata = self._load_adata(wsi_path)
 
@@ -80,7 +74,10 @@ class FeatureVisualizer:
                 elif mode == "tile":
                     X = self._get_tile_embeddings(adata, every_nth=every_nth)
                     if len(X) == 0:
+                        del adata
+                        gc.collect()
                         continue
+
                     embeddings.append(X)
                     labels.extend([label] * len(X))
                     slide_paths.extend([wsi_path] * len(X))
@@ -88,8 +85,12 @@ class FeatureVisualizer:
                 else:
                     raise ValueError("mode must be 'aggregated' or 'tile'")
 
+                del adata
+                gc.collect()
+
             except Exception as e:
                 print(f"Skipping {os.path.basename(wsi_path)}: {type(e).__name__}: {e}")
+                gc.collect()
 
         if not embeddings:
             raise ValueError("No embeddings could be loaded.")
@@ -104,15 +105,28 @@ class FeatureVisualizer:
             self.label_col: labels,
         })
 
+        del embeddings
+        gc.collect()
+
         return emb, out
 
+    def _standardize_features(self, emb: np.ndarray) -> np.ndarray:
+        return StandardScaler().fit_transform(emb).astype(np.float32)
+
+    def _encode_labels(self, labels: np.ndarray) -> np.ndarray:
+        return LabelEncoder().fit_transform(labels)
+
     def _reduce_pca(self, emb: np.ndarray, n_components: int = 2):
-        emb_scaled = StandardScaler().fit_transform(emb)
-        reduced = PCA(n_components=n_components, svd_solver="randomized").fit_transform(emb_scaled)
-        return reduced
+        emb_scaled = self._standardize_features(emb)
+        reduced = PCA(
+            n_components=n_components,
+            svd_solver="randomized",
+            random_state=42
+        ).fit_transform(emb_scaled)
+        return reduced, emb_scaled
 
     def _reduce_tsne(self, emb: np.ndarray, n_components: int = 2, perplexity: int | None = None):
-        emb_scaled = StandardScaler().fit_transform(emb)
+        emb_scaled = self._standardize_features(emb)
 
         if perplexity is None:
             perplexity = max(5, min(30, len(emb_scaled) // 3))
@@ -125,56 +139,9 @@ class FeatureVisualizer:
             random_state=42,
         ).fit_transform(emb_scaled)
 
-        return reduced
+        return reduced, emb_scaled
 
-    def _reduce_umap(self, emb: np.ndarray, n_components: int = 2):
-        # TODO implement UMAP reduction
-        raise NotImplementedError("UMAP reduction is not yet implemented.")
-    
-    def plot_embeddings(self, method: str = "pca", mode: str = "aggregated", every_nth: int = 1):
-        emb, meta = self.build_embedding_table(mode=mode, every_nth=every_nth)
-
-        if method == "pca":
-            reduced = self._reduce_pca(emb, n_components=2)
-            xlab, ylab = "PC1", "PC2"
-            title = f"PCA ({mode}, silhouette score: {self.silhouette_score():.3f})"
-        elif method == "tsne":
-            reduced = self._reduce_tsne(emb, n_components=2)
-            xlab, ylab = "Dim 1", "Dim 2"
-            title = f"t-SNE ({mode}, silhouette score: {self.silhouette_score():.3f})"
-        elif method == "umap":
-            reduced = self._reduce_umap(emb, n_components=2)
-            xlab, ylab = "UMAP 1", "UMAP 2"
-            title = f"UMAP ({mode}, silhouette score: {self.silhouette_score():.3f})"
-        else:
-            raise ValueError("method must be 'pca' or 'tsne' or 'umap'")
-
-        labels = meta[self.label_col].to_numpy()
-        unique_labels = pd.unique(labels)
-        cmap = plt.get_cmap("tab20")
-
-        plt.figure(figsize=(8, 8))
-        
-        for i, lbl in enumerate(unique_labels):
-            idx = labels == lbl
-            plt.scatter(
-                reduced[idx, 0],
-                reduced[idx, 1],
-                s=20,
-                alpha=0.8,
-                color=cmap(i % cmap.N),
-                label=str(lbl),
-            )
-
-        plt.title(title)
-        plt.xlabel(xlab)
-        plt.ylabel(ylab)
-        plt.legend(title=self.label_col, bbox_to_anchor=(1.04, 1), loc="upper left")
-        plt.tight_layout()
-        plt.show()
-
-    def silhouette_score(self):
-        emb, labels, _ = self._extract_embeddings()
+    def silhouette_score(self, emb: np.ndarray, labels: np.ndarray):
         emb_scaled = self._standardize_features(emb)
         labels_encoded = self._encode_labels(labels)
 
@@ -184,3 +151,46 @@ class FeatureVisualizer:
             sil = np.nan
 
         return sil
+
+    def plot_embeddings(self, method: str = "pca", mode: str = "aggregated", every_nth: int = 1):
+        emb, meta = self.build_embedding_table(mode=mode, every_nth=every_nth)
+        labels = meta[self.label_col].to_numpy()
+
+        sil = self.silhouette_score(emb, labels)
+
+        if method == "pca":
+            reduced, _ = self._reduce_pca(emb, n_components=2)
+            xlab, ylab = "PC1", "PC2"
+            title = f"PCA ({mode}, silhouette score: {sil:.3f})"
+
+        elif method == "tsne":
+            reduced, _ = self._reduce_tsne(emb, n_components=2)
+            xlab, ylab = "Dim 1", "Dim 2"
+            title = f"t-SNE ({mode}, silhouette score: {sil:.3f})"
+
+        else:
+            raise ValueError("method must be 'pca' or 'tsne'")
+
+        unique_labels = pd.unique(labels)
+        cmap = plt.get_cmap("tab20")
+
+        plt.figure(figsize=(8, 8))
+
+        for i, lbl in enumerate(unique_labels):
+            idx = labels == lbl
+            plt.scatter(
+                reduced[idx, 0],
+                reduced[idx, 1],
+                s=20,
+                alpha=0.8,
+                color=cmap(i % cmap.N),
+                label=str(lbl),
+                rasterized=(mode == "tile"),
+            )
+
+        plt.title(title)
+        plt.xlabel(xlab)
+        plt.ylabel(ylab)
+        plt.legend(title=self.label_col, bbox_to_anchor=(1.04, 1), loc="upper left")
+        plt.tight_layout()
+        plt.show()
