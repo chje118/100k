@@ -134,3 +134,39 @@ class ROISelector:
             if g.geom_type == "Polygon"
         ]
         return polygons_top, polygons_bottom
+
+
+    def viewer_polygons(self):
+        """ Return top/bottom tile outlines as closed polygons in standard image coordinate order: (x, y).
+
+        Each tile is returned as a 5-point closed ring:
+        [(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy), (minx, miny)].
+        """
+        top_tiles_gdf, bottom_tiles_gdf = self.get_tiles_gdf()
+
+        def geom_to_polygon_xy(geom):
+            if geom is None or geom.is_empty:
+                return None
+
+            minx, miny, maxx, maxy = geom.bounds
+            return np.array([
+                [minx, miny],
+                [maxx, miny],
+                [maxx, maxy],
+                [minx, maxy],
+                [minx, miny],
+            ], dtype=float)
+
+        polygons_top = []
+        for geom in top_tiles_gdf.geometry:
+            poly = geom_to_polygon_xy(geom)
+            if poly is not None:
+                polygons_top.append(poly)
+
+        polygons_bottom = []
+        for geom in bottom_tiles_gdf.geometry:
+            poly = geom_to_polygon_xy(geom)
+            if poly is not None:
+                polygons_bottom.append(poly)
+
+        return polygons_top, polygons_bottom
