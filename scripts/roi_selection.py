@@ -9,11 +9,13 @@ from spatialdata.models import ShapesModel
 
 class ROISelector:
     """ Handle ROI selection from cached ABMIL inference results. """
-    def __init__(self, cache_path: str, slide_path: str, top_k: int = 20, bottom_k: int = 10):
+    def __init__(self, cache_path: str, slide_path: str, top_k: int = 20, bottom_k: int = 10, top_pct: float = 0.10, bottom_pct: float = 0.10):
         self.cache_path = cache_path
         self.slide_path = slide_path
         self.top_k = top_k
         self.bottom_k = bottom_k
+        self.top_pct = top_pct
+        self.bottom_pct = bottom_pct
         self.slide_cache = self.load_cache(cache_path)
         self.slide_data = self.get_slide_data()
 
@@ -23,6 +25,10 @@ class ROISelector:
             cached = pickle.load(f)
         return cached.get("slide_cache", cached) if isinstance(cached, dict) else {}
 
+    @staticmethod
+    def _get_pool_size(n_tiles: int, pct: float) -> int:
+        return max(1, int(np.ceil(n_tiles * pct)))
+
     def get_slide_data(self):
         slide_data = self.slide_cache.get(self.slide_path)
         if slide_data is None:
@@ -30,19 +36,39 @@ class ROISelector:
         return slide_data
 
     def get_tiles_gdf(self):
-        """ Return the top-k or bottom-k tiles from cached slide data. """
+        """Return top-k and bottom-k tiles from the top/bottom x% of attention scores."""
         tile_table = self.slide_data.get("tile_table")
         if tile_table is None:
             raise KeyError("slide_data must contain 'tile_table'")
-        top_tiles = tile_table.sort_values("attention", ascending=False).head(self.top_k).copy()
-        bottom_tiles = tile_table.sort_values("attention", ascending=True).head(self.bottom_k).copy()
+
+        tile_table = tile_table.dropna(subset=["attention", "geometry"]).copy()
+        n_tiles = len(tile_table)
+
+        if n_tiles == 0:
+            empty = gpd.GeoDataFrame(tile_table, geometry="geometry")
+            return empty, empty
+
+        top_pool_n = self._get_pool_size(n_tiles, self.top_pct)
+        bottom_pool_n = self._get_pool_size(n_tiles, self.bottom_pct)
+    
+        ranked_desc = tile_table.sort_values("attention", ascending=False)
+        ranked_asc = tile_table.sort_values("attention", ascending=True)
+
+        top_pool = ranked_desc.head(top_pool_n)
+        bottom_pool = ranked_asc.head(bottom_pool_n)
+
+        top_tiles = top_pool.head(self.top_k).copy()
+        bottom_tiles = bottom_pool.head(self.bottom_k).copy()
+
         return gpd.GeoDataFrame(top_tiles, geometry="geometry"), gpd.GeoDataFrame(bottom_tiles, geometry="geometry")
 
     def zoomed_view(self, margin: int = 0, max_tiles: int = 4, top: bool = True):
         """ Plot zoomed tiles (grid) for review from cached slide data. """
         top_tiles_gdf, bottom_tiles_gdf = self.get_tiles_gdf()
+        tiles_gdf = top_tiles_gdf if top else bottom_tiles_gdf
+
         if max_tiles is not None:
-            top_tiles_gdf = top_tiles_gdf.head(max_tiles)
+            tiles_gdf = tiles_gdf.head(max_tiles)
 
         slide_path = self.slide_data["slide_path"]
         zarr_path = self.slide_data["zarr_path"]
@@ -50,11 +76,11 @@ class ROISelector:
         wsi = open_wsi(slide_path, zarr_path)
 
         cols = 2
-        rows = int(np.ceil(len(top_tiles_gdf) / cols)) if len(top_tiles_gdf) > 0 else 1
+        rows = int(np.ceil(len(tiles_gdf) / cols)) if len(tiles_gdf) > 0 else 1
         fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 4 * rows))
         axes = np.asarray(axes).flatten()
 
-        for i, (_, tile_row) in enumerate(top_tiles_gdf.iterrows()):
+        for i, (_, tile_row) in enumerate(tiles_gdf.iterrows()):
             geometry = tile_row["geometry"]
             if not hasattr(geometry, "bounds"):
                 axes[i].axis("off")
@@ -69,7 +95,7 @@ class ROISelector:
             zs.pl.tiles(wsi, tile_key=tile_key, zoom=(xmin, xmax, ymin, ymax), ax=axes[i])
             axes[i].set_title(f"tile {tile_row.get('tile_id', i)}")
 
-        for j in range(len(top_tiles_gdf), len(axes)):
+        for j in range(len(tiles_gdf), len(axes)):
             axes[j].axis("off")
 
         plt.tight_layout()
