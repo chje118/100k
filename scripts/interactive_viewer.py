@@ -128,6 +128,7 @@ HTML = r"""
       <div class="hint" style="margin-top:8px;">
         Pan with mouse drag, zoom with wheel, then double-click to propose a calibration point.
         Accept to save it and generate four screenshots. The view resets after acceptance.
+        On Save & close, a global overview screenshot is also captured.
       </div>
     </div>
 
@@ -193,7 +194,8 @@ let records = {
 let screenshots = {
   calibration_point_1: null,
   calibration_point_2: null,
-  calibration_point_3: null
+  calibration_point_3: null,
+  global_overview: null
 };
 
 let pendingPoint = null;
@@ -360,6 +362,33 @@ function fitToAllPolygons() {
   redraw();
 }
 
+function fitToAllCalibrationPoints() {
+  const pts = [];
+  if (records.calibration_point_1) pts.push(records.calibration_point_1);
+  if (records.calibration_point_2) pts.push(records.calibration_point_2);
+  if (records.calibration_point_3) pts.push(records.calibration_point_3);
+
+  if (!pts.length) return;
+
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const pt of pts) {
+    if (pt.x < minX) minX = pt.x;
+    if (pt.y < minY) minY = pt.y;
+    if (pt.x > maxX) maxX = pt.x;
+    if (pt.y > maxY) maxY = pt.y;
+  }
+
+  const pad = 6000;
+  minX = Math.max(0, minX - pad);
+  minY = Math.max(0, minY - pad);
+  maxX = maxX + pad;
+  maxY = maxY + pad;
+
+  const tiled = viewer.world.getItemAt(0);
+  const rect = tiled.imageToViewportRectangle(minX, minY, maxX - minX, maxY - minY);
+  viewer.viewport.fitBounds(rect, true);
+}
+
 function redraw() {
   resizeCanvas();
   clearCanvas();
@@ -377,11 +406,14 @@ function redraw() {
 
   const shotSummary = {};
   for (const k of Object.keys(screenshots)) {
-    if (!screenshots[k]) {
+    const val = screenshots[k];
+    if (!val) {
       shotSummary[k] = null;
+    } else if (k === "global_overview") {
+      shotSummary[k] = val.filename;
     } else {
       shotSummary[k] = Object.fromEntries(
-        Object.entries(screenshots[k]).map(([name, meta]) => [name, meta.filename])
+        Object.entries(val).map(([name, meta]) => [name, meta.filename])
       );
     }
   }
@@ -620,6 +652,18 @@ viewer.addHandler("canvas-double-click", function(event) {
 });
 
 async function saveAndClose() {
+  // Global overview: frame all calibration points and capture one screenshot.
+  fitToAllCalibrationPoints();
+  redraw();
+  await sleep(500);
+
+  const globalDataUrl = await captureCurrentCanvasAsDataUrl();
+  screenshots.global_overview = {
+    filename: "global_overview.png",
+    data_url: globalDataUrl,
+    zoom: viewer.viewport.getZoom(true)
+  };
+
   const payload = {
     calibration_points: [
       records.calibration_point_1,
@@ -700,7 +744,8 @@ class NotebookWSIViewer:
 
         self.slide = openslide.OpenSlide(self.slide_path)
         self.level0_w, self.level0_h = self.slide.dimensions
-        self.dz = DeepZoomGenerator(self.slide, tile_size=254, overlap=1, limit_bounds=True)
+        # limit_bounds=False so DeepZoom level-0 matches full slide coords
+        self.dz = DeepZoomGenerator(self.slide, tile_size=254, overlap=1, limit_bounds=False)
 
         self.app = Flask(__name__ + f"_{port}")
         self._thread = None
@@ -775,6 +820,19 @@ class NotebookWSIViewer:
 
                 saved_screens[step_name] = {}
 
+                # global_overview is a single screenshot dict, others are dicts of levels
+                if step_name == "global_overview":
+                    shot = shot_group
+                    if shot and shot.get("data_url"):
+                        _, encoded = shot["data_url"].split(",", 1)
+                        img_bytes = base64.b64decode(encoded)
+                        filename = shot.get("filename", "global_overview.png")
+                        out_path = screenshot_dir / filename
+                        out_path.write_bytes(img_bytes)
+                        saved_screens[step_name] = str(out_path)
+                        shot.pop("data_url", None)
+                    continue
+
                 for level_name, shot in shot_group.items():
                     if shot and shot.get("data_url"):
                         _, encoded = shot["data_url"].split(",", 1)
@@ -788,7 +846,7 @@ class NotebookWSIViewer:
             data["saved_screenshot_paths"] = saved_screens
 
             Path(save_json).write_text(json.dumps(data, indent=2))
-            return jsonify({"message": f"Saved annotations to {save_json} and screenshots to {screenshot_dir}"})
+            return jsonify({"message": f"Saved annotations to {save_json} and screenshots to {self.screenshot_dir}"})
 
         @app.route("/state")
         def state():
