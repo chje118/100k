@@ -981,9 +981,14 @@ class ABMILInference:
         """Save cached inference results to disk."""
         if not self.cache_path:
             return self._slide_cache
+        
         os.makedirs(os.path.dirname(self.cache_path) or ".", exist_ok=True)
-        with open(self.cache_path, "wb") as f:
+        tmp_path = f"{self.cache_path}.tmp"
+
+        with open(tmp_path, "wb") as f:
             pickle.dump(self._slide_cache, f)
+        
+        os.replace(tmp_path, self.cache_path)
         return self._slide_cache
 
     @staticmethod
@@ -1068,6 +1073,7 @@ class ABMILInference:
 
             try:
                 self._infer_slide(slide_path)
+                self.save_cache()
                 processed_count += 1
             except Exception as e:
                 self._skipped_slides.append({
@@ -1076,8 +1082,6 @@ class ABMILInference:
                     "error_message": str(e),
                 })
                 print(f"Skipping slide {slide_path}: {type(e).__name__}: {e}")
-
-        self.save_cache()
 
         print(f"Processed {processed_count}/{len(self.slides)} slides.")
         if self.cache_path:
