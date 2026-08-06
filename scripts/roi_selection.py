@@ -9,13 +9,14 @@ from spatialdata.models import ShapesModel
 
 class ROISelector:
     """ Handle ROI selection from cached ABMIL inference results. """
-    def __init__(self, cache_path: str, slide_path: str, top_k: int = 20, bottom_k: int = 10, top_pct: float = 0.10, bottom_pct: float = 0.10):
+    def __init__(self, cache_path: str, slide_path: str, top_k: int = 20, bottom_k: int = 10, top_pct: float = 0.10, bottom_pct: float = 0.10, random_state: int | None = 42):
         self.cache_path = cache_path
         self.slide_path = slide_path
         self.top_k = top_k
         self.bottom_k = bottom_k
         self.top_pct = top_pct
         self.bottom_pct = bottom_pct
+        self.random_state = random_state
         self.slide_cache = self.load_cache(cache_path)
         self.slide_data = self.get_slide_data()
 
@@ -36,7 +37,7 @@ class ROISelector:
         return slide_data
 
     def get_tiles_gdf(self):
-        """Return top-k and bottom-k tiles from the top/bottom x% of attention scores."""
+        """Return random top-k and bottom-k tiles sampled from the top/bottom x% of attention scores."""
         tile_table = self.slide_data.get("tile_table")
         if tile_table is None:
             raise KeyError("slide_data must contain 'tile_table'")
@@ -50,15 +51,27 @@ class ROISelector:
 
         top_pool_n = self._get_pool_size(n_tiles, self.top_pct)
         bottom_pool_n = self._get_pool_size(n_tiles, self.bottom_pct)
-    
+        
         ranked_desc = tile_table.sort_values("attention", ascending=False)
         ranked_asc = tile_table.sort_values("attention", ascending=True)
 
-        top_pool = ranked_desc.head(top_pool_n)
-        bottom_pool = ranked_asc.head(bottom_pool_n)
+        top_pool = ranked_desc.head(top_pool_n).copy()
+        bottom_pool = ranked_asc.head(bottom_pool_n).copy()
 
-        top_tiles = top_pool.head(self.top_k).copy()
-        bottom_tiles = bottom_pool.head(self.bottom_k).copy()
+        top_sample_n = min(self.top_k, len(top_pool))
+        bottom_sample_n = min(self.bottom_k, len(bottom_pool))
+
+        top_tiles = top_pool.sample(
+            n=top_sample_n,
+            random_state=self.random_state,
+            replace=False,
+        ).copy()
+        
+        bottom_tiles = bottom_pool.sample(
+            n=bottom_sample_n,
+            random_state=self.random_state,
+            replace=False,
+        ).copy()
 
         return gpd.GeoDataFrame(top_tiles, geometry="geometry"), gpd.GeoDataFrame(bottom_tiles, geometry="geometry")
 
