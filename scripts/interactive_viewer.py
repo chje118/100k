@@ -7,7 +7,14 @@ from pathlib import Path
 
 import numpy as np
 import openslide
-from flask import Flask, Response, jsonify, render_template_string, request
+from flask import (
+    Flask,
+    Response,
+    jsonify,
+    render_template_string,
+    request,
+    send_from_directory,
+)
 from openslide.deepzoom import DeepZoomGenerator
 
 
@@ -17,8 +24,8 @@ HTML = r"""
 <head>
   <meta charset="utf-8">
   <title>WSI calibration wizard</title>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/openseadragon/4.1.0/openseadragon.min.js"></script>
-  <script src="https://html2canvas.hertzen.com/dist/html2canvas.min.js"></script>
+  <script src="/static/openseadragon.min.js"></script>
+  <script src="/static/html2canvas.min.js"></script>
   <style>
     body {
       margin: 0;
@@ -203,9 +210,9 @@ let busySaving = false;
 
 const viewer = OpenSeadragon({
   id: "viewer",
-  prefixUrl: "https://cdnjs.cloudflare.com/ajax/libs/openseadragon/4.1.0/images/",
+  prefixUrl: "",
   tileSources: "/dzi",
-  showNavigator: true,
+  showNavigator: false,
   animationTime: 0.8,
   blendTime: 0.1,
   minZoomImageRatio: 0.2,
@@ -774,6 +781,10 @@ class NotebookWSIViewer:
         img_h = self.level0_h
         top_summary = self._polygon_summary(top_polygons)
         bottom_summary = self._polygon_summary(bottom_polygons)
+
+        @app.route("/static/<path:filename>")
+        def static_files(filename):
+            return send_from_directory(Path.cwd() / "static", filename)
 
         @app.route("/")
         def index():
