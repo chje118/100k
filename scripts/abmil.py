@@ -1327,6 +1327,11 @@ class ABMILEvaluation:
             })
         
         group_metrics_df = pd.DataFrame(rows)
+        group_metrics_df = group_metrics_df.sort_values(
+            by=["accuracy", "n_samples"],
+            ascending=[False, False],
+            na_position="last"
+        ).reset_index(drop=True)
         print(f"\nPer-group metrics grouped by '{group_col}':")
         print(group_metrics_df.to_string(index=False))
         return group_metrics_df
