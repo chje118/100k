@@ -246,8 +246,8 @@ class ROISelector:
         slide_name = os.path.splitext(os.path.basename(self.slide_path))[0]
         try:
             for tiles in ["top", "bottom"]:
-                path_lmd = os.path.join(self.lmd_dir, slide_name, f'_{tiles}.xml')
-
+                path_lmd = os.path.join(self.lmd_dir, slide_name, f'{slide_name}_{tiles}.xml')
+                
                 # Transform coordinates to LMD coordinate system
                 H = self.sdata_lmd.images["wsi_thumbnail"].data.shape[1]
                 
