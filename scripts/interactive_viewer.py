@@ -1,21 +1,24 @@
 import base64
 import json
+import socket
 import threading
 import time
+import uuid
+import webbrowser
 from io import BytesIO
 from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import openslide
-from flask import (
-    Flask,
-    Response,
-    jsonify,
-    render_template_string,
-    request,
-    send_from_directory,
-)
+from flask import Flask, Response, jsonify, render_template_string, request, send_from_directory
 from openslide.deepzoom import DeepZoomGenerator
+from werkzeug.serving import make_server
+
+
+DEFAULT_HOST = "127.0.0.1"
+
+_ACTIVE_VIEWERS: Dict[Tuple[str, int], "NotebookWSIViewer"] = {}
 
 
 HTML = r"""
@@ -31,7 +34,7 @@ HTML = r"""
       margin: 0;
       font-family: Arial, sans-serif;
       display: grid;
-      grid-template-columns: 420px 1fr;
+      grid-template-columns: 430px 1fr;
       height: 100vh;
     }
     #sidebar {
@@ -135,7 +138,6 @@ HTML = r"""
       <div class="hint" style="margin-top:8px;">
         Pan with mouse drag, zoom with wheel, then double-click to propose a calibration point.
         Accept to save it and generate four screenshots. The view resets after acceptance.
-        On Save & close, a global overview screenshot is also captured.
       </div>
     </div>
 
@@ -161,11 +163,6 @@ HTML = r"""
     </div>
 
     <div class="section">
-      <h3>Polygon debug</h3>
-      <pre id="polygon-debug"></pre>
-    </div>
-
-    <div class="section">
       <div id="status" class="hint"></div>
     </div>
   </div>
@@ -184,6 +181,7 @@ HTML = r"""
 <script>
 const initialTop = {{ top_polygons | safe }};
 const initialBottom = {{ bottom_polygons | safe }};
+const initialSessionId = {{ session_id | tojson }};
 
 const steps = [
   {key: "calibration_point_1", label: "Calibration point 1"},
@@ -201,8 +199,7 @@ let records = {
 let screenshots = {
   calibration_point_1: null,
   calibration_point_2: null,
-  calibration_point_3: null,
-  global_overview: null
+  calibration_point_3: null
 };
 
 let pendingPoint = null;
@@ -210,9 +207,9 @@ let busySaving = false;
 
 const viewer = OpenSeadragon({
   id: "viewer",
-  prefixUrl: "",
   tileSources: "/dzi",
-  showNavigator: false,
+  showNavigator: true,
+  showNavigationControl: false,
   animationTime: 0.8,
   blendTime: 0.1,
   minZoomImageRatio: 0.2,
@@ -232,8 +229,7 @@ viewer.addHandler("open", function() {
   fitToAllPolygons();
   redraw();
   updateInstruction();
-  updatePolygonDebug();
-  setStatus("Viewer loaded and focused on tile outlines.");
+  setStatus("Viewer loaded.");
 });
 
 function setStatus(msg) {
@@ -263,20 +259,6 @@ function imageToScreen(x, y) {
 function clearCanvas() {
   const rect = viewerWrap.getBoundingClientRect();
   ctx.clearRect(0, 0, rect.width, rect.height);
-}
-
-function polygonBBox(poly) {
-  if (!poly || poly.length === 0) return null;
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const p of poly) {
-    const x = p[0];
-    const y = p[1];
-    if (x < minX) minX = x;
-    if (y < minY) minY = y;
-    if (x > maxX) maxX = x;
-    if (y > maxY) maxY = y;
-  }
-  return {minX, minY, maxX, maxY, w: maxX - minX, h: maxY - minY};
 }
 
 function drawPolygonOutline(poly, color) {
@@ -360,40 +342,13 @@ function fitToAllPolygons() {
   const pad = 2000;
   minX = Math.max(0, minX - pad);
   minY = Math.max(0, minY - pad);
-  maxX = maxX + pad;
-  maxY = maxY + pad;
+  maxX += pad;
+  maxY += pad;
 
   const tiled = viewer.world.getItemAt(0);
   const rect = tiled.imageToViewportRectangle(minX, minY, maxX - minX, maxY - minY);
   viewer.viewport.fitBounds(rect, true);
   redraw();
-}
-
-function fitToAllCalibrationPoints() {
-  const pts = [];
-  if (records.calibration_point_1) pts.push(records.calibration_point_1);
-  if (records.calibration_point_2) pts.push(records.calibration_point_2);
-  if (records.calibration_point_3) pts.push(records.calibration_point_3);
-
-  if (!pts.length) return;
-
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const pt of pts) {
-    if (pt.x < minX) minX = pt.x;
-    if (pt.y < minY) minY = pt.y;
-    if (pt.x > maxX) maxX = pt.x;
-    if (pt.y > maxY) maxY = pt.y;
-  }
-
-  const pad = 6000;
-  minX = Math.max(0, minX - pad);
-  minY = Math.max(0, minY - pad);
-  maxX = maxX + pad;
-  maxY = maxY + pad;
-
-  const tiled = viewer.world.getItemAt(0);
-  const rect = tiled.imageToViewportRectangle(minX, minY, maxX - minX, maxY - minY);
-  viewer.viewport.fitBounds(rect, true);
 }
 
 function redraw() {
@@ -403,54 +358,22 @@ function redraw() {
   drawPolygons(initialTop, "#ff2d2d");
   drawPolygons(initialBottom, "#2d6cff");
 
-  if (records.calibration_point_1) drawMarker(records.calibration_point_1, "P1", false);
-  if (records.calibration_point_2) drawMarker(records.calibration_point_2, "P2", false);
-  if (records.calibration_point_3) drawMarker(records.calibration_point_3, "P3", false);
-
+  if (records.calibration_point_1) drawMarker(records.calibration_point_1, "P1");
+  if (records.calibration_point_2) drawMarker(records.calibration_point_2, "P2");
+  if (records.calibration_point_3) drawMarker(records.calibration_point_3, "P3");
   if (pendingPoint) drawMarker(pendingPoint, "?", true);
 
   document.getElementById("coords-output").textContent = JSON.stringify(records, null, 2);
 
   const shotSummary = {};
   for (const k of Object.keys(screenshots)) {
-    const val = screenshots[k];
-    if (!val) {
-      shotSummary[k] = null;
-    } else if (k === "global_overview") {
-      shotSummary[k] = val.filename;
-    } else {
-      shotSummary[k] = Object.fromEntries(
-        Object.entries(val).map(([name, meta]) => [name, meta.filename])
-      );
-    }
+    shotSummary[k] = screenshots[k]
+      ? Object.fromEntries(Object.entries(screenshots[k]).map(([name, meta]) => [name, meta.filename]))
+      : null;
   }
   document.getElementById("shots-output").textContent = JSON.stringify(shotSummary, null, 2);
 
   renderWorkflowStatus();
-}
-
-function updatePolygonDebug() {
-  function bbox(poly) {
-    if (!poly || !poly.length) return null;
-    const xs = poly.map(p => p[0]);
-    const ys = poly.map(p => p[1]);
-    return {
-      min_x: Math.min(...xs),
-      max_x: Math.max(...xs),
-      min_y: Math.min(...ys),
-      max_y: Math.max(...ys)
-    };
-  }
-
-  const summary = {
-    top_polygon_count: initialTop.length,
-    bottom_polygon_count: initialBottom.length,
-    first_top_polygon_first_5_points: initialTop.length ? initialTop[0].slice(0, 5) : null,
-    first_bottom_polygon_first_5_points: initialBottom.length ? initialBottom[0].slice(0, 5) : null,
-    first_top_polygon_bbox: initialTop.length ? bbox(initialTop[0]) : null,
-    first_bottom_polygon_bbox: initialBottom.length ? bbox(initialBottom[0]) : null
-  };
-  document.getElementById("polygon-debug").textContent = JSON.stringify(summary, null, 2);
 }
 
 function renderWorkflowStatus() {
@@ -515,21 +438,16 @@ async function captureFourZoomScreenshots(stepKey, point) {
   const tiled = viewer.world.getItemAt(0);
   const targetVpPoint = tiled.imageToViewportCoordinates(point.x, point.y, true);
 
-  const screenshotsForStep = {};
-
-  const zoom1 = originalZoom;
-  const zoom2 = Math.max(zoom1 / 4.0, minZoom);
-  const zoom3 = Math.max(zoom1 / 12.0, minZoom);
-  const zoom4 = Math.max(zoom1 / 36.0, minZoom);
-
-  const levels = [
-    {name: "1", zoom: zoom1},
-    {name: "2", zoom: zoom2},
-    {name: "3", zoom: zoom3},
-    {name: "4", zoom: zoom4},
+  const zooms = [
+    {name: "1", zoom: originalZoom},
+    {name: "2", zoom: Math.max(originalZoom / 4.0, minZoom)},
+    {name: "3", zoom: Math.max(originalZoom / 12.0, minZoom)},
+    {name: "4", zoom: Math.max(originalZoom / 36.0, minZoom)}
   ];
 
-  for (const level of levels) {
+  const screenshotsForStep = {};
+
+  for (const level of zooms) {
     viewer.viewport.panTo(targetVpPoint, true);
     viewer.viewport.zoomTo(level.zoom, targetVpPoint, true);
     viewer.viewport.applyConstraints(true);
@@ -539,8 +457,7 @@ async function captureFourZoomScreenshots(stepKey, point) {
     const dataUrl = await captureCurrentCanvasAsDataUrl();
     screenshotsForStep[level.name] = {
       filename: `${stepKey}_${level.name}.png`,
-      data_url: dataUrl,
-      zoom: level.zoom
+      data_url: dataUrl
     };
   }
 
@@ -563,7 +480,7 @@ async function acceptPendingPoint() {
   records[step.key] = { x: pendingPoint.x, y: pendingPoint.y };
 
   redraw();
-  setStatus(`Accepted ${step.label} at (${pendingPoint.x}, ${pendingPoint.y}), saving 4 screenshots...`);
+  setStatus(`Accepted ${step.label} at (${pendingPoint.x}, ${pendingPoint.y}), saving screenshots...`);
 
   try {
     await captureFourZoomScreenshots(step.key, pendingPoint);
@@ -575,9 +492,9 @@ async function acceptPendingPoint() {
     viewer.viewport.goHome();
 
     if (currentStepIndex < steps.length) {
-      setStatus(`Saved ${step.label} with screenshots _1, _2, _3, _4. View reset. Next: ${steps[currentStepIndex].label}`);
+      setStatus(`Saved ${step.label}. View reset. Next: ${steps[currentStepIndex].label}`);
     } else {
-      setStatus("All steps recorded with screenshots _1, _2, _3, _4. View reset. Click Save & close.");
+      setStatus("All steps recorded. Click Save & close.");
     }
   } catch (err) {
     setStatus("Failed to capture screenshots: " + err);
@@ -590,17 +507,16 @@ function rejectPendingPoint() {
   pendingPoint = null;
   hideConfirmBox();
   redraw();
-  setStatus("Point rejected. Double-click again to choose another location.");
+  setStatus("Point rejected.");
 }
 
 function goBackOneStep() {
   if (busySaving) return;
+
   pendingPoint = null;
   hideConfirmBox();
 
-  if (currentStepIndex === 0 && !records[steps[0].key]) {
-    return;
-  }
+  if (currentStepIndex === 0 && !records[steps[0].key]) return;
 
   if (currentStepIndex >= steps.length) {
     currentStepIndex = steps.length - 1;
@@ -614,8 +530,7 @@ function goBackOneStep() {
   updateInstruction();
   redraw();
   viewer.viewport.goHome();
-
-  setStatus(`Cleared ${step.label} and reset view.`);
+  setStatus(`Cleared ${step.label}.`);
 }
 
 function resetWorkflow() {
@@ -626,11 +541,11 @@ function resetWorkflow() {
     records[step.key] = null;
     screenshots[step.key] = null;
   }
+
   currentStepIndex = 0;
   updateInstruction();
   redraw();
   viewer.viewport.goHome();
-
   setStatus("Workflow reset.");
 }
 
@@ -655,72 +570,46 @@ viewer.addHandler("canvas-double-click", function(event) {
 
   redraw();
   showConfirmBox(`Accept ${steps[currentStepIndex].label} at (${pendingPoint.x}, ${pendingPoint.y})?`);
-  setStatus("Point proposed. Accept or reject.");
+  setStatus("Point proposed.");
 });
 
 async function saveAndClose() {
-  if (busySaving) return;
-
-  busySaving = true;
-  setStatus("Returning to whole-slide view and capturing overview...");
+  const payload = {
+    calibration_points: [
+      records.calibration_point_1,
+      records.calibration_point_2,
+      records.calibration_point_3
+    ],
+    calibration_point_1: records.calibration_point_1,
+    calibration_point_2: records.calibration_point_2,
+    calibration_point_3: records.calibration_point_3,
+    top_polygons: initialTop,
+    bottom_polygons: initialBottom,
+    screenshots: screenshots,
+    session_id: initialSessionId
+  };
 
   try {
-    // Return to exactly the same view used when opening the viewer.
-    viewer.viewport.goHome(true);
-    viewer.viewport.applyConstraints(true);
-
-    // Ensure the calibration points are drawn on top of the home view.
-    redraw();
-
-    // Give OpenSeadragon time to render the whole-slide view.
-    await sleep(700);
-
-    // Capture the whole-slide view with calibration points visible.
-    const globalDataUrl = await captureCurrentCanvasAsDataUrl();
-
-    screenshots.global_overview = {
-      filename: "global_overview.png",
-      data_url: globalDataUrl,
-      zoom: viewer.viewport.getZoom(true)
-    };
-
-    const payload = {
-      calibration_points: [
-        records.calibration_point_1,
-        records.calibration_point_2,
-        records.calibration_point_3
-      ],
-      calibration_point_1: records.calibration_point_1,
-      calibration_point_2: records.calibration_point_2,
-      calibration_point_3: records.calibration_point_3,
-      top_polygons: initialTop,
-      bottom_polygons: initialBottom,
-      screenshots: screenshots
-    };
-
-    const resp = await fetch("/save", {
+    const resp = await fetch("/calibration_save", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify(payload)
     });
 
+    const data = await resp.json();
+
     if (!resp.ok) {
-      throw new Error(`Save request failed with status ${resp.status}`);
+      setStatus("Save failed: " + data.message);
+      return;
     }
 
-    const data = await resp.json();
-    setStatus(data.message + " Attempting to close tab...");
+    setStatus(data.message + " Closing...");
 
     setTimeout(() => {
       window.close();
-      setStatus(data.message + " You may need to close this tab manually.");
-    }, 300);
-
+    }, 500);
   } catch (err) {
-    console.error(err);
-    setStatus("Save failed: " + err.message);
-  } finally {
-    busySaving = false;
+    setStatus("Save failed: " + err);
   }
 }
 
@@ -731,198 +620,272 @@ updateInstruction();
 """
 
 
-def _normalize_polygons(polygons, input_order="xy", close_polygon=True):
-    out = []
-    for poly in polygons:
-        arr = np.asarray(poly, dtype=float)
+class ViewerServer(threading.Thread):
+    def __init__(self, app: Flask, host: str, port: int):
+        super().__init__(daemon=True)
+        self.server = make_server(host, port, app)
+        self.ctx = app.app_context()
+        self.ctx.push()
 
-        if arr.ndim != 2 or arr.shape[1] != 2:
-            raise ValueError("Each polygon must have shape (N, 2)")
+    def run(self) -> None:
+        self.server.serve_forever()
 
-        if input_order.lower() == "yx":
-            arr = arr[:, [1, 0]]
-        elif input_order.lower() != "xy":
-            raise ValueError("input_order must be 'xy' or 'yx'")
-
-        if close_polygon and len(arr) >= 3:
-            if not np.allclose(arr[0], arr[-1]):
-                arr = np.vstack([arr, arr[0]])
-
-        out.append(arr.tolist())
-    return out
+    def shutdown(self) -> None:
+        self.server.shutdown()
 
 
 class NotebookWSIViewer:
     def __init__(
         self,
-        slide_path,
-        top_polygons,
-        bottom_polygons,
-        save_json="annotations.json",
-        screenshot_dir="annotation_screenshots",
-        polygon_input_order="xy",
-        host="127.0.0.1",
-        port=5000,
+        slide_path: str,
+        top_polygons: Sequence[Sequence[Sequence[float]]],
+        bottom_polygons: Sequence[Sequence[Sequence[float]]],
+        save_json: str = "annotations.json",
+        screenshot_dir: str = "annotation_screenshots",
+        polygon_input_order: str = "xy",
+        host: str = DEFAULT_HOST,
+        port: Optional[int] = None,
+        strict: bool = True,
     ):
         self.slide_path = str(Path(slide_path).expanduser().resolve())
-        self.top_polygons = _normalize_polygons(top_polygons, input_order=polygon_input_order)
-        self.bottom_polygons = _normalize_polygons(bottom_polygons, input_order=polygon_input_order)
         self.save_json = str(Path(save_json).expanduser().resolve())
         self.screenshot_dir = str(Path(screenshot_dir).expanduser().resolve())
-        self.polygon_input_order = polygon_input_order
         self.host = host
-        self.port = port
+        self.port = int(port) if port is not None else 0
+        self.strict = bool(strict)
+        self.polygon_input_order = polygon_input_order.lower().strip()
+        self.session_id = uuid.uuid4().hex
+        self.created_at = time.time()
+
+        self.script_dir = Path(__file__).resolve().parent
+        self.static_dir = self.script_dir / "static"
+
+        self._validate_paths_and_environment()
+
+        self.top_polygons = self._normalize_polygons(top_polygons, self.polygon_input_order)
+        self.bottom_polygons = self._normalize_polygons(bottom_polygons, self.polygon_input_order)
+
+        if self.strict and not self.top_polygons and not self.bottom_polygons:
+            raise ValueError("Both top_polygons and bottom_polygons are empty. Refusing to launch in strict mode.")
 
         self.slide = openslide.OpenSlide(self.slide_path)
-        self.level0_w, self.level0_h = self.slide.dimensions
-        # limit_bounds=False so DeepZoom level-0 matches full slide coords
+        self.slide_dimensions = tuple(int(v) for v in self.slide.dimensions)
         self.dz = DeepZoomGenerator(self.slide, tile_size=254, overlap=1, limit_bounds=False)
 
-        self.app = Flask(__name__ + f"_{port}")
-        self._thread = None
+        self.app = Flask(__name__ + f"_{self.session_id}")
+        self.app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
+        self.server_thread: Optional[ViewerServer] = None
+
+        self._configure_app()
         self._setup_routes()
 
-    def _polygon_summary(self, polygons):
-        if not polygons:
-            return {"count": 0}
-        arr = np.vstack([np.asarray(p) for p in polygons if len(p) > 0])
-        return {
-            "count": len(polygons),
-            "min_x": float(arr[:, 0].min()),
-            "max_x": float(arr[:, 0].max()),
-            "min_y": float(arr[:, 1].min()),
-            "max_y": float(arr[:, 1].max()),
-        }
+    def _validate_paths_and_environment(self) -> None:
+        slide_path = Path(self.slide_path)
+        if not slide_path.exists():
+            raise FileNotFoundError(f"Slide file does not exist: {slide_path}")
+        if not slide_path.is_file():
+            raise ValueError(f"Slide path is not a file: {slide_path}")
 
-    def _setup_routes(self):
+        required_static = [
+            self.static_dir / "openseadragon.min.js",
+            self.static_dir / "html2canvas.min.js",
+        ]
+        missing = [str(p) for p in required_static if not p.exists()]
+        if missing:
+            raise FileNotFoundError("Missing required static files: " + ", ".join(missing))
+
+        Path(self.save_json).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.screenshot_dir).parent.mkdir(parents=True, exist_ok=True)
+
+        if self.polygon_input_order not in {"xy", "yx"}:
+            raise ValueError("polygon_input_order must be 'xy' or 'yx'")
+
+    def _configure_app(self) -> None:
+        @self.app.after_request
+        def add_no_cache_headers(response: Response) -> Response:
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, public, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+            return response
+
+    @staticmethod
+    def _normalize_polygons(
+        polygons: Sequence[Sequence[Sequence[float]]],
+        input_order: str,
+        close_polygon: bool = True,
+    ) -> List[List[List[float]]]:
+        normalized: List[List[List[float]]] = []
+
+        for poly in polygons:
+            arr = np.asarray(poly, dtype=float)
+
+            if arr.ndim != 2 or arr.shape[1] != 2:
+                raise ValueError("Each polygon must have shape (N, 2)")
+
+            if input_order == "yx":
+                arr = arr[:, [1, 0]]
+
+            if close_polygon and len(arr) >= 3 and not np.allclose(arr[0], arr[-1]):
+                arr = np.vstack([arr, arr[0]])
+
+            normalized.append(arr.tolist())
+
+        return normalized
+
+    def _setup_routes(self) -> None:
         app = self.app
+        outer = self
         dz = self.dz
-        save_json = self.save_json
-        screenshot_dir = Path(self.screenshot_dir)
-        top_polygons = self.top_polygons
-        bottom_polygons = self.bottom_polygons
-        img_w = self.level0_w
-        img_h = self.level0_h
-        top_summary = self._polygon_summary(top_polygons)
-        bottom_summary = self._polygon_summary(bottom_polygons)
-
-        @app.route("/static/<path:filename>")
-        def static_files(filename):
-            return send_from_directory(Path.cwd() / "static", filename)
 
         @app.route("/")
-        def index():
-            return render_template_string(
-                HTML,
-                top_polygons=json.dumps(top_polygons),
-                bottom_polygons=json.dumps(bottom_polygons),
+        def index() -> Response:
+            return Response(
+                render_template_string(
+                    HTML,
+                    top_polygons=json.dumps(outer.top_polygons),
+                    bottom_polygons=json.dumps(outer.bottom_polygons),
+                    session_id=outer.session_id,
+                ),
+                mimetype="text/html",
             )
 
-        @app.route("/debug_polygons")
-        def debug_polygons():
-            return jsonify({
-                "image_width": img_w,
-                "image_height": img_h,
-                "top_summary": top_summary,
-                "bottom_summary": bottom_summary,
-                "first_top_polygon": top_polygons[0][:10] if top_polygons else None,
-                "first_bottom_polygon": bottom_polygons[0][:10] if bottom_polygons else None,
-            })
+        @app.route("/static/<path:filename>")
+        def local_static(filename: str):
+            return send_from_directory(outer.static_dir, filename)
+
+        @app.route("/slide_info")
+        def slide_info():
+            return jsonify(
+                {
+                    "slide_path": outer.slide_path,
+                    "dimensions": list(outer.slide_dimensions),
+                    "properties": {
+                        "vendor": outer.slide.properties.get("openslide.vendor"),
+                        "mpp_x": outer.slide.properties.get("openslide.mpp-x"),
+                        "mpp_y": outer.slide.properties.get("openslide.mpp-y"),
+                    },
+                }
+            )
 
         @app.route("/dzi")
-        def dzi():
+        def dzi() -> Response:
             return Response(dz.get_dzi("jpeg"), mimetype="application/xml")
 
         @app.route("/dzi_files/<int:level>/<int:col>_<int:row>.jpeg")
-        def tile(level, col, row):
-            tile = dz.get_tile(level, (col, row))
+        def tile(level: int, col: int, row: int) -> Response:
+            tile_image = dz.get_tile(level, (col, row))
             buf = BytesIO()
-            tile.save(buf, format="JPEG", quality=90)
+            tile_image.save(buf, format="JPEG", quality=90)
             return Response(buf.getvalue(), mimetype="image/jpeg")
 
-        @app.route("/save", methods=["POST"])
-        def save():
+        @app.route("/calibration_save", methods=["POST"])
+        def calibration_save():
             data = request.get_json(force=True)
 
-            screenshot_dir.mkdir(parents=True, exist_ok=True)
+            if data.get("session_id") != outer.session_id:
+                return jsonify({"message": "Session mismatch. Refusing save."}), 409
 
-            screenshots = data.get("screenshots", {})
-            saved_screens = {}
+            save_json_path = Path(outer.save_json)
+            screenshot_dir_path = Path(outer.screenshot_dir)
 
-            for step_name, shot_group in screenshots.items():
+            save_json_path.parent.mkdir(parents=True, exist_ok=True)
+            screenshot_dir_path.mkdir(parents=True, exist_ok=True)
+
+            saved_screens: Dict[str, Dict[str, str]] = {}
+
+            for step_name, shot_group in data.get("screenshots", {}).items():
                 if not shot_group:
                     continue
 
                 saved_screens[step_name] = {}
 
-                # global_overview is a single screenshot dict, others are dicts of levels
-                if step_name == "global_overview":
-                    shot = shot_group
-                    if shot and shot.get("data_url"):
-                        _, encoded = shot["data_url"].split(",", 1)
-                        img_bytes = base64.b64decode(encoded)
-                        filename = shot.get("filename", "global_overview.png")
-                        out_path = screenshot_dir / filename
-                        out_path.write_bytes(img_bytes)
-                        saved_screens[step_name] = str(out_path)
-                        shot.pop("data_url", None)
-                    continue
-
                 for level_name, shot in shot_group.items():
-                    if shot and shot.get("data_url"):
-                        _, encoded = shot["data_url"].split(",", 1)
-                        img_bytes = base64.b64decode(encoded)
-                        filename = shot.get("filename", f"{step_name}_{level_name}.png")
-                        out_path = screenshot_dir / filename
-                        out_path.write_bytes(img_bytes)
-                        saved_screens[step_name][level_name] = str(out_path)
-                        shot.pop("data_url", None)
+                    if not shot or not shot.get("data_url"):
+                        continue
+
+                    _, encoded = shot["data_url"].split(",", 1)
+                    out_path = screenshot_dir_path / shot.get("filename", f"{step_name}_{level_name}.png")
+                    out_path.write_bytes(base64.b64decode(encoded))
+                    saved_screens[step_name][level_name] = str(out_path)
 
             data["saved_screenshot_paths"] = saved_screens
+            save_json_path.write_text(json.dumps(data, indent=2))
 
-            Path(save_json).write_text(json.dumps(data, indent=2))
-            return jsonify({"message": f"Saved annotations to {save_json} and screenshots to {self.screenshot_dir}"})
+            def delayed_shutdown() -> None:
+                time.sleep(0.5)
+                outer.stop()
 
-        @app.route("/state")
-        def state():
-            p = Path(save_json)
-            if p.exists():
-                return jsonify(json.loads(p.read_text()))
-            return jsonify({})
+            threading.Thread(target=delayed_shutdown, daemon=True).start()
 
-    def start(self, open_browser=False, wait_seconds=1.0):
-        if self._thread is not None and self._thread.is_alive():
-            return f"http://{self.host}:{self.port}"
+            return jsonify(
+                {
+                    "message": f"Saved annotations to {save_json_path} and screenshots to {screenshot_dir_path}"
+                }
+            )
 
-        def run():
-            self.app.run(host=self.host, port=self.port, debug=False, use_reloader=False)
+    def start(self, open_browser: bool = False, wait_seconds: float = 1.0) -> str:
+        self.port = _find_free_port(self.host)
 
-        self._thread = threading.Thread(target=run, daemon=True)
-        self._thread.start()
+        self.server_thread = ViewerServer(self.app, self.host, self.port)
+        self.server_thread.start()
+
+        active_key = (self.host, self.port)
+        _ACTIVE_VIEWERS[active_key] = self
+
         time.sleep(wait_seconds)
 
-        url = f"http://{self.host}:{self.port}"
+        url = f"http://{self.host}:{self.port}/?session={self.session_id}&slide={Path(self.slide_path).name}"
+
+        print("=== WSI calibration viewer session ===")
+        print(f"slide_path: {self.slide_path}")
+        print(f"slide_dimensions: {self.slide_dimensions}")
+        print(f"top_polygons: {len(self.top_polygons)}")
+        print(f"bottom_polygons: {len(self.bottom_polygons)}")
+        print(f"save_json: {self.save_json}")
+        print(f"screenshot_dir: {self.screenshot_dir}")
+        print(f"port: {self.port}")
         print("Viewer URL:", url)
-        print("Polygon debug URL:", f"http://{self.host}:{self.port}/debug_polygons")
+
+        if open_browser:
+            webbrowser.open_new(url)
+
         return url
 
-    def load_annotations(self):
-        p = Path(self.save_json)
-        if not p.exists():
-            raise FileNotFoundError(f"No annotation file found at {self.save_json}")
-        return json.loads(p.read_text())
+    def stop(self) -> None:
+        key = (self.host, self.port)
+
+        if self.server_thread is not None:
+            try:
+                self.server_thread.shutdown()
+            finally:
+                self.server_thread.join(timeout=3)
+                self.server_thread = None
+
+        try:
+            self.slide.close()
+        except Exception:
+            pass
+
+        _ACTIVE_VIEWERS.pop(key, None)
+
+
+def _find_free_port(host: str = DEFAULT_HOST) -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
+        return sock.getsockname()[1]
 
 
 def launch_calibration_viewer(
-    slide_path,
-    top_polygons,
-    bottom_polygons,
-    save_json="annotations.json",
-    screenshot_dir="annotation_screenshots",
-    polygon_input_order="xy",
-    host="127.0.0.1",
-    port=5000,
-    open_browser=False,
+    slide_path: str,
+    top_polygons: Sequence[Sequence[Sequence[float]]],
+    bottom_polygons: Sequence[Sequence[Sequence[float]]],
+    save_json: str = "annotations.json",
+    screenshot_dir: str = "annotation_screenshots",
+    polygon_input_order: str = "xy",
+    host: str = DEFAULT_HOST,
+    port: Optional[int] = None,
+    open_browser: bool = False,
+    strict: bool = True,
 ):
     viewer = NotebookWSIViewer(
         slide_path=slide_path,
@@ -933,6 +896,7 @@ def launch_calibration_viewer(
         polygon_input_order=polygon_input_order,
         host=host,
         port=port,
+        strict=strict,
     )
     url = viewer.start(open_browser=open_browser)
     return viewer, url
