@@ -1,3 +1,4 @@
+import json
 import pickle
 import matplotlib.pyplot as plt
 import lazyslide as zs
@@ -5,7 +6,9 @@ import numpy as np
 import pandas as pd
 from wsidata import open_wsi
 import geopandas as gpd
-from spatialdata.models import ShapesModel
+from spatialdata.models import PointsModel, ShapesModel
+from dvpio.write import write_lmd
+import os
 
 class ROISelector:
     """ Handle ROI selection from cached ABMIL inference results. """
@@ -174,7 +177,6 @@ class ROISelector:
         ]
         return polygons_top, polygons_bottom
 
-
     def viewer_polygons(self):
         """ Return top/bottom tile outlines as closed polygons in standard image coordinate order: (x, y).
 
@@ -209,3 +211,60 @@ class ROISelector:
                 polygons_bottom.append(poly)
 
         return polygons_top, polygons_bottom
+
+    # VIEWER SELECT CALBIRATION POINTS
+    # SAVED TO JSON FILE
+
+    def set_paths(self, annotations_path: str, lmd_dir: str):
+        self.annotations_path = annotations_path
+        self.lmd_dir = lmd_dir
+        os.makedirs(self.lmd_dir, exist_ok=True)
+        print(f"Set annotations path: {self.annotations_path}")
+        print(f"Set LMD directory: {self.lmd_dir}")
+
+    def _open_annotations(self):
+        if not hasattr(self, "annotations_path"):
+            raise AttributeError("Annotations path not set. Call set_paths() first.")
+        
+        with open(self.annotations_path, "r") as f:
+            self.ann = json.load(f)
+
+    def add_calibration_points(self):
+        self._open_annotations()
+
+        # Extract calibration points as an (N, 2) array in image coordinates
+        cal_points = self.ann.get("calibration_points", [])
+        coords = np.array([[p["x"], p["y"]] for p in cal_points], dtype=float)
+
+        self.sdata_lmd = self.get_sdata_lmd()
+
+        # Add to spatialdata object
+        self.sdata_lmd.points["calibration_points"] = PointsModel.parse(coords)
+        return self.sdata_lmd
+
+    def write_to_lmd(self):
+        slide_name = os.path.splitext(os.path.basename(self.slide_path))[0]
+        try:
+            for tiles in ["top", "bottom"]:
+                path_lmd = os.path.join(self.lmd_dir, slide_name, f'_{tiles}.xml')
+
+                # Transform coordinates to LMD coordinate system
+                H = self.sdata_lmd.images["wsi_thumbnail"].data.shape[1]
+                
+                affine_transformation = np.array([
+                    [1,  0, 0],
+                    [0, -1, H],
+                    [0,  0, 1]
+                ])
+
+                # Write LMD file with tiles and calibration points
+                write_lmd(
+                    path = path_lmd,
+                    annotation = self.sdata_lmd.shapes[f"{tiles}_tiles"],
+                    calibration_points=self.sdata_lmd.points["calibration_points"],
+                    affine_transformation=affine_transformation
+                )
+                print(f"Wrote LMD file for {tiles} tiles: {path_lmd}")
+
+        except Exception as e:
+            print(f"Error writing LMD files: {e}")
