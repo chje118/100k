@@ -659,45 +659,69 @@ viewer.addHandler("canvas-double-click", function(event) {
 });
 
 async function saveAndClose() {
-  // Global overview: frame all calibration points and capture one screenshot.
-  fitToAllCalibrationPoints();
-  redraw();
-  await sleep(500);
+  if (busySaving) return;
 
-  const globalDataUrl = await captureCurrentCanvasAsDataUrl();
-  screenshots.global_overview = {
-    filename: "global_overview.png",
-    data_url: globalDataUrl,
-    zoom: viewer.viewport.getZoom(true)
-  };
+  busySaving = true;
+  setStatus("Returning to whole-slide view and capturing overview...");
 
-  const payload = {
-    calibration_points: [
-      records.calibration_point_1,
-      records.calibration_point_2,
-      records.calibration_point_3
-    ],
-    calibration_point_1: records.calibration_point_1,
-    calibration_point_2: records.calibration_point_2,
-    calibration_point_3: records.calibration_point_3,
-    top_polygons: initialTop,
-    bottom_polygons: initialBottom,
-    screenshots: screenshots
-  };
+  try {
+    // Return to exactly the same view used when opening the viewer.
+    viewer.viewport.goHome(true);
+    viewer.viewport.applyConstraints(true);
 
-  const resp = await fetch("/save", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(payload)
-  });
+    // Ensure the calibration points are drawn on top of the home view.
+    redraw();
 
-  const data = await resp.json();
-  setStatus(data.message + " Attempting to close tab...");
+    // Give OpenSeadragon time to render the whole-slide view.
+    await sleep(700);
 
-  setTimeout(() => {
-    window.close();
-    setStatus(data.message + " You may need to close this tab manually.");
-  }, 300);
+    // Capture the whole-slide view with calibration points visible.
+    const globalDataUrl = await captureCurrentCanvasAsDataUrl();
+
+    screenshots.global_overview = {
+      filename: "global_overview.png",
+      data_url: globalDataUrl,
+      zoom: viewer.viewport.getZoom(true)
+    };
+
+    const payload = {
+      calibration_points: [
+        records.calibration_point_1,
+        records.calibration_point_2,
+        records.calibration_point_3
+      ],
+      calibration_point_1: records.calibration_point_1,
+      calibration_point_2: records.calibration_point_2,
+      calibration_point_3: records.calibration_point_3,
+      top_polygons: initialTop,
+      bottom_polygons: initialBottom,
+      screenshots: screenshots
+    };
+
+    const resp = await fetch("/save", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload)
+    });
+
+    if (!resp.ok) {
+      throw new Error(`Save request failed with status ${resp.status}`);
+    }
+
+    const data = await resp.json();
+    setStatus(data.message + " Attempting to close tab...");
+
+    setTimeout(() => {
+      window.close();
+      setStatus(data.message + " You may need to close this tab manually.");
+    }, 300);
+
+  } catch (err) {
+    console.error(err);
+    setStatus("Save failed: " + err.message);
+  } finally {
+    busySaving = false;
+  }
 }
 
 updateInstruction();
