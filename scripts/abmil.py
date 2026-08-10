@@ -658,7 +658,7 @@ class TrainABMILPipeline:
     def save_abmil(self, max_tiles=50000, seed=42, n_epochs=None):
         """ Retrain on all valid slides for best_epoch epochs and save the checkpoint. """
         
-        if self.best_epoch is None:
+        if self.best_epoch and n_epochs is None:
             raise ValueError("best_epoch is not set. Run train_abmil() first.")
 
         df = self._map_labels(self.df)
