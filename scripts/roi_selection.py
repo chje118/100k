@@ -40,7 +40,8 @@ class ROISelector:
         return slide_data
 
     def get_tiles_gdf(self):
-        """Return random top-k and bottom-k tiles sampled from the top/bottom x% of attention scores."""
+        """Return random top-k and bottom-k tiles sampled from the top/bottom x% of attention scores.
+        Sorted by shortest path (greedy nearest-neighbor from top-left corner)."""
         tile_table = self.slide_data.get("tile_table")
         if tile_table is None:
             raise KeyError("slide_data must contain 'tile_table'")
@@ -76,7 +77,55 @@ class ROISelector:
             replace=False,
         ).copy()
 
+        # Sort each by shortest path (greedy nearest-neighbor)
+        top_tiles = self._sort_tiles_tsp(top_tiles)
+        bottom_tiles = self._sort_tiles_tsp(bottom_tiles)
+
         return gpd.GeoDataFrame(top_tiles, geometry="geometry"), gpd.GeoDataFrame(bottom_tiles, geometry="geometry")
+
+    def _sort_tiles_tsp(self, tiles_gdf):
+        """Sort tiles by greedy nearest-neighbor from top-left corner."""
+        if len(tiles_gdf) <= 1:
+            return tiles_gdf
+    
+        tiles_gdf = tiles_gdf.copy()
+    
+        # Compute centroids
+        centroids = tiles_gdf.geometry.centroid
+        tiles_gdf["centroid_x"] = centroids.x
+        tiles_gdf["centroid_y"] = centroids.y
+    
+        # Start from top-left tile (min y, then min x)
+        tiles_gdf["sort_key"] = tiles_gdf["centroid_y"] * 1e6 + tiles_gdf["centroid_x"]
+        current_idx = tiles_gdf["sort_key"].idxmin()
+        tiles_gdf = tiles_gdf.drop(columns=["sort_key"])
+    
+        # Greedy nearest-neighbor traversal
+        remaining = set(tiles_gdf.index)
+        order = []
+    
+        while remaining:
+            order.append(current_idx)
+            remaining.remove(current_idx)
+        
+            if not remaining:
+                break
+        
+            # Find nearest unvisited tile
+            current_x = tiles_gdf.loc[current_idx, "centroid_x"]
+            current_y = tiles_gdf.loc[current_idx, "centroid_y"]
+        
+            remaining_gdf = tiles_gdf.loc[list(remaining)]
+            distances = np.sqrt(
+                (remaining_gdf["centroid_x"] - current_x)**2 + 
+                (remaining_gdf["centroid_y"] - current_y)**2
+            )
+            current_idx = distances.idxmin()
+    
+        # Reorder by traversal path
+        tiles_sorted = tiles_gdf.loc[order].drop(columns=["centroid_x", "centroid_y"])
+    
+        return tiles_sorted
 
     def zoomed_view(self, margin: int = 0, max_tiles: int = 4, top: bool = True):
         """ Plot zoomed tiles (grid) for review from cached slide data. """
