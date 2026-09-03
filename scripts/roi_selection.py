@@ -89,7 +89,10 @@ class ROISelector:
             return tiles_gdf
     
         tiles_gdf = tiles_gdf.copy()
-    
+        
+        if not isinstance(tiles_gdf, gpd.GeoDataFrame):
+            tiles_gdf = gpd.GeoDataFrame(tiles_gdf, geometry="geometry")
+
         # Compute centroids
         centroids = tiles_gdf.geometry.centroid
         tiles_gdf["centroid_x"] = centroids.x
