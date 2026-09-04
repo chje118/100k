@@ -169,7 +169,7 @@ class ROISelector:
         plt.tight_layout()
         plt.show()
 
-    def tiles_to_cut(self):
+    def tiles_to_cut(self, save = False, output_dir = None):
         """ Plot the full slide and highlight the top-k and bottom-k tiles to cut with red and blue. """
         top_tiles_gdf, bottom_tiles_gdf = self.get_tiles_gdf()
         wsi = self.get_wsi()
@@ -197,8 +197,22 @@ class ROISelector:
         ax.set_title(f"Top {len(top_tiles_gdf)} (red) and bottom {len(bottom_tiles_gdf)} (blue) tiles selected for cutting")
         ax.axis("off")
         plt.tight_layout()
-        plt.show()
 
+        if save:
+            if output_dir is None:
+                output_dir = "tiles_to_cut"
+                
+            os.makedirs(output_dir, exist_ok=True)
+            slide_name = os.path.splitext(os.path.basename(self.slide_path))[0]
+            output_path = os.path.join(output_dir, f"{slide_name}_tiles_to_cut.jpg")
+
+            fig.savefig(output_path, format="jpg", dpi=300, bbox_inches="tight")
+            plt.close(fig)
+            return output_path
+        
+        plt.show()
+        return fig
+    
     def get_wsi(self):
         slide_path = self.slide_data["slide_path"]
         zarr_path = self.slide_data["zarr_path"]
