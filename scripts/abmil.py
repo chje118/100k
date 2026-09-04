@@ -956,11 +956,13 @@ class KFoldPipeline:
 
 class ABMILInference:
     """ Run slide-level ABMIL inference from cached tile features and store attention outputs. """
-    def __init__(self, checkpoint_path, zarr_dir, slides, cache_path=None):
+    def __init__(self, checkpoint_path, zarr_dir, slides, cache_path=None, heatmap_dir=None, save_heatmap=False):
         self.checkpoint_path = checkpoint_path
         self.zarr_dir = zarr_dir
         self.slides = list(slides)
         self.cache_path = cache_path
+        self.heatmap_dir = heatmap_dir or os.path.join(os.path.dirname(cache_path) if cache_path else ".", "heatmaps")
+        self.save_heatmap = save_heatmap
         self._slide_cache = {}
         self._skipped_slides = []
 
@@ -976,7 +978,7 @@ class ABMILInference:
         self.feature_key = self.config.get("feature_key")
         self.tile_key = self.config.get("tile_key")
         self.idx_to_label = {v: k for k, v in self.label_mapping.items()} if self.label_mapping else {}
-
+    
     def save_cache(self):
         """Save cached inference results to disk."""
         if not self.cache_path:
@@ -1063,18 +1065,22 @@ class ABMILInference:
         return slide_data
 
     def process_slides(self):
-        """Process slides sequentially, skipping failures and continuing."""
+        """Process slides sequentially, skipping failures and continuing.
+        Optionally save one JPG heatmap per slide."""
         processed_count = 0
 
         for slide_path in tqdm(self.slides, desc="Running ABMIL inference..."):
-            if slide_path in self._slide_cache:
-                processed_count += 1
-                continue
-
             try:
                 self._infer_slide(slide_path)
+
+                if self.save_heatmap: 
+                    slide_name = os.path.splitext(os.path.basename(slide_path))[0]
+                    heatmap_path = os.path.join(self.heatmap_dir, f"{slide_name}_heatmap.jpg")
+                    self.attention_heatmap(slide_path, save_path=heatmap_path)
+
                 self.save_cache()
                 processed_count += 1
+
             except Exception as e:
                 self._skipped_slides.append({
                     "slide_path": slide_path,
@@ -1086,12 +1092,14 @@ class ABMILInference:
         print(f"Processed {processed_count}/{len(self.slides)} slides.")
         if self.cache_path:
             print(f"Cache saved to {self.cache_path}.")
+        if self.save_heatmap:
+            print(f"Heatmaps saved to {self.heatmap_dir}.")
         if self._skipped_slides:
             print(f"Skipped {len(self._skipped_slides)} slides due to errors.")
 
         return self._slide_cache
-
-    def attention_heatmap(self, slide_path: str):
+    
+    def attention_heatmap(self, slide_path: str, save_path: str = None):
         """Plot the attention heatmap for one cached slide."""
         slide_data = self._slide_cache.get(slide_path)
         if not slide_data:
@@ -1114,6 +1122,7 @@ class ABMILInference:
         else:
             attention_display = attention
 
+        
         print(
             f"Attention stats for {os.path.basename(slide_path)}: "
             f"min={attention.min():.4f}, p5={np.percentile(attention, 5):.4f}, "
@@ -1141,8 +1150,17 @@ class ABMILInference:
             f"(Conf: {slide_data['confidence']:.2f})"
         )
         ax.axis("off")
-        plt.show()
 
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+            fig.tight_layout()
+            fig.savefig(save_path, format="jpg", dpi=300, bbox_inches="tight")
+            plt.close(fig)
+            return save_path  
+
+        plt.show()
+        return fig
+    
     def results_dataframe(self):
         """Return one row per cached slide with predictions and class probabilities."""
         if not self._slide_cache:
