@@ -5,6 +5,7 @@ from tqdm import tqdm
 from datetime import datetime
 import pickle
 import shutil
+from collections import Counter
 
 # --------------------
 # Cache handling
@@ -41,6 +42,30 @@ def _get_processed_entries(cache):
                 if isinstance(data, dict):
                     processed[(slide_name, category, model)] = data
     return processed
+
+def print_cache_summary(cache_file):
+    """Print summary of processed slides."""
+    cache = _load_cache(cache_file)
+    entries = _get_processed_entries(cache)
+
+    total = 0
+    by_category = Counter()
+    by_cat_model = Counter()
+    by_cat_model_status = Counter()
+
+    for (_, category, model), data in entries.items():
+        total += 1
+        status = str(data.get("status", "unknown"))
+
+        by_category[category] += 1
+        by_cat_model[(category, model)] += 1
+        by_cat_model_status[(category, model, status)] += 1
+
+    print(f"Total entries: {total}\n")
+
+    print("\nProcessed WSIs:")
+    for (cat, model, status), cnt in sorted(by_cat_model_status.items()):
+        print(f"{cat} / {model} / {status}: {cnt}")
 
 def _store_processed_entry(cache, slide_name, category, model, data):
     """Store a processed entry using the slide -> category -> model layout."""
@@ -162,7 +187,7 @@ class SegmentArtifacts:
         os.makedirs(zarr_dir, exist_ok=True)
         
         self.version = version
-        self.tile_key = "tiles_px512_mpp1.5_overlap0.1" if version == "default" else "tiles_px512_mpp1.0_overlap0.1"
+        self.tile_key = "tiles_px512_mpp1.5_overlap0" if version == "default" else "tiles_px512_mpp1.0_overlap0"
         self.artifact_key = "artifacts_grandqc" if version == "default" else "artifacts_grandqc_10x"
         self.tissue_key = None
         self.elapsed_time = None
@@ -175,9 +200,9 @@ class SegmentArtifacts:
             raise KeyError("No tissue key found. ")
         return tissue_candidates
 
-    def _tile_tissue(self, tile_px=512, mpp=1.5, overlap=0.1):
+    def _tile_tissue(self, tile_px=512, mpp=1.5, overlap=0):
         """ Generate tiles from tissue regions. 
-        Default: tile_px=512, mpp=1.5, overlap=0.1 for GrandQC 7x.
+        Default: tile_px=512, mpp=1.5, overlap=0 for GrandQC 7x.
         """
         if self.tile_key not in self.wsi.shapes:
             zs.pp.tile_tissues(self.wsi, tile_px=tile_px, mpp=mpp, overlap=overlap, 
@@ -196,9 +221,9 @@ class SegmentArtifacts:
             
             if self.tile_key not in self.wsi.shapes:
                 if self.version == "10x":
-                    self._tile_tissue(tile_px=512, mpp=1.0, overlap=0.1)
+                    self._tile_tissue(tile_px=512, mpp=1.0, overlap=0)
                 else:
-                    self._tile_tissue(tile_px=512, mpp=1.5, overlap=0.1)
+                    self._tile_tissue(tile_px=512, mpp=1.5, overlap=0)
             
             self._segment_artifacts()
             artifacts = self.wsi.get(self.artifact_key)

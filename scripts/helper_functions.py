@@ -69,8 +69,6 @@ def find_files(root: str, suffix: str = ".mrxs") -> list[str]:
     return sorted(files)
 
 
-
-
 # --------- Methods to subset a dataframe ----------
 
 def subset_df(df, col, val):
@@ -108,7 +106,6 @@ def subset_df_word(df, col, word):
     """ Return rows where `word` (case-insensitive) appears in `col`. """
     mask = df[col].apply(contains_word, args=(word,))
     return df[mask].copy()
-
 
 def subset_df_processed(df, cache_file, category=None, status=None, model=None, filename_col="filename"):
     """Return dataframe rows that match processed cache entries.
