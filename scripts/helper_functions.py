@@ -4,6 +4,7 @@ import pandas as pd
 import ast
 import re
 from tissue_artifact_segmentation import _load_cache, _get_processed_entries
+import os
 
 # ---------- General helper functions ----------
 
@@ -51,6 +52,23 @@ def is_missing(x):
 def combine_values(series):
     uniques = series.dropna().unique()
     return ", ".join(map(str, uniques))
+
+def find_files(root: str, suffix: str = ".mrxs") -> list[str]:
+    """
+    Recursively walk `root` and return a sorted list of absolute paths
+    to all files ending with specified suffied (default = '.mrxs') (case-insensitive).
+    """
+    files = []
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        for fname in filenames:
+            if fname.lower().endswith(suffix):
+                full_path = os.path.join(dirpath, fname)
+                files.append(os.path.abspath(full_path))
+
+    return sorted(files)
+
+
 
 
 # --------- Methods to subset a dataframe ----------
