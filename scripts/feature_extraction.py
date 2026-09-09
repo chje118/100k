@@ -56,6 +56,8 @@ class ExtractFeatures:
         wsi_path,
         zarr_dir,
         foundation_model,
+        mpp=0.12,
+        tile_px=224,
         remove_artifacts=False,
         feature_batch_size=512,
         feature_num_workers=None,
@@ -66,6 +68,8 @@ class ExtractFeatures:
         os.makedirs(zarr_dir, exist_ok=True)
         self.wsi = open_wsi(self.wsi_path, self.zarr_path)
         self.foundation_model = foundation_model
+        self.mpp = mpp
+        self.tile_px = tile_px
         self.remove_artifacts = remove_artifacts
 
         cpu_count = os.cpu_count() or 8
@@ -75,10 +79,14 @@ class ExtractFeatures:
         )
         self.feature_autocast_dtype = feature_autocast_dtype or torch.bfloat16
 
-        self.TILE_KEY = "clean_tiles_224" if remove_artifacts else "tiles_224"
-        self.FEATURE_KEY = (f"clean_features_{self.foundation_model}" if remove_artifacts else f"features_{self.foundation_model}")
-        self.elapsed_time = None
+        # For future projects, generate tile and feature key based on mpp, px and presence of artifacts
+        base_tile_key = "clean_tiles_224" if remove_artifacts else "tiles_224"
+        self.TILE_KEY = f"{base_tile_key}_mpp{mpp}" if mpp != 0.12 else base_tile_key
+        
+        base_feature_key = (f"clean_features_{foundation_model}" if remove_artifacts else f"features_{foundation_model}")
+        self.FEATURE_KEY = f"{base_feature_key}_mpp{mpp}" if mpp != 0.12 else base_feature_key
 
+        self.elapsed_time = None
         self.process_slide()
 
     def _get_tissue_key(self):
@@ -107,6 +115,7 @@ class ExtractFeatures:
 
             if self.TILE_KEY not in self.wsi.shapes:
                 self.tile_tissue()
+                print(f"Tiling complete, key: {self.TILE_KEY}")
                 tiles = self.wsi.get(self.TILE_KEY)
                 if is_empty_array(tiles):
                     raise RuntimeError("No tiles generated")
@@ -120,11 +129,11 @@ class ExtractFeatures:
         except Exception as e:
             raise RuntimeError(str(e))
     
-    def tile_tissue(self, tile_px=224):
+    def tile_tissue(self):
         """Generate tissue tiles and optionally filter out artifact-overlapping tiles."""
         try:
             if self.TILE_KEY not in self.wsi.shapes:
-                zs.pp.tile_tissues(self.wsi, tile_px=tile_px, key_added=self.TILE_KEY, tissue_key=self.TISSUE_KEY)
+                zs.pp.tile_tissues(self.wsi, tile_px=self.tile_px, mpp = self.mpp, key_added=self.TILE_KEY, tissue_key=self.TISSUE_KEY)
                 
             if self.remove_artifacts:
                 self._remove_artifact_tiles()
@@ -198,6 +207,8 @@ class ExtractMany:
         cache_path,
         zarr_dir,
         foundation_model,
+        mpp=0.12,
+        tile_px=224, 
         remove_artifacts=False,
         feature_batch_size=512,
         feature_num_workers=None,
@@ -208,6 +219,8 @@ class ExtractMany:
         self.cache_path = cache_path
         self.zarr_dir = zarr_dir
         self.foundation_model = foundation_model
+        self.mpp = mpp
+        self.tile_px = tile_px 
         self.remove_artifacts = remove_artifacts
         self.feature_batch_size = feature_batch_size
         self.feature_num_workers = feature_num_workers
@@ -225,11 +238,17 @@ class ExtractMany:
         skipped = 0
         for path in tqdm(self.wsi_paths, desc="feature extraction progress"):
             slide_name = os.path.basename(path)
+
             feature_key = f"features_{self.foundation_model}"
             tile_key = "clean_tiles_224" if self.remove_artifacts else "tiles_224"
-            
+
+            if self.mpp != 0.12:
+                feature_key = f"{feature_key}_mpp{self.mpp}"
+                tile_key = f"{tile_key}_mpp{self.mpp}"
+
             # Check if already processed
-            cache_key = (slide_name, "features", self.foundation_model)
+            fm_key = f"{self.foundation_model}_mpp{self.mpp}" if self.mpp != 0.12 else self.foundation_model
+            cache_key = (slide_name, "features", fm_key)
             if cache_key in self.processed:
                 status = self.processed[cache_key].get("status")
                 if status == "complete":
@@ -249,6 +268,8 @@ class ExtractMany:
                     path,
                     self.zarr_dir,
                     foundation_model=self.foundation_model,
+                    mpp=self.mpp,
+                    tile_px=self.tile_px, 
                     remove_artifacts=self.remove_artifacts,
                     feature_batch_size=self.feature_batch_size,
                     feature_num_workers=self.feature_num_workers,
@@ -282,7 +303,7 @@ class ExtractMany:
                 **feature_summary,
                 "status": status,
             }
-            _store_processed_entry(self.cache, slide_name, "features", self.foundation_model, slide_data)
+            _store_processed_entry(self.cache, slide_name, "features", fm_key, slide_data)
             _save_cache(self.cache, self.cache_path)
             
             print(f"Saved result for {slide_name} → {self.cache_path}")
