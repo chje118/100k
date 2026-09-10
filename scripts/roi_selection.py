@@ -11,15 +11,30 @@ from dvpio.write import write_lmd
 import os
 
 class ROISelector:
-    """ Handle ROI selection from cached ABMIL inference results. """
-    def __init__(self, cache_path: str, slide_path: str, top_k: int = 20, bottom_k: int = 10, top_pct: float = 0.10, bottom_pct: float = 0.10, random_state: int | None = 42):
+    """ Handle ROI selection from cached ABMIL inference results.
+
+    Selection is driven by `contrast_score` (the classifier's own read of
+    each tile's raw features: + = disease-like, - = healthy-like). 
+    
+    Attention tells how much a tile influenced the slide-level prediction.
+
+    `min_attention_pct` is used as a relevance floor. Tiles
+    in the bottom `min_attention_pct` of attention for this slide are
+    dropped from BOTH the disease and healthy candidate pools before
+    ranking, since those are the tiles the model essentially ignored and
+    are the most likely to be background, blur or folds - not a
+    class judgement.
+    """
+    def __init__(self, cache_path: str, slide_path: str, healthy_k: int = 20, non_healthy_k: int = 10, healthy_pct: float = 0.10, non_healthy_pct: float = 0.10, random_state: int | None = 42, score_col: str = "contrast_score", min_attention_pct: float = 5.0):
         self.cache_path = cache_path
         self.slide_path = slide_path
-        self.top_k = top_k
-        self.bottom_k = bottom_k
-        self.top_pct = top_pct
-        self.bottom_pct = bottom_pct
+        self.healthy_k = healthy_k
+        self.non_healthy_k = non_healthy_k
+        self.healthy_pct = healthy_pct
+        self.non_healthy_pct = non_healthy_pct
         self.random_state = random_state
+        self.score_col = score_col
+        self.min_attention_pct = min_attention_pct
         self.slide_cache = self.load_cache(cache_path)
         self.slide_data = self.get_slide_data()
 
@@ -40,48 +55,71 @@ class ROISelector:
         return slide_data
 
     def get_tiles_gdf(self):
-        """Return random top-k and bottom-k tiles sampled from the top/bottom x% of attention scores.
-        Sorted by shortest path (greedy nearest-neighbor from top-left corner)."""
+        """ Return random healthy-k and non-healthy-k tiles sampled from the 
+        top/bottom x% of `self.score_col` (contrast_score by default: + = disease-like, 
+        - = healthy-like), restricted to tiles that cleared the attention
+        relevance floor. Sorted by shortest path (greedy nearest-neighbor
+        from top-left corner). """
         tile_table = self.slide_data.get("tile_table")
         if tile_table is None:
             raise KeyError("slide_data must contain 'tile_table'")
 
-        tile_table = tile_table.dropna(subset=["attention", "geometry"]).copy()
+        required_cols = ["attention", self.score_col, "geometry"]
+        missing = [c for c in required_cols if c not in tile_table.columns]
+        if missing:
+            raise KeyError(
+                f"slide_data['tile_table'] is missing column(s) {missing}. "
+                "Run ABMIL inference first. "
+            )
+
+        tile_table = tile_table.dropna(subset=required_cols).copy()
         n_tiles = len(tile_table)
 
         if n_tiles == 0:
             empty = gpd.GeoDataFrame(tile_table, geometry="geometry")
             return empty, empty
 
-        top_pool_n = self._get_pool_size(n_tiles, self.top_pct)
-        bottom_pool_n = self._get_pool_size(n_tiles, self.bottom_pct)
-        
-        ranked_desc = tile_table.sort_values("attention", ascending=False)
-        ranked_asc = tile_table.sort_values("attention", ascending=True)
+        # Relevance floor: drop the least-attended tiles from BOTH pools so
+        # ignored/background tiles can't masquerade as "healthy" just for
+        # having a low or negative contrast_score by chance.
+        if self.min_attention_pct and self.min_attention_pct > 0:
+            attn_floor = np.percentile(tile_table["attention"], self.min_attention_pct)
+            candidate_table = tile_table[tile_table["attention"] >= attn_floor].copy()
+            if candidate_table.empty:  # guard against a degenerate/uniform attention distribution
+                candidate_table = tile_table
+        else:
+            candidate_table = tile_table
 
-        top_pool = ranked_desc.head(top_pool_n).copy()
-        bottom_pool = ranked_asc.head(bottom_pool_n).copy()
+        n_candidates = len(candidate_table)
+        healthy_pool_n = self._get_pool_size(n_candidates, self.top_pct)
+        non_healthy_pool_n = self._get_pool_size(n_candidates, self.bottom_pct)
 
-        top_sample_n = min(self.top_k, len(top_pool))
-        bottom_sample_n = min(self.bottom_k, len(bottom_pool))
+        ranked_desc = candidate_table.sort_values(self.score_col, ascending=False)  # most disease-like first
+        ranked_asc = candidate_table.sort_values(self.score_col, ascending=True)    # most healthy-like first
 
-        top_tiles = top_pool.sample(
-            n=top_sample_n,
+        healthy_pool = ranked_desc.head(healthy_pool_n).copy()
+        non_healthy_pool = ranked_asc.head(non_healthy_pool_n).copy()
+
+        healthy_sample_n = min(self.healthy_k, len(healthy_pool))
+        non_healthy_sample_n = min(self.non_healthy_k, len(non_healthy_pool))
+
+        healthy_tiles = healthy_pool.sample(
+            n=healthy_sample_n,
             random_state=self.random_state,
             replace=False,
         ).copy()
-        
-        bottom_tiles = bottom_pool.sample(
-            n=bottom_sample_n,
+
+        non_healthy_tiles = non_healthy_pool.sample(
+            n=non_healthy_sample_n,
             random_state=self.random_state,
             replace=False,
         ).copy()
-
+    
         # Sort each by shortest path (greedy nearest-neighbor)
-        top_tiles = self._sort_tiles_tsp(top_tiles)
-        bottom_tiles = self._sort_tiles_tsp(bottom_tiles)
+        healthy_tiles = self._sort_tiles_tsp(healthy_tiles)
+        non_healthy_tiles = self._sort_tiles_tsp(non_healthy_tiles)
 
-        return gpd.GeoDataFrame(top_tiles, geometry="geometry"), gpd.GeoDataFrame(bottom_tiles, geometry="geometry")
+        return gpd.GeoDataFrame(healthy_tiles, geometry="geometry"), gpd.GeoDataFrame(non_healthy_tiles, geometry="geometry")
 
     def _sort_tiles_tsp(self, tiles_gdf):
         """Sort tiles by greedy nearest-neighbor from top-left corner."""
@@ -130,10 +168,10 @@ class ROISelector:
     
         return tiles_sorted
 
-    def zoomed_view(self, margin: int = 0, max_tiles: int = 4, top: bool = True):
+    def zoomed_view(self, margin: int = 0, max_tiles: int = 4, healthy: bool = True):
         """ Plot zoomed tiles (grid) for review from cached slide data. """
-        top_tiles_gdf, bottom_tiles_gdf = self.get_tiles_gdf()
-        tiles_gdf = top_tiles_gdf if top else bottom_tiles_gdf
+        healthy_tiles_gdf, non_healthy_tiles_gdf = self.get_tiles_gdf()
+        tiles_gdf = healthy_tiles_gdf if healthy else non_healthy_tiles_gdf
 
         if max_tiles is not None:
             tiles_gdf = tiles_gdf.head(max_tiles)
@@ -171,7 +209,7 @@ class ROISelector:
 
     def tiles_to_cut(self, save = False, output_dir = None):
         """ Plot the full slide and highlight the top-k and bottom-k tiles to cut with red and blue. """
-        top_tiles_gdf, bottom_tiles_gdf = self.get_tiles_gdf()
+        healthy_tiles_gdf, non_healthy_tiles_gdf = self.get_tiles_gdf()
         wsi = self.get_wsi()
 
         fig, ax = plt.subplots(figsize=(12, 12))
@@ -180,21 +218,21 @@ class ROISelector:
             ax=ax,
             show_contours=True,
         )
-        top_tiles_gdf.plot(
+        healthy_tiles_gdf.plot(
             ax=ax,
             facecolor="#ff2d2d",
             edgecolor="#b30000",
             linewidth=1.5,
             alpha=0.35,
         )
-        bottom_tiles_gdf.plot(
+        non_healthy_tiles_gdf.plot(
             ax=ax,
             facecolor="#2d2dff",
             edgecolor="#0000b3",
             linewidth=1.5,
             alpha=0.35,
         )
-        ax.set_title(f"Top {len(top_tiles_gdf)} (red) and bottom {len(bottom_tiles_gdf)} (blue) tiles selected for cutting")
+        ax.set_title(f"Top {len(healthy_tiles_gdf)} (red) and bottom {len(non_healthy_tiles_gdf)} (blue) tiles selected for cutting")
         ax.axis("off")
         plt.tight_layout()
 
@@ -221,27 +259,27 @@ class ROISelector:
     
     def get_sdata_lmd(self):
         self.sdata = self.wsi.to_spatialdata()
-        top_gdf, bottom_gdf = self.get_tiles_gdf()
-        self.sdata.shapes["top_tiles"] = ShapesModel.parse(top_gdf)
-        self.sdata.shapes["bottom_tiles"] = ShapesModel.parse(bottom_gdf)
-        export_layers = ["wsi_thumbnail", "top_tiles", "bottom_tiles"]
+        healthy_gdf, non_healthy_gdf = self.get_tiles_gdf()
+        self.sdata.shapes["healthy_tiles"] = ShapesModel.parse(healthy_gdf)
+        self.sdata.shapes["non_healthy_tiles"] = ShapesModel.parse(non_healthy_gdf)
+        export_layers = ["wsi_thumbnail", "healthy_tiles", "non_healthy_tiles"]
         sdata_lmd = self.sdata.subset(element_names=export_layers)
         return sdata_lmd
 
     def napari_polygons(self):
         """ Return list of polygon coordinate arrays suitable for Napari `add_shapes`."""
-        top_tiles_gdf, bottom_tiles_gdf = self.get_tiles_gdf()
-        polygons_top = [
+        healthy_tiles_gdf, non_healthy_tiles_gdf = self.get_tiles_gdf()
+        polygons_healthy = [
             np.array(g.exterior.coords)[:, [1, 0]]
-            for g in top_tiles_gdf.geometry
+            for g in healthy_tiles_gdf.geometry
             if g.geom_type == "Polygon"
         ]
-        polygons_bottom = [
+        polygons_non_healthy = [
             np.array(g.exterior.coords)[:, [1, 0]]
-            for g in bottom_tiles_gdf.geometry
+            for g in non_healthy_tiles_gdf.geometry
             if g.geom_type == "Polygon"
         ]
-        return polygons_top, polygons_bottom
+        return polygons_healthy, polygons_non_healthy
 
     def viewer_polygons(self):
         """ Return top/bottom tile outlines as closed polygons in standard image coordinate order: (x, y).
@@ -249,7 +287,7 @@ class ROISelector:
         Each tile is returned as a 5-point closed ring:
         [(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy), (minx, miny)].
         """
-        top_tiles_gdf, bottom_tiles_gdf = self.get_tiles_gdf()
+        healthy_tiles_gdf, non_healthy_tiles_gdf = self.get_tiles_gdf()
 
         def geom_to_polygon_xy(geom):
             if geom is None or geom.is_empty:
@@ -264,22 +302,19 @@ class ROISelector:
                 [minx, miny],
             ], dtype=float)
 
-        polygons_top = []
-        for geom in top_tiles_gdf.geometry:
+        polygons_healthy = []
+        for geom in healthy_tiles_gdf.geometry:
             poly = geom_to_polygon_xy(geom)
             if poly is not None:
-                polygons_top.append(poly)
+                polygons_healthy.append(poly)
 
-        polygons_bottom = []
-        for geom in bottom_tiles_gdf.geometry:
+        polygons_non_healthy = []
+        for geom in non_healthy_tiles_gdf.geometry:
             poly = geom_to_polygon_xy(geom)
             if poly is not None:
-                polygons_bottom.append(poly)
+                polygons_non_healthy.append(poly)
 
-        return polygons_top, polygons_bottom
-
-    # VIEWER SELECT CALBIRATION POINTS
-    # SAVED TO JSON FILE
+        return polygons_healthy, polygons_non_healthy
 
     def set_paths(self, annotations_path: str, lmd_dir: str):
         self.annotations_path = annotations_path
@@ -311,7 +346,7 @@ class ROISelector:
     def write_to_lmd(self):
         slide_name = os.path.splitext(os.path.basename(self.slide_path))[0]
         try:
-            for tiles in ["top", "bottom"]:
+            for tiles in ["healthy", "non_healthy"]:
                 path_lmd = os.path.join(self.lmd_dir, slide_name, f'{slide_name}_{tiles}.xml')
                 
                 # Transform coordinates to LMD coordinate system
