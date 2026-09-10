@@ -1,11 +1,3 @@
-"""
-ABMIL (Attention-Based Multiple Instance Learning) for WSI Classification.
-
-ABMIL pipeline for pathology benchmarking:
-Stratified k-fold cross validation with proper train/internal-val/test split
-Computes macro AUC (one-vs-rest, class-balanced)
-"""
-
 import os
 import pickle
 import torch
@@ -90,8 +82,21 @@ class ZarrSlideDataset(Dataset):
 # ----------------------------------------
 
 class ABMIL(nn.Module):
-    """ Attention-Based Multiple Instance Learning for WSI Classification. """
-    def __init__(self, in_dim, n_classes, hidden_dim=256, n_heads=4):
+    """
+    Single-head gated ABMIL for:
+        Class 0 = healthy-ish
+        Class 1 = non-healthy
+
+    This uses the standard gated attention mechanism from Ilse et al. (2018):
+        a_i ∝ exp(w^T (tanh(V x_i) ⊙ sigmoid(U x_i)))
+    and MIL pooling:
+        z = Σ_i a_i x_i
+    followed by a linear classifier on the slide embedding z.
+
+    Keeping n_heads=1 for interpretability: one attention weight per tile.
+    Tile-level class contributions are derived from attention and classifier weights.
+    """
+    def __init__(self, in_dim, n_classes = 2, hidden_dim=256, n_heads=1):
         """
         in_dim: feature size per tile (e.g. 512, 768, 1024)
         n_classes: number of output classes
@@ -107,14 +112,17 @@ class ABMIL(nn.Module):
 
         # Attention mechanism, producing one attention score per tile
         # Gated attention: A = V * U (tanh * sigmoid)
+        # Tanh allows positive and negative responses
         self.attn_V = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.Tanh()
         )
+        # Sigmoid acts as a learned gate between 0 and 1.
         self.attn_U = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.Sigmoid()
         )
+        # Maps hidden representation to raw attention scores
         self.attn_w = nn.Linear(hidden_dim, n_heads) 
 
         # Classifier layer, maps final slide embedding to class scores
@@ -122,32 +130,99 @@ class ABMIL(nn.Module):
 
     def forward(self, x):
         """
-        Forward pass of ABMIL:
+        Forward pass of ABMIL.
 
         Parameters: 
-        - x: slide with shape, [n_tiles, feat_dim]
-        
-        Returns:
-        - logits: used for training (CrossEntropyLoss)
-        - A: attention weights (for interpretability)
+        - x: tile features for one slide, shape: [n_tiles, feat_dim]
         """
         # Compute attention scores: A = V * U (gated attention)
         V = self.attn_V(x)      # [n_tiles, hidden_dim] (tanh)
         U = self.attn_U(x)      # [n_tiles, hidden_dim] (sigmoid)
         H = V * U               # elementwise gating
-        A = self.attn_w(H)      # [n_tiles, n_heads] (attention)
 
-        # Normalize with softmax (sums to 1)
-        A = torch.softmax(A, dim=0)
+        # Raw attention logits
+        attention_logits = self.attn_w(H)      # [n_tiles, n_heads]
 
-        # MIL pooling, for multiple attention heads
-        M = A.T @ x         # [n_heads, feat_dim]
-        M = M.mean(dim=0)   
+        # Normalize attention within each head so weights sum to 1 over tiles
+        attention = torch.softmax(attention_logits, dim=0)  # [n_tiles, n_heads]
 
-        # Multiclass predictions
-        logits = self.classifier(M)
+        # MIL pooling: one pooled representation per head
+        # pooled_heads[h, :] = Σ_i attention[i, h] * x[i, :]
+        pooled_heads = torch.einsum("nh,nd->hd", attention, x)  # [n_heads, in_dim]
 
-        return logits, A
+        # Aggregate heads by averaging (simple, symmetric aggregation)
+        pooled = pooled_heads.mean(dim=0)  # [in_dim]; with n_heads=1, this is just pooled[0]
+
+        # Slide-level class logits
+        logits = self.classifier(pooled)
+
+        return {
+            "logits": logits,
+            "attention_logits": attention_logits,
+            "attention": attention,
+            "pooled_heads": pooled_heads,
+            "pooled": pooled,
+            
+        }
+
+@torch.no_grad()
+def get_tile_contributions(model: ABMIL, feats: torch.Tensor):
+    """
+    Compute tile-level scores for DVP ROI selection.
+
+    Two seperate signals are returned:
+
+    1. attention (a_i): "how much did this tile influence the slide
+       embedding". This is unsigned salience only - a low value can mean
+       either 'confidently healthy/uninteresting' OR 'background/artifact
+       the model correctly ignored'. It should NOT be used to decide
+       healthy vs. disease.
+
+    2. contrast_score: "does this tile's own feature vector read as
+       disease-like or healthy-like, according to the classifier".
+       This is the classifier's linear read of the RAW tile features,
+       independent of attention:
+           disease_score = x_i · w_disease
+           healthy_score = x_i · w_healthy
+           contrast_score = disease_score - healthy_score
+       Because it is not scaled by a_i, a tile the model paid little
+       attention to but that still looks structurally healthy keeps a
+       negative contrast_score instead of collapsing toward zero.
+
+    Use contrast_score to pick the disease/healthy arms, and use 
+    attention only as a relevance floor (drop the least-attended
+    tiles from consideration) to keep obvious background/artifact out of
+    both arms (see ROISelector.get_tiles_gdf).
+    """
+    model.eval()
+
+    out = model(feats)
+    logits = out["logits"]                       # [n_classes]
+    attention = out["attention"]                 # [n_tiles, n_heads]
+
+    # n_heads=1 by design (see ABMIL docstring) -> one weight per tile
+    attention = attention.mean(dim=1)             # [n_tiles]
+
+    # Raw, attention-INDEPENDENT linear read of each tile's own features:
+    # model.classifier.weight: [n_classes, in_dim]; feats: [n_tiles, in_dim]
+    tile_class_scores = feats @ model.classifier.weight.T  # [n_tiles, n_classes]
+
+    healthy_score = tile_class_scores[:, 0]       # evidence for healthy-ish
+    disease_score = tile_class_scores[:, 1]       # evidence for non-healthy
+
+    # Positive = more disease-like, negative = more healthy-like
+    contrast_score = disease_score - healthy_score
+
+    probabilities = torch.softmax(logits, dim=0)  # [n_classes]
+
+    return {
+        "logits": logits.cpu(),
+        "probabilities": probabilities.cpu(),
+        "attention": attention.cpu(),
+        "healthy_score": healthy_score.cpu(),
+        "disease_score": disease_score.cpu(),
+        "contrast_score": contrast_score.cpu(),
+    }
 
 # ----------------------------------------
 # Helper functions
@@ -337,14 +412,14 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
 
             # Forward pass with mixed precision on CUDA
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                logits, A = model(feats)
-                ce_loss = loss_fn(logits.unsqueeze(0), label)
-
-                # Diversity loss to encourage different attention maps
-                G = A.T @ A                                 # off-diagonal entries tell how similar two heads are
-                I = torch.eye(G.size(0), device=A.device)   # compare with identity matrix
-                div_loss = ((G - I) ** 2).mean()            # computes loss, smaller when more independent
-                loss = ce_loss + 0.05 * div_loss    # 0.05 can be tuned
+                out = model(feats)
+                logits = out["logits"]
+                loss = loss_fn(logits.unsqueeze(0), label)
+                # Note: with n_heads=1 (the default, kept for interpretability -
+                # one attention weight per tile) there is nothing for a
+                # cross-head diversity term to act on, so it's dropped here.
+                # If you experiment with n_heads>1 later, add it back against
+                # out["attention"].
 
             loss.backward() # Backpropagation
             optimizer.step() # Update weights
@@ -419,8 +494,8 @@ def validate_ABMIL(model, val_dataset):
 
             # Forward pass with mixed precision on CUDA
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                logits, _ = model(feats)
-            
+                logits = model(feats)["logits"]
+
             # Compute predicted class and probabilities
             probs = torch.softmax(logits.float(), dim=0).cpu().numpy()
             pred = torch.argmax(logits, dim=0).item()
@@ -1024,29 +1099,28 @@ class ABMILInference:
         with torch.no_grad():
             if self.device.type == "cuda":
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    logits, attention = self.model(feats)
+                    contrib = get_tile_contributions(self.model, feats)
             else:
-                logits, attention = self.model(feats)
+                contrib = get_tile_contributions(self.model, feats)
 
-        probs = torch.softmax(logits.float(), dim=0).detach().cpu().numpy()
+        probs = contrib["probabilities"].numpy()
         pred_idx = int(np.argmax(probs))
-        attention = attention.detach().cpu().numpy()
 
-        if attention.ndim == 2 and attention.shape[1] == 1:
-            attention = attention.squeeze(1)
+        attention = contrib["attention"].numpy()         
+        healthy_score = contrib["healthy_score"].numpy()
+        disease_score = contrib["disease_score"].numpy()
+        contrast_score = contrib["contrast_score"].numpy()      # (ROI selection axis)
 
-        if attention.ndim == 1:
-            attention_for_table = attention
-        else:
-            attention_for_table = attention.mean(axis=1)
-
-        # Build a tile table with attention scores and geometries
-        attention_df = pd.DataFrame({
+        # Build a tile table with attention + classifier scores and geometries
+        scores_df = pd.DataFrame({
             "tile_id": tile_ids,
-            "attention": attention_for_table,
+            "attention": attention,
+            "healthy_score": healthy_score,
+            "disease_score": disease_score,
+            "contrast_score": contrast_score,
         })
         tile_df = wsi.shapes[self.tile_key][["tile_id", "geometry"]].copy()
-        tile_table = pd.merge(attention_df, tile_df, on="tile_id", how="inner")
+        tile_table = pd.merge(scores_df, tile_df, on="tile_id", how="inner")
 
         slide_data = {
             "slide_path": slide_path,
@@ -1160,7 +1234,61 @@ class ABMILInference:
 
         plt.show()
         return fig
-    
+
+    def contrast_heatmap(self, slide_path: str, save_path: str = None):
+        """Plot the contrast_score heatmap (disease-like vs. healthy-like) for one
+        cached slide. This is the signal used for ROI selection - compare it
+        against attention_heatmap() to see that they are NOT the same thing:
+        attention shows where the model looked, this shows what it saw there."""
+        slide_data = self._slide_cache.get(slide_path)
+        if not slide_data:
+            print(f"No cached data found for slide: {slide_path}")
+            return None
+
+        tile_table = slide_data.get("tile_table")
+        if tile_table is None or "contrast_score" not in tile_table.columns:
+            print(f"No contrast_score found for slide: {slide_path}. Re-run inference to populate it.")
+            return None
+
+        wsi = open_wsi(slide_path, slide_data["zarr_path"])
+        contrast = tile_table.set_index("tile_id")["contrast_score"]
+
+        # Center the colormap at 0 (healthy-like <-> disease-like), symmetric
+        # around the largest absolute value so 0 always maps to the midpoint.
+        limit = float(np.abs(contrast).max()) if len(contrast) else 1.0
+        limit = limit if limit > 0 else 1.0
+
+        adata = wsi.tables[slide_data["feature_key"]]
+        adata.obs["contrast_display"] = contrast.reindex(adata.obs["tile_id"]).to_numpy()
+
+        fig, ax = plt.subplots(figsize=(10, 10))
+        zs.pl.tiles(
+            wsi,
+            tile_key=slide_data["tile_key"],
+            feature_key=slide_data["feature_key"],
+            color="contrast_display",
+            cmap="coolwarm",
+            vmin=-limit,
+            vmax=limit,
+            show_contours=True,
+            ax=ax,
+        )
+        ax.set_title(
+            f"Contrast score (blue=healthy-like, red=disease-like): {os.path.basename(slide_path)}, "
+            f"Predicted: {slide_data['pred_label']} (Conf: {slide_data['confidence']:.2f})"
+        )
+        ax.axis("off")
+
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+            fig.tight_layout()
+            fig.savefig(save_path, format="jpg", dpi=300, bbox_inches="tight")
+            plt.close(fig)
+            return save_path
+
+        plt.show()
+        return fig
+
     def results_dataframe(self):
         """Return one row per cached slide with predictions and class probabilities."""
         if not self._slide_cache:
