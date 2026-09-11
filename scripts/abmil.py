@@ -950,10 +950,10 @@ class KFoldPipeline:
                 print(f"Using existing checkpoint for fold {fold_num}: {checkpoint_path}")
                 model, _, _ = load_checkpoint(checkpoint_path)
 
-                all_labels, all_preds, all_probs, fold_auc, fold_accuracy, fold_per_class_aucs = self._evaluate_fold(model, test_dataset)
+                all_labels, all_preds, all_probs, fold_auc, fold_accuracy, fold_class_aucs = self._evaluate_fold(model, test_dataset)
 
                 fold_ovr_auc_scores.append(fold_auc)
-                fold_per_class_aucs.append(fold_per_class_aucs)
+                fold_per_class_aucs.append(fold_class_aucs)
                 fold_accuracies.append(fold_accuracy)
                 fold_all_labels.append(list(all_labels))
                 fold_all_preds.append(list(all_preds))
@@ -975,10 +975,10 @@ class KFoldPipeline:
             )
 
             # Validate on test set for final evaluation of this fold
-            all_labels, all_preds, all_probs, fold_auc, fold_accuracy, fold_per_class_aucs = self._evaluate_fold(model, test_dataset)
+            all_labels, all_preds, all_probs, fold_auc, fold_accuracy, fold_class_aucs = self._evaluate_fold(model, test_dataset)
 
             fold_ovr_auc_scores.append(fold_auc)
-            fold_per_class_aucs.append(fold_per_class_aucs)
+            fold_per_class_aucs.append(fold_class_aucs)
             fold_accuracies.append(fold_accuracy)
             fold_all_labels.append(list(all_labels))
             fold_all_preds.append(list(all_preds))
