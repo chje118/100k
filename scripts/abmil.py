@@ -93,7 +93,7 @@ class ABMIL(nn.Module):
         z = Σ_i a_i x_i
     followed by a linear classifier on the slide embedding z.
 
-    Keeping n_heads=1 for interpretability: one attention weight per tile.
+    Keeps n_heads=1 for interpretability: one attention weight per tile.
     Tile-level class contributions are derived from attention and classifier weights.
     """
     def __init__(self, in_dim, n_classes = 2, hidden_dim=256, n_heads=1):
@@ -130,8 +130,7 @@ class ABMIL(nn.Module):
 
     def forward(self, x):
         """
-        Forward pass of ABMIL.
-
+        Forward pass of ABMIL:
         Parameters: 
         - x: tile features for one slide, shape: [n_tiles, feat_dim]
         """
@@ -170,29 +169,36 @@ def get_tile_contributions(model: ABMIL, feats: torch.Tensor):
     """
     Compute tile-level scores for DVP ROI selection.
 
-    Two seperate signals are returned:
+    Three signals are returned, because they answer three different
+    questions and DVP selection wants a different one for each arm:
 
     1. attention (a_i): "how much did this tile influence the slide
-       embedding". This is unsigned salience only - a low value can mean
-       either 'confidently healthy/uninteresting' OR 'background/artifact
-       the model correctly ignored'. It should NOT be used to decide
-       healthy vs. disease.
+       embedding". Unsigned salience only - a low value can mean either
+       'confidently healthy/uninteresting' OR 'background/artifact the
+       model correctly ignored'. Not a healthy/disease signal by itself.
 
     2. contrast_score: "does this tile's own feature vector read as
-       disease-like or healthy-like, according to the classifier".
-       This is the classifier's linear read of the RAW tile features,
-       independent of attention:
+       disease-like or healthy-like", independent of attention:
            disease_score = x_i · w_disease
            healthy_score = x_i · w_healthy
            contrast_score = disease_score - healthy_score
-       Because it is not scaled by a_i, a tile the model paid little
-       attention to but that still looks structurally healthy keeps a
-       negative contrast_score instead of collapsing toward zero.
+       A tile the model paid little attention to but that still looks
+       structurally healthy keeps a negative contrast_score instead of
+       collapsing toward zero. Good for picking REPRESENTATIVE tissue
+       (e.g. the healthy/control arm) regardless of whether the model
+       happened to need it for this particular slide's verdict.
 
-    Use contrast_score to pick the disease/healthy arms, and use 
-    attention only as a relevance floor (drop the least-attended
-    tiles from consideration) to keep obvious background/artifact out of
-    both arms (see ROISelector.get_tiles_gdf).
+    3. contribution_score = a_i * contrast_score: the EXACT per-tile
+       contribution to the class logit. Because pooled = sum_i a_i * x_i
+       and the classifier is linear, logit_c - b_c = sum_i a_i*(x_i · w_c)
+       - i.e. contribution_score is not a heuristic, it's an algebraic
+       decomposition of the model's own decision, and every tile's value
+       sums to the (bias-adjusted) logit. A tile with near-zero attention
+       automatically collapses toward 0 here regardless of contrast_score,
+       so it can't land at either extreme - this gives you a "what
+       actually drove the call" ranking that self-excludes ignored/
+       artifact tiles without a separate cutoff. Good for the DISEASE arm,
+       where you want tissue that IS the diagnostic evidence.
     """
     model.eval()
 
@@ -213,6 +219,9 @@ def get_tile_contributions(model: ABMIL, feats: torch.Tensor):
     # Positive = more disease-like, negative = more healthy-like
     contrast_score = disease_score - healthy_score
 
+    # Exact per-tile contribution to the class logit
+    contribution_score = attention * contrast_score
+
     probabilities = torch.softmax(logits, dim=0)  # [n_classes]
 
     return {
@@ -222,6 +231,7 @@ def get_tile_contributions(model: ABMIL, feats: torch.Tensor):
         "healthy_score": healthy_score.cpu(),
         "disease_score": disease_score.cpu(),
         "contrast_score": contrast_score.cpu(),
+        "contribution_score": contribution_score.cpu(),
     }
 
 # ----------------------------------------
@@ -1106,10 +1116,11 @@ class ABMILInference:
         probs = contrib["probabilities"].numpy()
         pred_idx = int(np.argmax(probs))
 
-        attention = contrib["attention"].numpy()         
+        attention = contrib["attention"].numpy()               # salience only - QC/relevance, not healthy/disease
         healthy_score = contrib["healthy_score"].numpy()
         disease_score = contrib["disease_score"].numpy()
-        contrast_score = contrib["contrast_score"].numpy()      # (ROI selection axis)
+        contrast_score = contrib["contrast_score"].numpy()          # + = disease-like, - = healthy-like (raw, unweighted - use for the healthy/control arm)
+        contribution_score = contrib["contribution_score"].numpy()  # attention * contrast_score (exact logit decomposition - use for the disease arm)
 
         # Build a tile table with attention + classifier scores and geometries
         scores_df = pd.DataFrame({
@@ -1118,6 +1129,7 @@ class ABMILInference:
             "healthy_score": healthy_score,
             "disease_score": disease_score,
             "contrast_score": contrast_score,
+            "contribution_score": contribution_score,
         })
         tile_df = wsi.shapes[self.tile_key][["tile_id", "geometry"]].copy()
         tile_table = pd.merge(scores_df, tile_df, on="tile_id", how="inner")
