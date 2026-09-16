@@ -8,7 +8,7 @@ from torch.utils.data import Dataset, DataLoader
 from wsidata import open_wsi
 import lazyslide as zs
 from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score, roc_curve
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split, StratifiedGroupKFold
 from sklearn.metrics import precision_recall_curve, average_precision_score
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -665,10 +665,11 @@ class TrainABMILPipeline:
     pipeline.run_pipeline(max_tiles=50000, n_epochs=100, seed=42, validation_fraction=0.10, early_stopping_patience=5)
     """
 
-    def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir, save_path):
+    def __init__(self, df, filename_col, label_col, patient_col, feature_key, tile_key, zarr_dir, save_path):
         self.df = df.copy()
         self.filename_col = filename_col
         self.label_col = label_col
+        self.patient_col = patient_col
         self.feature_key = feature_key
         self.tile_key = tile_key
         self.zarr_dir = zarr_dir
@@ -796,7 +797,7 @@ class KFoldPipeline:
     
     Usage:
     """
-    def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir):
+    def __init__(self, df, filename_col, label_col, patient_col, feature_key, tile_key, zarr_dir):
         """
         Parameters:
         - df: DataFrame with slide metadata
@@ -809,6 +810,7 @@ class KFoldPipeline:
         self.df = df.copy()
         self.filename_col = filename_col
         self.label_col = label_col
+        self.patient_col = patient_col
         self.feature_key = feature_key
         self.tile_key = tile_key
         self.zarr_dir = zarr_dir
@@ -876,7 +878,7 @@ class KFoldPipeline:
         print(f"Random seed set to {random_state} for reproducibility")
     
         df, label_mapping = self._map_labels(self.df)
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+        skf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
         fold_ovr_auc_scores = []
         fold_per_class_aucs = []
@@ -911,7 +913,7 @@ class KFoldPipeline:
             print(f"Resume mode enabled. Found checkpoints for folds: {sorted(checkpoint_by_fold.keys())}")
             print(f"Will train from fold {start_fold}/{n_splits}")
 
-        for fold_idx, (train_idx, test_idx) in enumerate(skf.split(df, df[self.label_col])):
+        for fold_idx, (train_idx, test_idx) in enumerate(skf.split(df, y = df[self.label_col], groups = df[self.patient_col])):
             fold_num = fold_idx + 1
             print(f"\n{'='*60}")
             print(f"Fold {fold_num}/{n_splits}")
