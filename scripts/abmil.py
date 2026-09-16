@@ -8,7 +8,7 @@ from torch.utils.data import Dataset, DataLoader
 from wsidata import open_wsi
 import lazyslide as zs
 from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score, roc_curve
-from sklearn.model_selection import StratifiedKFold, train_test_split, StratifiedGroupKFold
+from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.metrics import precision_recall_curve, average_precision_score
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -338,6 +338,29 @@ def load_checkpoint(path):
 def create_label_mapping(df, label_col):
     """ Map class labels to integer indices. """
     return {label: i for i, label in enumerate(sorted(df[label_col].unique()))}
+
+def _group_stratified_train_val_split(df, label_col, group_col, test_size, random_state=None):
+    """
+    Group-aware, approximately-stratified train/val split.
+
+    Plain sklearn `train_test_split(..., stratify=...)` has no notion of
+    groups, so a group (e.g. patient/rekvnr) with multiple slides can be
+    split across train and val - leaking that patient's tissue into both
+    sets. This uses StratifiedGroupKFold and keeps a single fold's test
+    split as "val", so every slide from a given group ends up entirely
+    in train or entirely in val.
+
+    n_splits is chosen so the val fold is close to `test_size` of the
+    data (e.g. test_size=0.10 -> n_splits=10 -> val fold ~= 10%). Because
+    grouping constrains which slides can move together, both the val
+    fraction and class balance are only approximate, not exact.
+    """
+    n_splits = max(2, round(1.0 / test_size))
+    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    train_idx, val_idx = next(sgkf.split(df, y=df[label_col], groups=df[group_col]))
+    train_df = df.iloc[train_idx].reset_index(drop=True)
+    val_df = df.iloc[val_idx].reset_index(drop=True)
+    return train_df, val_df
 
 # ----------------------------------------
 # Training and validation functions
@@ -718,11 +741,14 @@ class TrainABMILPipeline:
     def train_abmil(self, max_tiles=50000, n_epochs=100, seed=42, validation_fraction=0.10, early_stopping_patience=5):
         """ Fit on a train/validation split and record the best epoch. """
         df = self._map_labels(self.df)
-        
-        train_df, val_df = train_test_split(
+
+        # Group-aware split: keeps all slides from the same patient
+        # (self.patient_col) entirely in train or entirely in val.
+        train_df, val_df = _group_stratified_train_val_split(
             df,
+            label_col=self.label_col,
+            group_col=self.patient_col,
             test_size=validation_fraction,
-            stratify=df[self.label_col],
             random_state=seed,
         )
 
@@ -923,13 +949,17 @@ class KFoldPipeline:
             fold_df = df.iloc[train_idx].reset_index(drop=True)
             test_df = df.iloc[test_idx].reset_index(drop=True)
 
-            # Further split train into 90% train_subset + 10% internal_val (use fold-specific seed)
+            # Further split train into 90% train_subset + 10% internal_val (use fold-specific seed).
+            # Group-aware: keeps each patient's (self.patient_col) slides entirely in
+            # train_subset or entirely in internal_val, so the early-stopping signal
+            # isn't contaminated by seeing the same patient in both.
             split_seed = random_state + fold_num
-            train_subset_df, internal_val_df = train_test_split(
+            train_subset_df, internal_val_df = _group_stratified_train_val_split(
                 fold_df,
+                label_col=self.label_col,
+                group_col=self.patient_col,
                 test_size=1/9, # 90% train, 10% internal val
-                stratify=fold_df[self.label_col],
-                random_state=split_seed
+                random_state=split_seed,
             )
         
             print(f"Train subset: {len(train_subset_df)} samples")
@@ -1595,14 +1625,15 @@ def _slide_deletion_curve(model, feats, frac_grid, device, n_random=5, rng=None)
         "random_curve": np.array(random_curve),
     }
 
-def run_deletion_curve_evaluation(df, filename_col, label_col, feature_key, tile_key, zarr_dir,
+def run_deletion_curve_evaluation(df, filename_col, label_col, patient_col, feature_key, tile_key, zarr_dir,
         checkpoint_dir, n_splits=5, random_state=42, frac_grid=None, n_random=5, seed=0):
     """
     Run out-of-fold deletion curves across an entire dataset, reusing an
     existing K-fold checkpoint set (no retraining). Reproduces the exact
-    same stratified fold split used by KFoldPipeline.kfold_cross_validation
-    (same n_splits/random_state) so each slide is evaluated with the
-    checkpoint from the fold where it was held out - no leakage.
+    same stratified GROUP k-fold split used by KFoldPipeline.kfold_cross_validation
+    (same n_splits/random_state, grouped by patient_col) so each slide is
+    evaluated with the checkpoint from the fold where its patient was held
+    out - no leakage.
 
     Returns a long-format DataFrame: one row per (slide, fraction deleted),
     with columns for the importance-guided and random-baseline predicted-
@@ -1616,14 +1647,14 @@ def run_deletion_curve_evaluation(df, filename_col, label_col, feature_key, tile
     label_mapping = create_label_mapping(df2, label_col)
     df2[label_col] = df2[label_col].map(label_mapping).astype(int)
 
-    # Recreate the exact CV splitter used during training
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    # Recreate the exact CV splitter used during training (grouped by patient)
+    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     rng = np.random.RandomState(seed)
 
     rows = []
 
     # Iterate over the CV folds, only using held-out indices for evaluation
-    for fold_idx, (_, test_idx) in enumerate(skf.split(df2, df2[label_col])): 
+    for fold_idx, (_, test_idx) in enumerate(sgkf.split(df2, df2[label_col], groups=df2[patient_col])): 
         fold_num = fold_idx + 1
         test_df = df2.iloc[test_idx].reset_index(drop=True)
 
