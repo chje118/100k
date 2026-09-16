@@ -1511,3 +1511,236 @@ class ABMILEvaluation:
         if self.y_true is None or self.y_probs is None:
             raise ValueError("No matched labels found. Call match_true_labels() first.")
         return per_class_roc_curves(self.y_true, self.y_probs)
+
+# ----------------------------------------
+# Deletion curve evaluation (attention/contribution faithfulness check)
+# ----------------------------------------
+
+def _find_fold_checkpoint(checkpoint_dir, fold_num):
+    """Find the checkpoint file for a given fold, matching the naming
+    convention used by KFoldPipeline.kfold_cross_validation()."""
+    pattern = os.path.join(checkpoint_dir, f"fold_{fold_num}_auc_*.pt")
+    matches = glob.glob(pattern)
+    if not matches:
+        raise FileNotFoundError(f"No checkpoint found for fold {fold_num} in {checkpoint_dir} (pattern: {pattern})")
+    # If several exist (e.g. re-runs), take the most recently written one
+    matches.sort(key=os.path.getmtime, reverse=True)
+    return matches[0]
+
+def _load_slide_feats(slide_path, zarr_dir, feature_key):
+    """Load the full (unsampled) tile feature matrix for one slide."""
+    zarr_path = os.path.join(zarr_dir, os.path.basename(slide_path).replace(".mrxs", ".zarr"))
+    wsi = open_wsi(slide_path, zarr_path)
+    if feature_key not in wsi.tables:
+        raise KeyError(f"Feature key '{feature_key}' not found in zarr tables for {slide_path}")
+    adata = wsi.tables[feature_key]
+    feats = torch.from_numpy(adata.X).float()
+    return feats
+
+@torch.no_grad()
+def _slide_deletion_curve(model, feats, frac_grid, device, n_random=5, rng=None):
+    """
+    Compute deletion curve for a single slide: for each fraction in
+    frac_grid, delete that fraction of the most-important tiles 
+    (ranked once, up front, from the full bag) and re-run the forward
+    pass on what remains, tracking the probability of the ORIGINAL 
+    predicted class.
+    Also computes a random-deletion baseline, averaged over n_random
+    permutations, for comparison.
+    """
+    feats = feats.to(device)
+    n_tiles = feats.shape[0]
+    if rng is None:
+        rng = np.random.RandomState(0)
+
+    contrib = get_tile_contributions(model, feats)
+    pred_idx = int(torch.argmax(contrib["probabilities"]).item())
+    baseline_prob = float(contrib["probabilities"][pred_idx].item())
+    importance = contrib["attention"].numpy()
+
+    order = np.argsort(-importance)  # descending: most important tile first
+
+    def _prob_after_deleting(keep_idx):
+        if len(keep_idx) == 0:
+            return np.nan
+        sub_feats = feats[keep_idx]
+        out = model(sub_feats)
+        probs = torch.softmax(out["logits"], dim=0)
+        return float(probs[pred_idx].item())
+
+    importance_curve = []
+    random_curve = []
+
+    for frac in frac_grid:
+        n_delete = min(int(round(frac * n_tiles)), max(n_tiles - 1, 0))  # always keep >=1 tile
+
+        # Importance-guided deletion: remove the top n_delete by rank
+        keep_idx = order[n_delete:]
+        importance_curve.append(_prob_after_deleting(keep_idx))
+
+        # Random deletion baseline, averaged over n_random permutations
+        random_probs = []
+        for _ in range(n_random):
+            perm = rng.permutation(n_tiles)
+            keep_idx_r = perm[n_delete:]
+            random_probs.append(_prob_after_deleting(keep_idx_r))
+        random_curve.append(float(np.nanmean(random_probs)))
+
+    return {
+        "pred_idx": pred_idx,
+        "baseline_prob": baseline_prob,
+        "importance_curve": np.array(importance_curve),
+        "random_curve": np.array(random_curve),
+    }
+
+def run_deletion_curve_evaluation(df, filename_col, label_col, feature_key, tile_key, zarr_dir,
+        checkpoint_dir, n_splits=5, random_state=42, frac_grid=None, n_random=5, seed=0):
+    """
+    Run out-of-fold deletion curves across an entire dataset, reusing an
+    existing K-fold checkpoint set (no retraining). Reproduces the exact
+    same stratified fold split used by KFoldPipeline.kfold_cross_validation
+    (same n_splits/random_state) so each slide is evaluated with the
+    checkpoint from the fold where it was held out - no leakage.
+
+    Returns a long-format DataFrame: one row per (slide, fraction deleted),
+    with columns for the importance-guided and random-baseline predicted-
+    class probability at that fraction.
+    """
+    if frac_grid is None:
+        frac_grid = np.linspace(0.0, 1.0, 11)  # 0%, 10%, ..., 100%
+
+    set_seed(random_state)
+    df2 = df.copy().reset_index(drop=True)
+    label_mapping = create_label_mapping(df2, label_col)
+    df2[label_col] = df2[label_col].map(label_mapping).astype(int)
+
+    # Recreate the exact CV splitter used during training
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    rng = np.random.RandomState(seed)
+
+    rows = []
+
+    # Iterate over the CV folds, only using held-out indices for evaluation
+    for fold_idx, (_, test_idx) in enumerate(skf.split(df2, df2[label_col])): 
+        fold_num = fold_idx + 1
+        test_df = df2.iloc[test_idx].reset_index(drop=True)
+
+        checkpoint_path = _find_fold_checkpoint(checkpoint_dir, fold_num)
+        model, config, _ = load_checkpoint(checkpoint_path)
+        device = next(model.parameters()).device
+        model.eval()
+
+        # Iterate through held-out slides
+        for _, row in tqdm(test_df.iterrows(), total=len(test_df), desc=f"Deletion curves (fold {fold_num})"):
+            slide_path = row[filename_col]
+
+            # Load features
+            try:
+                feats = _load_slide_feats(slide_path, zarr_dir, feature_key)
+            except Exception as e:
+                print(f"Skipping {slide_path}: {type(e).__name__}: {e}")
+                continue
+
+            # Compute targeted-vs-random deletion curves for this slide
+            result = _slide_deletion_curve(
+                model, feats, frac_grid, device, n_random=n_random, rng=rng,
+            )
+
+            for frac, imp_prob, rand_prob in zip(frac_grid, result["importance_curve"], result["random_curve"]):
+                rows.append({
+                    "slide_path": slide_path,
+                    "fold": fold_num,
+                    "true_label": row[label_col],
+                    "pred_idx": result["pred_idx"],
+                    "baseline_prob": result["baseline_prob"], # original class probability before deletion
+                    "frac_deleted": frac, # fraction of tiles removed at this step
+                    "importance_prob": imp_prob, # probability after deleting highest-importance tiles
+                    "random_prob": rand_prob, # probability after deleting random tiles
+                })
+
+    return pd.DataFrame(rows)
+
+def deletion_auc_summary(results_df):
+    """
+    Compute per-slide Area Under the Deletion Curve (AUDC) for both the
+    importance-guided and random curves (trapezoidal integration over
+    frac_deleted), and summarize. Lower AUDC = confidence collapses
+    faster = importance ranking is more faithful.
+    """
+    # Use np.trapezoid if available (newer NumPy), otherwise fall back to np.trapz
+    _trapz = getattr(np, "trapezoid", None) or np.trapz
+
+    audc_rows = []
+    for slide_path, g in results_df.groupby("slide_path"):
+        g = g.sort_values("frac_deleted") # ensure x-axis order
+        audc_importance = _trapz(g["importance_prob"], g["frac_deleted"]) # area under the importance-guided deletion curve
+        audc_random = _trapz(g["random_prob"], g["frac_deleted"]) # area under the random-deletion baseline curve
+        audc_rows.append({
+            "slide_path": slide_path,
+            "audc_importance": audc_importance,
+            "audc_random": audc_random,
+            "audc_gap": audc_random - audc_importance,  # positive = importance ranking is more faithful
+        })
+    audc_df = pd.DataFrame(audc_rows)
+
+    print(f"Mean AUDC (importance-guided): {audc_df['audc_importance'].mean():.4f} ± {audc_df['audc_importance'].std():.4f}")
+    print(f"Mean AUDC (random baseline):   {audc_df['audc_random'].mean():.4f} ± {audc_df['audc_random'].std():.4f}")
+    print(f"Mean gap (random - importance): {audc_df['audc_gap'].mean():.4f} ± {audc_df['audc_gap'].std():.4f}")
+    print("(Positive gap = importance-guided deletion collapses confidence faster than random = importance ranking is faithful)")
+
+    return audc_df
+
+
+def plot_deletion_curves(results_df, title=None):
+    """
+    Plot mean ± SEM deletion curves (importance-guided vs. random) across all slides.
+    SEM = standard error of the mean, computed as std / sqrt(n).
+    """
+    summary = results_df.groupby("frac_deleted").agg(
+        importance_mean=("importance_prob", "mean"),
+        importance_sem=("importance_prob", lambda x: x.std(ddof=1) / np.sqrt(len(x))),
+        random_mean=("random_prob", "mean"),
+        random_sem=("random_prob", lambda x: x.std(ddof=1) / np.sqrt(len(x))),
+    ).reset_index()
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+
+    # Plot the importance-guided deletion curve with mean and SEM shading
+    ax.plot(
+        summary["frac_deleted"], 
+        summary["importance_mean"], 
+        color="#b30000", 
+        label="Importance-guided deletion", 
+        marker="o"
+    )
+    ax.fill_between(
+        summary["frac_deleted"],
+        summary["importance_mean"] - summary["importance_sem"],
+        summary["importance_mean"] + summary["importance_sem"],
+        color="#b30000", alpha=0.2,
+    )
+
+    # Plot the random deletion baseline curve with mean and SEM shading
+    ax.plot(
+        summary["frac_deleted"], 
+        summary["random_mean"], 
+        color="#555555", 
+        label="Random deletion", 
+        marker="o", 
+        linestyle="--"
+    )
+    ax.fill_between(
+        summary["frac_deleted"],
+        summary["random_mean"] - summary["random_sem"],
+        summary["random_mean"] + summary["random_sem"],
+        color="#555555", alpha=0.2,
+    )
+
+    ax.set_xlabel("Fraction of tiles deleted")
+    ax.set_ylabel("Probability of original predicted class")
+    ax.set_ylim(0, 1.02)
+    ax.set_title(title or "Deletion curve: attention faithfulness")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+    return fig
