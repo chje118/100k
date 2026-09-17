@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import pandas as pd
+from contextlib import nullcontext
 from torch.utils.data import Dataset, DataLoader
 from wsidata import open_wsi
 import lazyslide as zs
@@ -23,14 +24,13 @@ import random
 # ----------------------------------------
 
 class ZarrSlideDataset(Dataset):
-    """ PyTorch Dataset for loading WSI features from Zarr files. """
+    """PyTorch Dataset for loading WSI features from Zarr files."""
 
-    def __init__(self, df, filename_col, label_col, feature_key, tile_key, zarr_dir, max_tiles=None, seed=None, require_labels = True):
+    def __init__(self, df, filename_col, label_col, feature_key, zarr_dir, max_tiles=None, seed=None, require_labels=True):
         self.df = df.reset_index(drop=True)
         self.filename_col = filename_col
         self.label_col = label_col
         self.feature_key = feature_key
-        self.tile_key = tile_key
         self.zarr_dir = zarr_dir
         self.max_tiles = max_tiles  # Maximum number of tiles per slide (None = no limit)
         self.seed = seed    # Seed for deterministic tile sampling (if max_tiles is set)
@@ -51,22 +51,18 @@ class ZarrSlideDataset(Dataset):
         feats = torch.from_numpy(adata.X).float() # tile features as a PyTorch tensor
         tile_ids = np.array(adata.obs['tile_id']) # save tile IDs for visualization
 
-        # Apply max_tiles limit with deterministic, norm-biased sampling
+        # Apply max_tiles limit with deterministic, uniform sampling (equal probability)
         if self.max_tiles is not None and feats.shape[0] > self.max_tiles:
             if self.seed is not None:
                 local_rng = np.random.RandomState(self.seed + idx)
             else:
                 local_rng = np.random.RandomState(idx)
 
-            # Slight sampling bias toward high-information tiles
-            norms = torch.linalg.norm(feats, dim=1).cpu().numpy()
-            probs = norms / norms.sum() if norms.sum() > 0 else None
-
-            indices = local_rng.choice(feats.shape[0], self.max_tiles, replace=False, p=probs)
+            indices = local_rng.choice(feats.shape[0], self.max_tiles, replace=False)
             feats = feats[indices]
-            tile_ids = tile_ids[indices] 
-        
-        # Handle missing labels (inference uses label=none)
+            tile_ids = tile_ids[indices]
+
+        # Handle missing labels (inference uses label=None)
         if self.require_labels:
             label_val = row[self.label_col]
             if pd.isna(label_val):
@@ -83,7 +79,7 @@ class ZarrSlideDataset(Dataset):
 
 class ABMIL(nn.Module):
     """
-    Single-head gated ABMIL for:
+    Single-head gated ABMIL for binary classification:
         Class 0 = healthy-ish
         Class 1 = non-healthy
 
@@ -96,14 +92,11 @@ class ABMIL(nn.Module):
     Keeps n_heads=1 for interpretability: one attention weight per tile.
     Tile-level class contributions are derived from attention and classifier weights.
     """
-    def __init__(self, in_dim, n_classes = 2, hidden_dim=256, n_heads=1):
-        """
-        in_dim: feature size per tile (e.g. 512, 768, 1024)
-        n_classes: number of output classes
-        hidden_dim: size of attention hidden layer
-        n_heads: number of attention heads
-        """
+    def __init__(self, in_dim, n_classes=2, hidden_dim=256, n_heads=1):
         super().__init__()
+
+        if n_classes != 2:
+            raise ValueError(f"ABMIL is currently restricted to binary classification (n_classes=2), got {n_classes}.")
 
         self.in_dim = in_dim
         self.n_classes = n_classes
@@ -130,9 +123,9 @@ class ABMIL(nn.Module):
 
     def forward(self, x):
         """
-        Forward pass of ABMIL:
-        Parameters: 
-        - x: tile features for one slide, shape: [n_tiles, feat_dim]
+        Forward pass of ABMIL.
+        Parameters:
+        - x: tile features for one slide, shape [n_tiles, feat_dim]
         """
         # Compute attention scores: A = V * U (gated attention)
         V = self.attn_V(x)      # [n_tiles, hidden_dim] (tanh)
@@ -161,7 +154,6 @@ class ABMIL(nn.Module):
             "attention": attention,
             "pooled_heads": pooled_heads,
             "pooled": pooled,
-            
         }
 
 @torch.no_grad()
@@ -169,60 +161,35 @@ def get_tile_contributions(model: ABMIL, feats: torch.Tensor):
     """
     Compute tile-level scores for DVP ROI selection.
 
-    Three signals are returned, because they answer three different
-    questions and DVP selection wants a different one for each arm:
+    Returns:
+    1. attention: "How much did this tile influence the slide embedding?"
+       Unsigned salience only.
 
-    1. attention (a_i): "how much did this tile influence the slide
-       embedding". Unsigned salience only - a low value can mean either
-       'confidently healthy/uninteresting' OR 'background/artifact the
-       model correctly ignored'. Not a healthy/disease signal by itself.
+    2. contrast_score: "Does this tile's own feature vector read as disease-like or healthy-like?"
+       Independent of attention.
 
-    2. contrast_score: "does this tile's own feature vector read as
-       disease-like or healthy-like", independent of attention:
-           disease_score = x_i · w_disease
-           healthy_score = x_i · w_healthy
-           contrast_score = disease_score - healthy_score
-       A tile the model paid little attention to but that still looks
-       structurally healthy keeps a negative contrast_score instead of
-       collapsing toward zero. Good for picking REPRESENTATIVE tissue
-       (e.g. the healthy/control arm) regardless of whether the model
-       happened to need it for this particular slide's verdict.
-
-    3. contribution_score = a_i * contrast_score: the EXACT per-tile
-       contribution to the class logit. Because pooled = sum_i a_i * x_i
-       and the classifier is linear, logit_c - b_c = sum_i a_i*(x_i · w_c)
-       - i.e. contribution_score is not a heuristic, it's an algebraic
-       decomposition of the model's own decision, and every tile's value
-       sums to the (bias-adjusted) logit. A tile with near-zero attention
-       automatically collapses toward 0 here regardless of contrast_score,
-       so it can't land at either extreme - this gives you a "what
-       actually drove the call" ranking that self-excludes ignored/
-       artifact tiles without a separate cutoff. Good for the DISEASE arm,
-       where you want tissue that IS the diagnostic evidence.
+    3. contribution_score = attention * contrast_score:
+       Exact per-tile contribution to the class contrast.
     """
     model.eval()
 
     out = model(feats)
-    logits = out["logits"]                       # [n_classes]
-    attention = out["attention"]                 # [n_tiles, n_heads]
+    logits = out["logits"]
+    attention = out["attention"]
 
-    # n_heads=1 by design (see ABMIL docstring) -> one weight per tile
-    attention = attention.mean(dim=1)             # [n_tiles]
+    # n_heads=1 by design 
+    attention = attention.mean(dim=1)
 
-    # Raw, attention-INDEPENDENT linear read of each tile's own features:
-    # model.classifier.weight: [n_classes, in_dim]; feats: [n_tiles, in_dim]
-    tile_class_scores = feats @ model.classifier.weight.T  # [n_tiles, n_classes]
+    # Raw, attention-independent linear read of each tile's own features:
+    tile_class_scores = feats @ model.classifier.weight.T
 
     healthy_score = tile_class_scores[:, 0]       # evidence for healthy-ish
     disease_score = tile_class_scores[:, 1]       # evidence for non-healthy
 
-    # Positive = more disease-like, negative = more healthy-like
+    # Binary-only model: class 0 = healthy-ish, class 1 = non-healthy
     contrast_score = disease_score - healthy_score
-
-    # Exact per-tile contribution to the class logit
     contribution_score = attention * contrast_score
-
-    probabilities = torch.softmax(logits, dim=0)  # [n_classes]
+    probabilities = torch.softmax(logits, dim=0)
 
     return {
         "logits": logits.cpu(),
@@ -239,11 +206,7 @@ def get_tile_contributions(model: ABMIL, feats: torch.Tensor):
 # ----------------------------------------
 
 def set_seed(seed):
-    """ Set seeds for reproducibility.
-    
-    Parameters:
-    - seed: Random seed value (integer)
-    """
+    """Set seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -254,53 +217,60 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 def validate_dataset(dataset):
-    """
-    Filter out invalid slides from dataset.
-    
-    Parameters:
-    - dataset: PyTorch Dataset instance to validate
-    
-    Returns:
-    - filtered_dataset: torch.utils.data.Subset with only valid slides
-    - valid_indices: List of valid slide indices
-    """
+    """Filter out invalid slides from dataset."""
     valid_indices = []
     for i in tqdm(range(len(dataset)), desc="Validating slides"):
         try:
             _ = dataset[i]
             valid_indices.append(i)
         except Exception as e:
-            print(f"Invalid slide at index {i}: {type(e).__name__}")
-    
+            print(f"Invalid slide at index {i}: {type(e).__name__}: {str(e)}")
+
     filtered_dataset = torch.utils.data.Subset(dataset, valid_indices)
     print(f"Dataset validation complete: {len(valid_indices)}/{len(dataset)} valid slides")
-    
     return filtered_dataset, valid_indices
 
 def require_cuda():
-    """ Raise an error if CUDA is not available. """
+    """Raise an error if CUDA is not available and return the CUDA device string."""
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this ABMIL pipeline, but no CUDA device is available.")
     return "cuda"
 
 def _configure_gpu_optimization():
-    """
-    Enable optional CUDA performance settings for training/inference on 
-    supported NVIDIA GPUs.
-    """
+    """ Enable optional CUDA performance settings for training/inference on supported NVIDIA GPUs."""
     if not torch.cuda.is_available():
         return
     try:
         torch.set_float32_matmul_precision("high")
-    except AttributeError:  
+    except AttributeError:
         pass
     if hasattr(torch.backends.cuda, "matmul"):
         torch.backends.cuda.matmul.allow_tf32 = True
-    if hasattr(torch.backends.cuda, "cudnn"):
-        torch.backends.cuda.cudnn.allow_tf32 = True
+    if hasattr(torch.backends.cudnn, "allow_tf32"):
+        torch.backends.cudnn.allow_tf32 = True
+
+def get_amp_dtype():
+    """
+    Choose the mixed-precision dtype for CUDA.
+
+    For NVIDIA H100, bfloat16 is the best default for training stability and
+    throughput. It is also a good fit for ABMIL because attention/softmax over
+    many tiles benefits from bf16's wider numeric range compared with fp16.
+    """
+    device = require_cuda()
+    major, _ = torch.cuda.get_device_capability(device=device)
+    if major >= 8:
+        return torch.bfloat16
+    return torch.float16
+
+def autocast_context():
+    """Return the correct CUDA autocast context for the current GPU."""
+    if not torch.cuda.is_available():
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=get_amp_dtype())
 
 def save_checkpoint(model, config, label_mapping, path):
-    """ Save model checkpoint with configuration and label mapping. """
+    """Save model checkpoint with configuration and label mapping."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     checkpoint = {
         "model_state_dict": model.state_dict(),
@@ -311,14 +281,13 @@ def save_checkpoint(model, config, label_mapping, path):
     print(f"Saved checkpoint to {path}")
 
 def load_checkpoint(path):
-    """ Load a checkpoint with model, config, and label mapping. """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    """Load a checkpoint with model, config, and label mapping."""
+    device = require_cuda()
     checkpoint = torch.load(path, map_location=device, weights_only=False)
 
     config = checkpoint["config"]
     label_mapping = checkpoint["label_mapping"]
 
-    # Reconstruct model from config
     model = ABMIL(
         in_dim=config["in_dim"],
         n_classes=config["n_classes"],
@@ -330,31 +299,21 @@ def load_checkpoint(path):
     model.eval()
 
     print(f"Loaded checkpoint from {path}")
-    print(f"Model config: in_dim={config['in_dim']}, n_classes={config['n_classes']}, hidden_dim={config['hidden_dim']}, n_heads = {config['n_heads']}")
+    print(
+        f"Model config: in_dim={config['in_dim']}, "
+        f"n_classes={config['n_classes']}, "
+        f"hidden_dim={config['hidden_dim']}, "
+        f"n_heads={config['n_heads']}"
+    )
     print(f"Label mapping: {label_mapping}")
-    
     return model, config, label_mapping
 
 def create_label_mapping(df, label_col):
-    """ Map class labels to integer indices. """
+    """Map class labels to integer indices."""
     return {label: i for i, label in enumerate(sorted(df[label_col].unique()))}
 
 def _group_stratified_train_val_split(df, label_col, group_col, test_size, random_state=None):
-    """
-    Group-aware, approximately-stratified train/val split.
-
-    Plain sklearn `train_test_split(..., stratify=...)` has no notion of
-    groups, so a group (e.g. patient/rekvnr) with multiple slides can be
-    split across train and val - leaking that patient's tissue into both
-    sets. This uses StratifiedGroupKFold and keeps a single fold's test
-    split as "val", so every slide from a given group ends up entirely
-    in train or entirely in val.
-
-    n_splits is chosen so the val fold is close to `test_size` of the
-    data (e.g. test_size=0.10 -> n_splits=10 -> val fold ~= 10%). Because
-    grouping constrains which slides can move together, both the val
-    fraction and class balance are only approximate, not exact.
-    """
+    """Group-aware, approximately stratified train/val split."""
     n_splits = max(2, round(1.0 / test_size))
     sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     train_idx, val_idx = next(sgkf.split(df, y=df[label_col], groups=df[group_col]))
@@ -368,25 +327,10 @@ def _group_stratified_train_val_split(df, label_col, group_col, test_size, rando
 
 def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epochs=10, 
     early_stopping_patience=None, seed=None):
-    """ 
-    Train ABMIL model with optional early stopping for best AUC comparability.
-    
-    Parameters:
-    - train_df: DataFrame with training data
-    - train_dataset: ZarrSlideDataset instance
-    - val_dataset: Optional ZarrSlideDataset for early stopping.
-    - label_col: Column name for labels (required if using early stopping)
-    - n_epochs: Maximum number of training epochs
-    - early_stopping_patience: Number of epochs with no improvement to wait before stopping.
-    - seed: Random seed for reproducibility. If None, uses current random state.
-    
-    Returns:
-    - model: Trained ABMIL model
-    - best_model_state: Best model state dict (for restoring best model when using early stopping)
-    """
+    """Train ABMIL model with optional early stopping."""
     if seed is not None:
         set_seed(seed)
-    
+
     device = require_cuda()
 
     # DataLoader: handles shuffling and batching
@@ -403,17 +347,19 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
     sample_feats, _, _ = train_dataset[0]
     feat_dim = sample_feats.shape[1]
     n_classes = train_df[label_col].nunique()
+    if n_classes != 2:
+        raise ValueError(
+            f"This training pipeline currently supports binary classification only, but found {n_classes} classes."
+        )
 
-    # Create the ABMIL model
-    model = ABMIL(feat_dim, n_classes).to(device)
+    model = ABMIL(feat_dim, n_classes=2).to(device)
 
-    # Enable TF32 / high matmul precision on modern GPUs (e.g. H100)
     _configure_gpu_optimization()
-     
+    amp_dtype = get_amp_dtype()
+    print(f"Using CUDA mixed precision dtype: {amp_dtype}")
+
     # Create optimizer and loss function
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    
-    # Loss function: CrossEntropyLoss for multi-class classification
     loss_fn = torch.nn.CrossEntropyLoss()
 
     # Early stopping setup
@@ -421,15 +367,13 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
     best_model_state = None
     best_epoch = 0
     epochs_no_improve = 0
-    
-    # Training Loop
+
+    # Training loop
     for epoch in tqdm(range(n_epochs), desc="Epochs"):
         model.train()
         total_loss = 0.0
 
-        # Loop over slides
         for feats, tile_ids, label in tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs}", leave=False):
-            # Preprocess batch
             if feats.dim() == 3:
                 feats = feats.squeeze(0)
             if tile_ids.ndim == 2:
@@ -441,26 +385,25 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
             if feats.shape[0] == 0:
                 continue
 
-            optimizer.zero_grad() # Clear gradients
+            optimizer.zero_grad() # clear gradients
 
-            # Forward pass with mixed precision on CUDA
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
+            # Forward pass with CUDA mixed precision.
+            # On H100 this will use bfloat16, which is the preferred balance of
+            # speed and numerical stability for this ABMIL setup.
+            with autocast_context():
                 out = model(feats)
                 logits = out["logits"]
                 loss = loss_fn(logits.unsqueeze(0), label)
-                # Note: with n_heads=1 (the default, kept for interpretability -
-                # one attention weight per tile) there is nothing for a
-                # cross-head diversity term to act on, so it's dropped here.
-                # If you experiment with n_heads>1 later, add it back against
-                # out["attention"].
 
-            loss.backward() # Backpropagation
-            optimizer.step() # Update weights
-            total_loss += loss.item() # Accumulate loss
+            loss.backward() # backpropagation
+            optimizer.step() # update weights
+
+            total_loss += loss.item() # accumulate loss
 
         print(f"Epoch {epoch+1}/{n_epochs} | Loss: {total_loss:.4f}", end="")
-        
-        # Early stopping: evaluate on validation set if provided
+        # TODO: save training loss history for plotting
+
+        # Early stopping based on validation AUC
         if val_dataset is not None and early_stopping_patience is not None:
             all_labels, _, all_probs = validate_ABMIL(model, val_dataset)
             val_auc = auc_score(all_labels, all_probs)
@@ -482,7 +425,8 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
                 print(f"\nEarly stopping at epoch {epoch+1}")
                 if best_model_state is not None:
                     model.load_state_dict(best_model_state)
-                break        
+                break
+
         print()
 
     if val_dataset is not None and early_stopping_patience is not None and best_epoch == 0:
@@ -495,8 +439,8 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
 
 def validate_ABMIL(model, val_dataset):
     device = require_cuda()
-    
-    # Validation DataLoader
+
+    # DataLoader for validation (no shuffling, batch_size=1)
     val_loader = DataLoader(
         val_dataset,
         batch_size=1,
@@ -504,8 +448,8 @@ def validate_ABMIL(model, val_dataset):
         num_workers=0,
         pin_memory=True,
     )
-    
-    model.eval() # Evaluation mode (disables dropout, batch norm updates)
+
+    model.eval() # evaluation mode disables dropout, batchnorm updates, etc.
 
     all_labels = []
     all_preds = []
@@ -513,7 +457,6 @@ def validate_ABMIL(model, val_dataset):
 
     with torch.no_grad():
         for feats, tile_ids, label in tqdm(val_loader, desc="Validation", leave=False):
-            # Preprocess batch 
             if feats.dim() == 3:
                 feats = feats.squeeze(0)
             if tile_ids.ndim == 2:
@@ -525,8 +468,8 @@ def validate_ABMIL(model, val_dataset):
             if feats.shape[0] == 0:
                 continue
 
-            # Forward pass with mixed precision on CUDA
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
+            # Forward pass with mixed precision for speed and memory efficiency
+            with autocast_context():
                 logits = model(feats)["logits"]
 
             # Compute predicted class and probabilities
@@ -545,7 +488,7 @@ def validate_ABMIL(model, val_dataset):
 # ----------------------------------------
 
 def plot_confusion_matrix(all_labels, all_preds, class_names=None):
-    """ Compute and plot confusion matrix. """
+    """Compute and plot confusion matrix."""
     cm = confusion_matrix(all_labels, all_preds)
     plt.figure(figsize=(6, 5))
     sns.heatmap(
@@ -564,7 +507,7 @@ def plot_confusion_matrix(all_labels, all_preds, class_names=None):
     return cm
 
 def get_classification_report(all_labels, all_preds, class_names=None):
-    """ Return and print classification report. """
+    """Return and print classification report."""
     if class_names is None:
         report = classification_report(all_labels, all_preds)
     else:
@@ -573,49 +516,28 @@ def get_classification_report(all_labels, all_preds, class_names=None):
     return report
 
 def auc_score(all_labels, all_probs):
-    """
-    Compute macro AUC score for multi-class classification, as the unweighted mean 
-    of one-vs-rest AUC scores across all classes. This metric is class-balanced and 
-    appropriate for multi-class problems where all classes are equally important.
-    
-    Formula: macro AUC = mean(AUC_class_i for i in 1..n_classes)
-    where each AUC_class_i is computed using the one-vs-rest approach.    
-    """
-    all_labels = np.asarray(all_labels)
-    all_probs = np.asarray(all_probs)
-
-    # Convert true labels to one-hot encoding for multi-class AUC computation
-    n_classes = all_probs.shape[1]
-    y_true = np.eye(n_classes)[all_labels]
-
-    # Compute macro AUC: unweighted mean of one-vs-rest AUC for each class 
-    try:
-        return roc_auc_score(y_true, all_probs, average="macro", multi_class="ovr")
-    except ValueError:
-        return np.nan
-
-def per_class_auc(all_labels, all_probs):
-    """ Compute one-vs-rest AUC for each class. """
-    all_labels = np.asarray(all_labels)
-    all_probs = np.asarray(all_probs)
-
-    n_classes = all_probs.shape[1]
-    y_true = np.eye(n_classes)[all_labels]
-
-    try:
-        return roc_auc_score(y_true, all_probs, average=None, multi_class="ovr")
-    except ValueError:
-        return np.full(n_classes, np.nan)
-
-def plot_roc_curve(all_labels, all_probs):
-    """ Plot ROC curve for binary classification. """
+    """Compute ROC AUC for binary classification."""
     all_labels = np.asarray(all_labels)
     all_probs = np.asarray(all_probs)
 
     if all_probs.shape[1] != 2:
         raise ValueError(
-            f"plot_roc_curve only supports binary classification. "
-            f"Found {all_probs.shape[1]} classes."
+            f"auc_score currently supports binary classification only. Found {all_probs.shape[1]} classes."
+        )
+
+    try:
+        return roc_auc_score(all_labels, all_probs[:, 1])
+    except ValueError:
+        return np.nan
+
+def plot_roc_curve(all_labels, all_probs):
+    """Plot ROC curve for binary classification."""
+    all_labels = np.asarray(all_labels)
+    all_probs = np.asarray(all_probs)
+
+    if all_probs.shape[1] != 2:
+        raise ValueError(
+            f"plot_roc_curve only supports binary classification. Found {all_probs.shape[1]} classes."
         )
 
     fpr, tpr, _ = roc_curve(all_labels, all_probs[:, 1])
@@ -631,63 +553,37 @@ def plot_roc_curve(all_labels, all_probs):
     plt.tight_layout()
     plt.show()
 
-def per_class_roc_curves(all_labels, all_probs):
-    """ Plot one-vs-rest ROC curves for all classes. """
-    n_classes = all_probs.shape[1]
-    y_true = np.eye(n_classes)[all_labels]
-
-    plt.figure(figsize=(8, 6))
-    colors = sns.color_palette("pastel", n_classes)
-
-    for c in range(n_classes):
-        fpr, tpr, _ = roc_curve(y_true[:, c], all_probs[:, c])
-        auc_c = roc_auc_score(y_true[:, c], all_probs[:, c])
-        plt.plot(fpr, tpr, color=colors[c], lw=2, label=f"Class {c} (AUC={auc_c:.4f})")
-
-    plt.plot([0, 1], [0, 1], linestyle="--", color="gray", lw=1, label="Random")
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
-    plt.title("One-vs-Rest ROC Curves")
-    plt.legend(loc="lower right")
-    plt.tight_layout()
-    plt.show()
-
-def per_class_pr_curves(all_labels, all_probs):
-    """ Plot one-vs-rest precision-recall curves for all classes. """
+def plot_pr_curve(all_labels, all_probs):
+    """Plot precision-recall curve for binary classification."""
     all_labels = np.asarray(all_labels)
     all_probs = np.asarray(all_probs)
 
-    n_classes = all_probs.shape[1]
-    y_true = np.eye(n_classes)[all_labels]
+    if all_probs.shape[1] != 2:
+        raise ValueError(
+            f"pr_curve_binary only supports binary classification. Found {all_probs.shape[1]} classes."
+        )
 
-    plt.figure(figsize=(8, 6))
-    colors = sns.color_palette("pastel", n_classes)
+    p, r, _ = precision_recall_curve(all_labels, all_probs[:, 1])
+    ap = average_precision_score(all_labels, all_probs[:, 1])
 
-    for c in range(n_classes):
-        p, r, _ = precision_recall_curve(y_true[:, c], all_probs[:, c])
-        ap = average_precision_score(y_true[:, c], all_probs[:, c])
-        plt.plot(r, p, color=colors[c], linewidth=2, label=f"Class {c} (AP={ap:.2f})")
-
+    plt.figure(figsize=(6, 5))
+    plt.plot(r, p, linewidth=2, label=f"AP={ap:.4f}")
     plt.xlabel("Recall")
     plt.ylabel("Precision")
-    plt.title("Per-class Precision–Recall curves (OvR)")
-    plt.legend(title="Classes")
+    plt.title("Precision-Recall Curve (Binary Classification)")
+    plt.legend()
     plt.tight_layout()
-    plt.show()    
+    plt.show()
 
 # ----------------------------------------
 # Training, inference and evaluation pipelines
 # ----------------------------------------
 
 class TrainABMILPipeline:
-    """ 
-    Train ABMIL with validation, then retrain on all valid slides for the best epoch count and save checkpoint. 
-    
-    Usage: 
-    pipeline = TrainABMILPipeline(df, 'path_col', 'label_col', 'features_key', 'tiles_key', 'zarr_dir', 'save_path')
-    pipeline.run_pipeline(max_tiles=50000, n_epochs=100, seed=42, validation_fraction=0.10, early_stopping_patience=5)
     """
-
+    Train ABMIL with validation, then retrain on all valid slides for the
+    best epoch count and save checkpoint.
+    """
     def __init__(self, df, filename_col, label_col, patient_col, feature_key, tile_key, zarr_dir, save_path):
         self.df = df.copy()
         self.filename_col = filename_col
@@ -698,7 +594,7 @@ class TrainABMILPipeline:
         self.zarr_dir = zarr_dir
         self.save_path = save_path
         self.label_mapping = create_label_mapping(self.df, self.label_col)
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = require_cuda()
 
         self.model = None
         self.best_epoch = None
@@ -711,7 +607,6 @@ class TrainABMILPipeline:
             filename_col=self.filename_col,
             label_col=self.label_col,
             feature_key=self.feature_key,
-            tile_key=self.tile_key,
             zarr_dir=self.zarr_dir,
             max_tiles=max_tiles,
             seed=seed,
@@ -727,10 +622,10 @@ class TrainABMILPipeline:
         return mapped
 
     def validate_slides(self):
-        """ Filter out slides that cannot be loaded. """
+        """Filter out slides that cannot be loaded."""
         len_before = len(self.df)
         print(f"\nValidating {len_before} slides...")
-        
+
         temp_dataset = self._make_dataset(self.df)
         _, valid_indices = validate_dataset(temp_dataset)
         self.df = self.df.iloc[valid_indices].reset_index(drop=True)
@@ -739,11 +634,16 @@ class TrainABMILPipeline:
         return self.df
 
     def train_abmil(self, max_tiles=50000, n_epochs=100, seed=42, validation_fraction=0.10, early_stopping_patience=5):
-        """ Fit on a train/validation split and record the best epoch. """
+        """Fit on a train/validation split and record the best epoch."""
         df = self._map_labels(self.df)
 
-        # Group-aware split: keeps all slides from the same patient
-        # (self.patient_col) entirely in train or entirely in val.
+        n_classes = df[self.label_col].nunique()
+        if n_classes != 2:
+            raise ValueError(
+                f"TrainABMILPipeline currently supports binary classification only, but found {n_classes} classes."
+            )
+
+        # Group-aware, stratified train/validation split
         train_df, val_df = _group_stratified_train_val_split(
             df,
             label_col=self.label_col,
@@ -768,14 +668,12 @@ class TrainABMILPipeline:
         return self.model, self.best_epoch
 
     def save_abmil(self, max_tiles=50000, seed=42, n_epochs=None):
-        """ Retrain on all valid slides for best_epoch epochs and save the checkpoint. """
-        
-        if self.best_epoch and n_epochs is None:
+        """Retrain on all valid slides for best_epoch epochs and save the checkpoint."""
+        if self.best_epoch is None and n_epochs is None:
             raise ValueError("best_epoch is not set. Run train_abmil() first.")
 
         df = self._map_labels(self.df)
         full_dataset = self._make_dataset(df, max_tiles=max_tiles, seed=seed)
-
         epochs = self.best_epoch if n_epochs is None else n_epochs
 
         self.model, _, _ = train_ABMIL(
@@ -818,21 +716,8 @@ class TrainABMILPipeline:
 
 
 class KFoldPipeline:
-    """
-    K-fold cross-validation pipeline for ABMIL model evaluation.
-    
-    Usage:
-    """
+    """K-fold cross-validation pipeline for binary ABMIL model evaluation."""
     def __init__(self, df, filename_col, label_col, patient_col, feature_key, tile_key, zarr_dir):
-        """
-        Parameters:
-        - df: DataFrame with slide metadata
-        - filename_col: Column name for slide paths
-        - label_col: Column name for class labels
-        - feature_key: Key for features in zarr (e.g., 'features_h-optimus-0')
-        - tile_key: Key for tiles in zarr (e.g., 'tiles_224')
-        - zarr_dir: Directory containing zarr files
-        """
         self.df = df.copy()
         self.filename_col = filename_col
         self.label_col = label_col
@@ -840,7 +725,7 @@ class KFoldPipeline:
         self.feature_key = feature_key
         self.tile_key = tile_key
         self.zarr_dir = zarr_dir
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = require_cuda()
         self.results = None
 
         print(f"KFoldPipeline initialized on device: {self.device}")
@@ -851,7 +736,6 @@ class KFoldPipeline:
             filename_col=self.filename_col,
             label_col=self.label_col,
             feature_key=self.feature_key,
-            tile_key=self.tile_key,
             zarr_dir=self.zarr_dir,
             max_tiles=max_tiles,
             seed=seed,
@@ -871,14 +755,13 @@ class KFoldPipeline:
         all_labels, all_preds, all_probs = validate_ABMIL(model=model, val_dataset=eval_dataset)
         fold_auc = auc_score(all_labels, all_probs)
         fold_accuracy = np.mean(np.array(all_labels) == np.array(all_preds))
-        fold_per_class_aucs = per_class_auc(all_labels, all_probs)
-        return all_labels, all_preds, all_probs, fold_auc, fold_accuracy, fold_per_class_aucs
+        return all_labels, all_preds, all_probs, fold_auc, fold_accuracy
 
     def validate_slides(self):
-        """ Filter out invalid slides causing errors during loading. """
+        """Filter out invalid slides causing errors during loading."""
         len_before = len(self.df)
         print(f"\nValidating {len_before} slides...")
-        
+
         temp_dataset = self._make_dataset(self.df)
         _, valid_indices = validate_dataset(temp_dataset)
         self.df = self.df.iloc[valid_indices].reset_index(drop=True)
@@ -886,38 +769,43 @@ class KFoldPipeline:
         print(f"Validation complete: {len(self.df)} valid slides (removed {len_before - len(self.df)})")
         return self.df
 
-    def kfold_cross_validation(self, n_splits=5, n_epochs=10, early_stopping_patience=5, max_tiles=None, 
-            random_state=42, resume_from_checkpoints=False, checkpoint_dir="checkpoints/"):
-        """ 
-        Run stratified k-fold cross-validation with internal validation.
-        
-        Parameters:
-        - n_splits: number of folds
-        - n_epochs: maximum epochs per fold
-        - early_stopping_patience: patience for early stopping
-        - max_tiles: maximum tiles per slide (None = no limit)
-        - random_state: random seed for reproducibility
-        - resume_from_checkpoints: if True, detect completed folds from checkpoint files and continue from next fold
-        - checkpoint_dir: directory containing fold checkpoints (fold_{n}_auc_*.pt)
+    def kfold_cross_validation(
+        self,
+        n_splits=5,
+        n_epochs=10,
+        early_stopping_patience=5,
+        max_tiles=None,
+        random_state=42,
+        resume_from_checkpoints=False,
+        checkpoint_dir="checkpoints/"
+    ):
+        """
+        Run stratified group k-fold cross-validation with internal validation.
         """
         set_seed(random_state)
         print(f"Random seed set to {random_state} for reproducibility")
-    
-        df, label_mapping = self._map_labels(self.df)
-        skf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
-        fold_ovr_auc_scores = []
-        fold_per_class_aucs = []
+        df, label_mapping = self._map_labels(self.df)
+
+        if df[self.label_col].nunique() != 2:
+            raise ValueError(
+                f"KFoldPipeline currently supports binary classification only, but found {df[self.label_col].nunique()} classes."
+            )
+
+        sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+
+        fold_auc_scores = []
         fold_accuracies = []
         fold_all_labels = []
         fold_all_preds = []
         fold_all_probs = []
 
         print(f"Starting {n_splits}-fold cross-validation with early stopping (patience={early_stopping_patience})...")
-        print(f"Train (80%) → 90% training / 10% internal val | Test (20%) → final evaluation")
+        print("Train/Test split is patient-grouped and label-stratified.")
 
         start_fold = 1
         checkpoint_by_fold = {}
+
         if resume_from_checkpoints:
             pattern = os.path.join(checkpoint_dir, "fold_*_auc_*.pt")
             checkpoint_files = glob.glob(pattern)
@@ -939,7 +827,7 @@ class KFoldPipeline:
             print(f"Resume mode enabled. Found checkpoints for folds: {sorted(checkpoint_by_fold.keys())}")
             print(f"Will train from fold {start_fold}/{n_splits}")
 
-        for fold_idx, (train_idx, test_idx) in enumerate(skf.split(df, y = df[self.label_col], groups = df[self.patient_col])):
+        for fold_idx, (train_idx, test_idx) in enumerate(sgkf.split(df, y=df[self.label_col], groups=df[self.patient_col])):
             fold_num = fold_idx + 1
             print(f"\n{'='*60}")
             print(f"Fold {fold_num}/{n_splits}")
@@ -949,10 +837,6 @@ class KFoldPipeline:
             fold_df = df.iloc[train_idx].reset_index(drop=True)
             test_df = df.iloc[test_idx].reset_index(drop=True)
 
-            # Further split train into 90% train_subset + 10% internal_val (use fold-specific seed).
-            # Group-aware: keeps each patient's (self.patient_col) slides entirely in
-            # train_subset or entirely in internal_val, so the early-stopping signal
-            # isn't contaminated by seeing the same patient in both.
             split_seed = random_state + fold_num
             train_subset_df, internal_val_df = _group_stratified_train_val_split(
                 fold_df,
@@ -961,7 +845,7 @@ class KFoldPipeline:
                 test_size=1/9, # 90% train, 10% internal val
                 random_state=split_seed,
             )
-        
+
             print(f"Train subset: {len(train_subset_df)} samples")
             print(f"Internal val: {len(internal_val_df)} samples")
             print(f"Test set: {len(test_df)} samples")
@@ -982,10 +866,9 @@ class KFoldPipeline:
                 print(f"Using existing checkpoint for fold {fold_num}: {checkpoint_path}")
                 model, _, _ = load_checkpoint(checkpoint_path)
 
-                all_labels, all_preds, all_probs, fold_auc, fold_accuracy, fold_class_aucs = self._evaluate_fold(model, test_dataset)
+                all_labels, all_preds, all_probs, fold_auc, fold_accuracy = self._evaluate_fold(model, test_dataset)
 
-                fold_ovr_auc_scores.append(fold_auc)
-                fold_per_class_aucs.append(fold_class_aucs)
+                fold_auc_scores.append(fold_auc)
                 fold_accuracies.append(fold_accuracy)
                 fold_all_labels.append(list(all_labels))
                 fold_all_preds.append(list(all_preds))
@@ -999,7 +882,7 @@ class KFoldPipeline:
             model, _, _ = train_ABMIL(
                 train_df=train_subset_df,
                 train_dataset=train_dataset,
-                val_dataset=internal_val_dataset, 
+                val_dataset=internal_val_dataset,
                 label_col=self.label_col,
                 n_epochs=n_epochs,
                 early_stopping_patience=early_stopping_patience,
@@ -1007,15 +890,14 @@ class KFoldPipeline:
             )
 
             # Validate on test set for final evaluation of this fold
-            all_labels, all_preds, all_probs, fold_auc, fold_accuracy, fold_class_aucs = self._evaluate_fold(model, test_dataset)
+            all_labels, all_preds, all_probs, fold_auc, fold_accuracy = self._evaluate_fold(model, test_dataset)
 
-            fold_ovr_auc_scores.append(fold_auc)
-            fold_per_class_aucs.append(fold_class_aucs)
+            fold_auc_scores.append(fold_auc)
             fold_accuracies.append(fold_accuracy)
             fold_all_labels.append(list(all_labels))
             fold_all_preds.append(list(all_preds))
             fold_all_probs.append(all_probs.tolist())
-        
+
             print(f"Fold {fold_num} - Test AUC: {fold_auc:.4f}, Test Accuracy: {fold_accuracy:.4f}")
 
             # Save checkpoint for this fold
@@ -1035,44 +917,39 @@ class KFoldPipeline:
             save_checkpoint(model, config, label_mapping, checkpoint_path)
 
         # Compute mean and std across folds
-        per_class_aucs = np.array(fold_per_class_aucs, dtype=float)
         results_dict = {
-            "fold_ovr_auc_scores": fold_ovr_auc_scores,
-            "mean_ovr_auc": float(np.mean(fold_ovr_auc_scores)) if fold_ovr_auc_scores else np.nan,
-            "std_ovr_auc": float(np.std(fold_ovr_auc_scores)) if fold_ovr_auc_scores else np.nan,        
-            'fold_accuracies': fold_accuracies,
+            "fold_auc_scores": fold_auc_scores,
+            "mean_auc": float(np.mean(fold_auc_scores)) if fold_auc_scores else np.nan,
+            "std_auc": float(np.std(fold_auc_scores)) if fold_auc_scores else np.nan,
+            "fold_accuracies": fold_accuracies,
             "mean_accuracy": float(np.mean(fold_accuracies)) if fold_accuracies else np.nan,
             "std_accuracy": float(np.std(fold_accuracies)) if fold_accuracies else np.nan,
-            'fold_per_class_aucs': fold_per_class_aucs,
-            "mean_per_class_auc": np.nanmean(per_class_aucs, axis=0).tolist() if len(per_class_aucs) else [],
-            "std_per_class_auc": np.nanstd(per_class_aucs, axis=0).tolist() if len(per_class_aucs) else [],
-            'fold_all_labels': fold_all_labels,
-            'fold_all_preds': fold_all_preds,
-            'fold_all_probs': fold_all_probs,
-            'n_splits': n_splits
-        }    
+            "fold_all_labels": fold_all_labels,
+            "fold_all_preds": fold_all_preds,
+            "fold_all_probs": fold_all_probs,
+            "n_splits": n_splits
+        }
+
         self.results = results_dict
         return self.results
 
     def print_results(self):
-        """ Print cross-validation result summary. """
+        """Print cross-validation result summary."""
         if self.results is None:
             print("No results available. Run the pipeline first with .kfold_cross_validation()")
             return
-        
+
         print(f"\n{'='*60}")
         print(f"K-Fold Cross-Validation Results ({self.results['n_splits']} folds)")
         print(f"{'='*60}")
-        print(f"Mean AUC: {self.results['mean_ovr_auc']:.4f} ± {self.results['std_ovr_auc']:.4f}")
+        print(f"Mean AUC: {self.results['mean_auc']:.4f} ± {self.results['std_auc']:.4f}")
         print(f"Mean Accuracy: {self.results['mean_accuracy']:.4f} ± {self.results['std_accuracy']:.4f}")
-        print(f"\nPer-fold AUC: {[f'{auc:.4f}' for auc in self.results['fold_ovr_auc_scores']]}")
+        print(f"\nPer-fold AUC: {[f'{auc:.4f}' for auc in self.results['fold_auc_scores']]}")
         print(f"Per-fold Accuracy: {[f'{acc:.4f}' for acc in self.results['fold_accuracies']]}")
-        print("Per-class AUC (mean ± std):")
-        for class_idx, (mean_auc, std_auc) in enumerate(zip(self.results['mean_per_class_auc'], self.results['std_per_class_auc'])):
-            print(f"  Class {class_idx}: {mean_auc:.4f} ± {std_auc:.4f}")
+
 
 class ABMILInference:
-    """ Run slide-level ABMIL inference from cached tile features and store attention outputs. """
+    """Run slide-level ABMIL inference from cached tile features and store attention outputs."""
     def __init__(self, checkpoint_path, zarr_dir, slides, cache_path=None, heatmap_dir=None, save_heatmap=False):
         self.checkpoint_path = checkpoint_path
         self.zarr_dir = zarr_dir
@@ -1083,7 +960,7 @@ class ABMILInference:
         self._slide_cache = {}
         self._skipped_slides = []
 
-        # Ensure cache file exists (create empty cache if missing) and load it
+        # Load cached inference results if available
         if self.cache_path and os.path.exists(self.cache_path):
             loaded_cache = self.load_cache(self.cache_path)
             if isinstance(loaded_cache, dict):
@@ -1095,18 +972,18 @@ class ABMILInference:
         self.feature_key = self.config.get("feature_key")
         self.tile_key = self.config.get("tile_key")
         self.idx_to_label = {v: k for k, v in self.label_mapping.items()} if self.label_mapping else {}
-    
+
     def save_cache(self):
         """Save cached inference results to disk."""
         if not self.cache_path:
             return self._slide_cache
-        
+
         os.makedirs(os.path.dirname(self.cache_path) or ".", exist_ok=True)
         tmp_path = f"{self.cache_path}.tmp"
 
         with open(tmp_path, "wb") as f:
             pickle.dump(self._slide_cache, f)
-        
+
         os.replace(tmp_path, self.cache_path)
         return self._slide_cache
 
@@ -1115,7 +992,7 @@ class ABMILInference:
         """Load a pickle cache file."""
         with open(input_path, "rb") as f:
             return pickle.load(f)
-    
+
     def _infer_slide(self, slide_path: str):
         """Infer one slide and cache result."""
         if slide_path in self._slide_cache:
@@ -1139,22 +1016,18 @@ class ABMILInference:
         feats = feats.to(self.device, non_blocking=True)
 
         with torch.no_grad():
-            if self.device.type == "cuda":
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    contrib = get_tile_contributions(self.model, feats)
-            else:
+            with autocast_context():
                 contrib = get_tile_contributions(self.model, feats)
 
         probs = contrib["probabilities"].numpy()
         pred_idx = int(np.argmax(probs))
 
-        attention = contrib["attention"].numpy()               # salience only - QC/relevance, not healthy/disease
+        attention = contrib["attention"].numpy()               # salience only
         healthy_score = contrib["healthy_score"].numpy()
         disease_score = contrib["disease_score"].numpy()
-        contrast_score = contrib["contrast_score"].numpy()          # + = disease-like, - = healthy-like (raw, unweighted - use for the healthy/control arm)
-        contribution_score = contrib["contribution_score"].numpy()  # attention * contrast_score (exact logit decomposition - use for the disease arm)
+        contrast_score = contrib["contrast_score"].numpy()          # + disease-like, - healthy-like (raw, unweighted - healthy/control arm)
+        contribution_score = contrib["contribution_score"].numpy()  # attention * contrast_score (exact logit decomposition - disease arm)
 
-        # Build a tile table with attention + classifier scores and geometries
         scores_df = pd.DataFrame({
             "tile_id": tile_ids,
             "attention": attention,
@@ -1163,6 +1036,7 @@ class ABMILInference:
             "contrast_score": contrast_score,
             "contribution_score": contribution_score,
         })
+
         tile_df = wsi.shapes[self.tile_key][["tile_id", "geometry"]].copy()
         tile_table = pd.merge(scores_df, tile_df, on="tile_id", how="inner")
 
@@ -1183,15 +1057,17 @@ class ABMILInference:
         return slide_data
 
     def process_slides(self):
-        """Process slides sequentially, skipping failures and continuing.
-        Optionally save one JPG heatmap per slide."""
+        """
+        Process slides sequentially, skipping failures and continuing.
+        Optionally save one JPG heatmap per slide.
+        """
         processed_count = 0
 
         for slide_path in tqdm(self.slides, desc="Running ABMIL inference..."):
             try:
                 self._infer_slide(slide_path)
 
-                if self.save_heatmap: 
+                if self.save_heatmap:
                     slide_name = os.path.splitext(os.path.basename(slide_path))[0]
                     heatmap_path = os.path.join(self.heatmap_dir, f"{slide_name}_heatmap.jpg")
                     self.attention_heatmap(slide_path, save_path=heatmap_path)
@@ -1216,7 +1092,7 @@ class ABMILInference:
             print(f"Skipped {len(self._skipped_slides)} slides due to errors.")
 
         return self._slide_cache
-    
+
     def attention_heatmap(self, slide_path: str, save_path: str = None):
         """Plot the attention heatmap for one cached slide."""
         slide_data = self._slide_cache.get(slide_path)
@@ -1240,7 +1116,6 @@ class ABMILInference:
         else:
             attention_display = attention
 
-        
         print(
             f"Attention stats for {os.path.basename(slide_path)}: "
             f"min={attention.min():.4f}, p5={np.percentile(attention, 5):.4f}, "
@@ -1274,16 +1149,15 @@ class ABMILInference:
             fig.tight_layout()
             fig.savefig(save_path, format="jpg", dpi=300, bbox_inches="tight")
             plt.close(fig)
-            return save_path  
+            return save_path
 
         plt.show()
         return fig
 
     def contrast_heatmap(self, slide_path: str, save_path: str = None):
-        """Plot the contrast_score heatmap (disease-like vs. healthy-like) for one
-        cached slide. This is the signal used for ROI selection - compare it
-        against attention_heatmap() to see that they are NOT the same thing:
-        attention shows where the model looked, this shows what it saw there."""
+        """
+        Plot the contrast_score heatmap for one cached slide.
+        """
         slide_data = self._slide_cache.get(slide_path)
         if not slide_data:
             print(f"No cached data found for slide: {slide_path}")
@@ -1297,8 +1171,7 @@ class ABMILInference:
         wsi = open_wsi(slide_path, slide_data["zarr_path"])
         contrast = tile_table.set_index("tile_id")["contrast_score"]
 
-        # Center the colormap at 0 (healthy-like <-> disease-like), symmetric
-        # around the largest absolute value so 0 always maps to the midpoint.
+        # Center the colormap at 0
         limit = float(np.abs(contrast).max()) if len(contrast) else 1.0
         limit = limit if limit > 0 else 1.0
 
@@ -1338,7 +1211,7 @@ class ABMILInference:
         if not self._slide_cache:
             print("No cached results found. Run process_slides() first.")
             return pd.DataFrame()
-    
+
         rows = []
         for slide_path, cached in self._slide_cache.items():
             rows.append({
@@ -1356,12 +1229,13 @@ class ABMILInference:
 
 
 class ABMILEvaluation:
-    """ Evaluate slide-level ABMIL inference results against metadata labels. """
+    """Evaluate slide-level ABMIL inference results against metadata labels."""
+
     def __init__(self, results_df: pd.DataFrame, metadata_df: pd.DataFrame, true_label_col: str):
         self.results_df = results_df.copy()
         self.metadata_df = metadata_df.copy()
         self.true_label_col = true_label_col
-        
+
         self.y_true = None
         self.y_pred = None
         self.y_probs = None
@@ -1371,11 +1245,11 @@ class ABMILEvaluation:
 
     @staticmethod
     def _extract_slide_id(slide_path):
-        """ Extract slide identifier from a path or filename. """
+        """Extract slide identifier from a path or filename."""
         return os.path.basename(str(slide_path)).replace(".mrxs", "")
 
-    def match_true_labels(self, slide_id_col: str = "filename", results_path_col: str = "slide_path"):
-        """ Match predictions with ground-truth labels using slide identifiers. """
+    def match_true_labels(self, slide_id_col="filename", results_path_col="slide_path"):
+        """Match predictions with ground-truth labels using slide identifiers."""
         if results_path_col not in self.results_df.columns:
             raise ValueError(f"Column '{results_path_col}' not found in results_df.")
         if slide_id_col not in self.metadata_df.columns:
@@ -1386,11 +1260,11 @@ class ABMILEvaluation:
         results_df = self.results_df.copy()
         metadata_df = self.metadata_df.copy()
 
-        # Extract slide IDs from results paths and metadata paths
+        # Extract slide identifiers for matching
         results_df["_slide_id_results"] = results_df[results_path_col].apply(self._extract_slide_id)
         metadata_df["_slide_id_metadata"] = metadata_df[slide_id_col].apply(self._extract_slide_id)
 
-        # Merge results with metadata on slide_id
+        # Merge results with metadata on slide identifiers
         matched_df = pd.merge(
             results_df,
             metadata_df[["_slide_id_metadata", self.true_label_col]],
@@ -1398,15 +1272,15 @@ class ABMILEvaluation:
             right_on="_slide_id_metadata",
             how="inner"
         )
-        
+
         if matched_df.empty:
             raise ValueError("No matches found between results and metadata.")
 
-        # Clean up temporary columns
+        # Drop temporary slide identifier columns after matching
         matched_df = matched_df.drop(columns=["_slide_id_results", "_slide_id_metadata"])
         self.matched_df = matched_df
-        
-        # True and predicted labels as strings
+
+        # Prepare true and predicted labels for evaluation
         pred_labels = matched_df["pred_label"].astype(str).values
         true_labels = matched_df[self.true_label_col].astype(str).values
 
@@ -1414,35 +1288,23 @@ class ABMILEvaluation:
         self.label_to_idx = {label: idx for idx, label in enumerate(all_labels)}
         self.idx_to_label = {idx: label for label, idx in self.label_to_idx.items()}
 
-        # True and predicted labels as indices
         self.y_true = np.array([self.label_to_idx[label] for label in true_labels], dtype=int)
         self.y_pred = np.array([self.label_to_idx[label] for label in pred_labels], dtype=int)
 
-        # Extract probability columns (all columns starting with "prob_")
         prob_cols = [col for col in matched_df.columns if col.startswith("prob_")]
         if prob_cols:
-            # Converts each column name into its class label
-            prob_label_map = {col: col.replace("prob_", "", 1) for col in prob_cols}
-            # Creates empty array of shape (n_samples, n_classes) to hold probabilities
             y_probs = np.zeros((len(matched_df), len(all_labels)), dtype=float)
-            
-            # Copies probabilities from matched_df into y_probs based on label mapping
             for col in prob_cols:
-                label = prob_label_map[col]
+                label = col.replace("prob_", "", 1)
                 if label in self.label_to_idx:
                     y_probs[:, self.label_to_idx[label]] = matched_df[col].to_numpy(dtype=float)
             self.y_probs = y_probs
-
         else:
-            # Create empty array of shape (n_samples, n_classes) to hold probabilities
             y_probs = np.zeros((len(matched_df), len(all_labels)), dtype=float)
-            
-            # Set the predicted class index to 1.0 for each sample (one-hot encoding)
-            # Placeholder probabilities if no probability columns are present
             for i, pred_idx in enumerate(self.y_pred):
                 y_probs[i, pred_idx] = 1.0
             self.y_probs = y_probs
-        
+
         print(
             f"Matched {len(self.matched_df)} slides. "
             f"y_true shape: {self.y_true.shape}, "
@@ -1452,7 +1314,7 @@ class ABMILEvaluation:
         return self.matched_df
 
     def assessment_report(self):
-        """ Print confusion matrix and classification report using shared helper. """
+        """Print confusion matrix and classification report."""
         if self.y_true is None or self.y_pred is None:
             raise ValueError("No matched labels found. Call match_true_labels() first.")
 
@@ -1462,17 +1324,16 @@ class ABMILEvaluation:
         return {"confusion_matrix": cm, "classification_report": report}
 
     def compute_metrics(self):
-        """ Compute macro AUC and per-class AUC using shared helpers. """
+        """Compute binary AUC."""
         if self.y_true is None or self.y_probs is None:
             raise ValueError("No matched labels found. Call match_true_labels() first.")
 
         return {
             "auc": auc_score(self.y_true, self.y_probs),
-            "per_class_aucs": per_class_auc(self.y_true, self.y_probs),
         }
 
     def group_by_metrics(self, group_col, slide_id_col="filename", results_path_col="slide_path"):
-        """ Compute accuracy and AUC grouped by a metadata column. """
+        """Compute accuracy and AUC grouped by a metadata column."""
         if self.matched_df is None or self.matched_df.empty:
             raise ValueError("No matched labels found. Call match_true_labels() first.")
         if group_col not in self.metadata_df.columns:
@@ -1493,7 +1354,7 @@ class ABMILEvaluation:
             on="_slide_id",
             how="left",
         )
-        
+
         rows = []
         for group_val, group_data in grouped_df.groupby(group_col, dropna=False):
             y_true_group = np.array([self.label_to_idx[str(label)] for label in group_data[self.true_label_col].astype(str).values], dtype=int)
@@ -1509,53 +1370,54 @@ class ABMILEvaluation:
             else:
                 y_probs_group = None
 
+            auc_val = np.nan
+            if y_probs_group is not None and y_probs_group.shape[1] == 2:
+                try:
+                    auc_val = float(auc_score(y_true_group, y_probs_group))
+                except ValueError:
+                    auc_val = np.nan
+
             rows.append({
                 group_col: group_val,
                 "n_samples": len(group_data),
                 "accuracy": float(np.mean(y_true_group == y_pred_group)),
-                "auc": float(auc_score(y_true_group, y_probs_group)) if y_probs_group is not None and y_probs_group.shape[1] > 1 else np.nan,
+                "auc": auc_val,
             })
-        
+
         group_metrics_df = pd.DataFrame(rows)
         group_metrics_df = group_metrics_df.sort_values(
             by=["accuracy", "n_samples"],
             ascending=[False, False],
             na_position="last"
         ).reset_index(drop=True)
+
         print(f"\nPer-group metrics grouped by '{group_col}':")
         print(group_metrics_df.to_string(index=False))
         return group_metrics_df
 
     def roc_curve(self):
-        """ Plot ROC curve for binary classification using shared helper. """
+        """Plot ROC curve for binary classification."""
         if self.y_true is None or self.y_probs is None:
             raise ValueError("No matched labels found. Call match_true_labels() first.")
         return plot_roc_curve(self.y_true, self.y_probs)
 
-    def pr_curves(self):
-        """ Plot per-class precision-recall curves using shared helper. """
+    def pr_curve(self):
+        """Plot precision-recall curve for binary classification."""
         if self.y_true is None or self.y_probs is None:
             raise ValueError("No matched labels found. Call match_true_labels() first.")
-        return per_class_pr_curves(self.y_true, self.y_probs)
+        return plot_pr_curve(self.y_true, self.y_probs)
 
-    def ovr_roc_curves(self):
-        """ Plot one-vs-rest ROC curves for all classes using shared helper. """
-        if self.y_true is None or self.y_probs is None:
-            raise ValueError("No matched labels found. Call match_true_labels() first.")
-        return per_class_roc_curves(self.y_true, self.y_probs)
 
 # ----------------------------------------
-# Deletion curve evaluation (attention/contribution faithfulness check)
+# Deletion curve evaluation
 # ----------------------------------------
 
 def _find_fold_checkpoint(checkpoint_dir, fold_num):
-    """Find the checkpoint file for a given fold, matching the naming
-    convention used by KFoldPipeline.kfold_cross_validation()."""
+    """Find the checkpoint file for a given fold."""
     pattern = os.path.join(checkpoint_dir, f"fold_{fold_num}_auc_*.pt")
     matches = glob.glob(pattern)
     if not matches:
         raise FileNotFoundError(f"No checkpoint found for fold {fold_num} in {checkpoint_dir} (pattern: {pattern})")
-    # If several exist (e.g. re-runs), take the most recently written one
     matches.sort(key=os.path.getmtime, reverse=True)
     return matches[0]
 
@@ -1572,13 +1434,7 @@ def _load_slide_feats(slide_path, zarr_dir, feature_key):
 @torch.no_grad()
 def _slide_deletion_curve(model, feats, frac_grid, device, n_random=5, rng=None):
     """
-    Compute deletion curve for a single slide: for each fraction in
-    frac_grid, delete that fraction of the most-important tiles 
-    (ranked once, up front, from the full bag) and re-run the forward
-    pass on what remains, tracking the probability of the ORIGINAL 
-    predicted class.
-    Also computes a random-deletion baseline, averaged over n_random
-    permutations, for comparison.
+    Compute deletion curve for a single slide.
     """
     feats = feats.to(device)
     n_tiles = feats.shape[0]
@@ -1596,7 +1452,8 @@ def _slide_deletion_curve(model, feats, frac_grid, device, n_random=5, rng=None)
         if len(keep_idx) == 0:
             return np.nan
         sub_feats = feats[keep_idx]
-        out = model(sub_feats)
+        with autocast_context():
+            out = model(sub_feats)
         probs = torch.softmax(out["logits"], dim=0)
         return float(probs[pred_idx].item())
 
@@ -1604,7 +1461,7 @@ def _slide_deletion_curve(model, feats, frac_grid, device, n_random=5, rng=None)
     random_curve = []
 
     for frac in frac_grid:
-        n_delete = min(int(round(frac * n_tiles)), max(n_tiles - 1, 0))  # always keep >=1 tile
+        n_delete = min(int(round(frac * n_tiles)), max(n_tiles - 1, 0))
 
         # Importance-guided deletion: remove the top n_delete by rank
         keep_idx = order[n_delete:]
@@ -1625,19 +1482,24 @@ def _slide_deletion_curve(model, feats, frac_grid, device, n_random=5, rng=None)
         "random_curve": np.array(random_curve),
     }
 
-def run_deletion_curve_evaluation(df, filename_col, label_col, patient_col, feature_key, tile_key, zarr_dir,
-        checkpoint_dir, n_splits=5, random_state=42, frac_grid=None, n_random=5, seed=0):
+
+def run_deletion_curve_evaluation(
+    df,
+    filename_col,
+    label_col,
+    patient_col,
+    feature_key,
+    zarr_dir,
+    checkpoint_dir,
+    n_splits=5,
+    random_state=42,
+    frac_grid=None,
+    n_random=5,
+    seed=0
+):
     """
     Run out-of-fold deletion curves across an entire dataset, reusing an
-    existing K-fold checkpoint set (no retraining). Reproduces the exact
-    same stratified GROUP k-fold split used by KFoldPipeline.kfold_cross_validation
-    (same n_splits/random_state, grouped by patient_col) so each slide is
-    evaluated with the checkpoint from the fold where its patient was held
-    out - no leakage.
-
-    Returns a long-format DataFrame: one row per (slide, fraction deleted),
-    with columns for the importance-guided and random-baseline predicted-
-    class probability at that fraction.
+    existing K-fold checkpoint set.
     """
     if frac_grid is None:
         frac_grid = np.linspace(0.0, 1.0, 11)  # 0%, 10%, ..., 100%
@@ -1647,7 +1509,11 @@ def run_deletion_curve_evaluation(df, filename_col, label_col, patient_col, feat
     label_mapping = create_label_mapping(df2, label_col)
     df2[label_col] = df2[label_col].map(label_mapping).astype(int)
 
-    # Recreate the exact CV splitter used during training (grouped by patient)
+    if df2[label_col].nunique() != 2:
+        raise ValueError(
+            f"run_deletion_curve_evaluation currently supports binary classification only, but found {df2[label_col].nunique()} classes."
+        )
+
     sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     rng = np.random.RandomState(seed)
 
@@ -1667,7 +1533,6 @@ def run_deletion_curve_evaluation(df, filename_col, label_col, patient_col, feat
         for _, row in tqdm(test_df.iterrows(), total=len(test_df), desc=f"Deletion curves (fold {fold_num})"):
             slide_path = row[filename_col]
 
-            # Load features
             try:
                 feats = _load_slide_feats(slide_path, zarr_dir, feature_key)
             except Exception as e:
@@ -1695,12 +1560,9 @@ def run_deletion_curve_evaluation(df, filename_col, label_col, patient_col, feat
 
 def deletion_auc_summary(results_df):
     """
-    Compute per-slide Area Under the Deletion Curve (AUDC) for both the
-    importance-guided and random curves (trapezoidal integration over
-    frac_deleted), and summarize. Lower AUDC = confidence collapses
-    faster = importance ranking is more faithful.
+    Compute per-slide area under the deletion curve (AUDC) for both the
+    importance-guided and random curves.
     """
-    # Use np.trapezoid if available (newer NumPy), otherwise fall back to np.trapz
     _trapz = getattr(np, "trapezoid", None) or np.trapz
 
     audc_rows = []
@@ -1740,33 +1602,35 @@ def plot_deletion_curves(results_df, title=None):
 
     # Plot the importance-guided deletion curve with mean and SEM shading
     ax.plot(
-        summary["frac_deleted"], 
-        summary["importance_mean"], 
-        color="#b30000", 
-        label="Importance-guided deletion", 
+        summary["frac_deleted"],
+        summary["importance_mean"],
+        color="#b30000",
+        label="Importance-guided deletion",
         marker="o"
     )
     ax.fill_between(
         summary["frac_deleted"],
         summary["importance_mean"] - summary["importance_sem"],
         summary["importance_mean"] + summary["importance_sem"],
-        color="#b30000", alpha=0.2,
+        color="#b30000",
+        alpha=0.2,
     )
 
     # Plot the random deletion baseline curve with mean and SEM shading
     ax.plot(
-        summary["frac_deleted"], 
-        summary["random_mean"], 
-        color="#555555", 
-        label="Random deletion", 
-        marker="o", 
+        summary["frac_deleted"],
+        summary["random_mean"],
+        color="#555555",
+        label="Random deletion",
+        marker="o",
         linestyle="--"
     )
     ax.fill_between(
         summary["frac_deleted"],
         summary["random_mean"] - summary["random_sem"],
         summary["random_mean"] + summary["random_sem"],
-        color="#555555", alpha=0.2,
+        color="#555555",
+        alpha=0.2,
     )
 
     ax.set_xlabel("Fraction of tiles deleted")
