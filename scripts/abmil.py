@@ -1641,3 +1641,97 @@ def plot_deletion_curves(results_df, title=None):
     plt.tight_layout()
     plt.show()
     return fig
+
+
+# ----------------------------------------
+# Five-slide overfit check
+# ----------------------------------------
+
+def run_five_slide_overfit_check(
+    df,
+    filename_col,
+    label_col,
+    feature_key,
+    zarr_dir,
+    patient_col=None,
+    max_tiles=None,
+    seed=42,
+    n_epochs=100
+):
+    """
+    Sanity check: can the model memorize 5 slides?
+    Success criterion:
+      - near-perfect training accuracy
+      - near-perfect AUC
+      - very low loss
+    """
+    set_seed(seed)
+    require_cuda()
+
+    # Keep only labeled rows
+    df = df.dropna(subset=[label_col]).copy()
+
+    # Binary only
+    classes = sorted(df[label_col].unique())
+    if len(classes) != 2:
+        raise ValueError(f"Expected binary labels, found {classes}")
+
+    # Pick a tiny balanced subset
+    class0 = df[df[label_col] == classes[0]]
+    class1 = df[df[label_col] == classes[1]]
+
+    if len(class0) < 2 or len(class1) < 2:
+        raise ValueError("Need at least 2 slides from each class for a 5-slide overfit check.")
+
+    if patient_col is not None:
+        class0 = class0.drop_duplicates(subset=[patient_col])
+        class1 = class1.drop_duplicates(subset=[patient_col])
+
+    tiny_df = pd.concat([
+        class0.sample(n=2, random_state=seed),
+        class1.sample(n=3, random_state=seed)
+    ]).sample(frac=1, random_state=seed).reset_index(drop=True)
+
+    print("Five-slide overfit subset:")
+    display_cols = [c for c in [filename_col, label_col, patient_col] if c is not None]
+    print(tiny_df[display_cols])
+
+    tiny_dataset = ZarrSlideDataset(
+        df=tiny_df,
+        filename_col=filename_col,
+        label_col=label_col,
+        feature_key=feature_key,
+        zarr_dir=zarr_dir,
+        max_tiles=max_tiles,
+        seed=seed,
+        require_labels=True,
+    )
+
+    tiny_dataset, valid_indices = validate_dataset(tiny_dataset)
+    if len(tiny_dataset) != 5:
+        raise RuntimeError(f"Expected 5 valid slides, got {len(tiny_dataset)}")
+
+    model, _, _ = train_ABMIL(
+        train_df=tiny_df.iloc[valid_indices].reset_index(drop=True),
+        train_dataset=tiny_dataset,
+        val_dataset=None,
+        label_col=label_col,
+        n_epochs=n_epochs,
+        early_stopping_patience=None,
+        seed=seed,
+    )
+
+    all_labels, all_preds, all_probs = validate_ABMIL(model, tiny_dataset)
+    train_acc = (np.array(all_labels) == np.array(all_preds)).mean()
+    train_auc = auc_score(all_labels, all_probs)
+
+    print(f"Five-slide overfit results | Accuracy: {train_acc:.4f} | AUC: {train_auc:.4f}")
+    print(classification_report(all_labels, all_preds))
+
+    return model, tiny_df, {
+        "labels": all_labels,
+        "preds": all_preds,
+        "probs": all_probs,
+        "train_acc": train_acc,
+        "train_auc": train_auc,
+    }
