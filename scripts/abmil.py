@@ -91,8 +91,16 @@ class ABMIL(nn.Module):
 
     Keeps n_heads=1 for interpretability: one attention weight per tile.
     Tile-level class contributions are derived from attention and classifier weights.
+
+    `dropout` (default 0.1) is applied inside the attention branches only,
+    never on the pooled slide embedding or the classifier input. This keeps
+    the linear pooled -> classifier path exactly linear at eval time (so
+    `get_tile_contributions`'s per-tile decomposition stays exact), while
+    still regularizing the attention MLP, which is the part most prone to
+    overfitting on small slide counts. Set dropout=0.0 to recover the
+    original, unregularized model.
     """
-    def __init__(self, in_dim, n_classes=2, hidden_dim=256, n_heads=1):
+    def __init__(self, in_dim, n_classes=2, hidden_dim=256, n_heads=1, dropout=0.1):
         super().__init__()
 
         if n_classes != 2:
@@ -102,23 +110,28 @@ class ABMIL(nn.Module):
         self.n_classes = n_classes
         self.hidden_dim = hidden_dim
         self.n_heads = n_heads
+        self.dropout = dropout
 
         # Attention mechanism, producing one attention score per tile
         # Gated attention: A = V * U (tanh * sigmoid)
         # Tanh allows positive and negative responses
         self.attn_V = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
-            nn.Tanh()
+            nn.Tanh(),
+            nn.Dropout(dropout),
         )
         # Sigmoid acts as a learned gate between 0 and 1.
         self.attn_U = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
-            nn.Sigmoid()
+            nn.Sigmoid(),
+            nn.Dropout(dropout),
         )
         # Maps hidden representation to raw attention scores
         self.attn_w = nn.Linear(hidden_dim, n_heads) 
 
-        # Classifier layer, maps final slide embedding to class scores
+        # Classifier layer, maps final slide embedding to class scores.
+        # Deliberately left undropped: get_tile_contributions relies on this
+        # being an exact linear map from pooled features to logits.
         self.classifier = nn.Linear(in_dim, n_classes)
 
     def forward(self, x):
@@ -292,7 +305,8 @@ def load_checkpoint(path):
         in_dim=config["in_dim"],
         n_classes=config["n_classes"],
         hidden_dim=config["hidden_dim"],
-        n_heads=config["n_heads"]
+        n_heads=config["n_heads"],
+        dropout=config.get("dropout", 0.0),  # old checkpoints predate this key (no dropout)
     ).to(device)
 
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -326,7 +340,7 @@ def _group_stratified_train_val_split(df, label_col, group_col, test_size, rando
 # ----------------------------------------
 
 def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epochs=10, 
-    early_stopping_patience=None, seed=None):
+    early_stopping_patience=None, seed=None, dropout=0.1, weight_decay=1e-4):
     """Train ABMIL model with optional early stopping."""
     if seed is not None:
         set_seed(seed)
@@ -352,14 +366,14 @@ def train_ABMIL(train_df, train_dataset, val_dataset=None, label_col=None, n_epo
             f"This training pipeline currently supports binary classification only, but found {n_classes} classes."
         )
 
-    model = ABMIL(feat_dim, n_classes=2).to(device)
+    model = ABMIL(feat_dim, n_classes=2, dropout=dropout).to(device)
 
     _configure_gpu_optimization()
     amp_dtype = get_amp_dtype()
     print(f"Using CUDA mixed precision dtype: {amp_dtype}")
 
     # Create optimizer and loss function
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=weight_decay)
     loss_fn = torch.nn.CrossEntropyLoss()
 
     # Early stopping setup
@@ -633,8 +647,10 @@ class TrainABMILPipeline:
         print(f"Validation complete: {len(self.df)} valid slides (removed {len_before - len(self.df)})")
         return self.df
 
-    def train_abmil(self, max_tiles=50000, n_epochs=100, seed=42, validation_fraction=0.10, early_stopping_patience=5):
+    def train_abmil(self, max_tiles=50000, n_epochs=100, seed=42, validation_fraction=0.10,
+                     early_stopping_patience=5, dropout=0.1, weight_decay=1e-4):
         """Fit on a train/validation split and record the best epoch."""
+        self._train_kwargs = dict(dropout=dropout, weight_decay=weight_decay)
         df = self._map_labels(self.df)
 
         n_classes = df[self.label_col].nunique()
@@ -655,6 +671,11 @@ class TrainABMILPipeline:
         train_dataset = self._make_dataset(train_df, max_tiles=max_tiles, seed=seed)
         val_dataset = self._make_dataset(val_df, max_tiles=max_tiles, seed=seed)
 
+        print(
+            f"Train slides: {len(train_df)} (patients: {train_df[self.patient_col].nunique()}) | "
+            f"Val slides: {len(val_df)} (patients: {val_df[self.patient_col].nunique()})"
+        )
+
         self.model, _, self.best_epoch = train_ABMIL(
             train_df=train_df,
             train_dataset=train_dataset,
@@ -663,6 +684,7 @@ class TrainABMILPipeline:
             n_epochs=n_epochs,
             early_stopping_patience=early_stopping_patience,
             seed=seed,
+            **self._train_kwargs,
         )
 
         return self.model, self.best_epoch
@@ -671,6 +693,8 @@ class TrainABMILPipeline:
         """Retrain on all valid slides for best_epoch epochs and save the checkpoint."""
         if self.best_epoch is None and n_epochs is None:
             raise ValueError("best_epoch is not set. Run train_abmil() first.")
+
+        train_kwargs = getattr(self, "_train_kwargs", dict(dropout=0.1, weight_decay=1e-4))
 
         df = self._map_labels(self.df)
         full_dataset = self._make_dataset(df, max_tiles=max_tiles, seed=seed)
@@ -684,6 +708,7 @@ class TrainABMILPipeline:
             n_epochs=epochs,
             early_stopping_patience=None,
             seed=seed,
+            **train_kwargs,
         )
 
         self.config = {
@@ -691,11 +716,13 @@ class TrainABMILPipeline:
             "n_classes": self.model.n_classes,
             "hidden_dim": self.model.hidden_dim,
             "n_heads": self.model.n_heads,
+            "dropout": self.model.dropout,
             "feature_key": self.feature_key,
             "tile_key": self.tile_key,
             "max_tiles": max_tiles,
             "n_epochs": epochs,
             "seed": seed,
+            **train_kwargs,
         }
 
         os.makedirs(os.path.dirname(self.save_path) or ".", exist_ok=True)
@@ -777,7 +804,9 @@ class KFoldPipeline:
         max_tiles=None,
         random_state=42,
         resume_from_checkpoints=False,
-        checkpoint_dir="checkpoints/"
+        checkpoint_dir="checkpoints/",
+        dropout=0.1,
+        weight_decay=1e-4,
     ):
         """
         Run stratified group k-fold cross-validation with internal validation.
@@ -791,6 +820,8 @@ class KFoldPipeline:
             raise ValueError(
                 f"KFoldPipeline currently supports binary classification only, but found {df[self.label_col].nunique()} classes."
             )
+
+        print(f"Overall class counts: {dict(df[self.label_col].value_counts().sort_index())}")
 
         sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
@@ -846,9 +877,11 @@ class KFoldPipeline:
                 random_state=split_seed,
             )
 
-            print(f"Train subset: {len(train_subset_df)} samples")
+            print(f"Train subset: {len(train_subset_df)} samples "
+                  f"(class counts: {dict(train_subset_df[self.label_col].value_counts().sort_index())})")
             print(f"Internal val: {len(internal_val_df)} samples")
-            print(f"Test set: {len(test_df)} samples")
+            print(f"Test set: {len(test_df)} samples "
+                  f"(class counts: {dict(test_df[self.label_col].value_counts().sort_index())})")
 
             # Use fold-specific seed for deterministic tile sampling
             fold_seed = random_state + fold_num
@@ -886,7 +919,9 @@ class KFoldPipeline:
                 label_col=self.label_col,
                 n_epochs=n_epochs,
                 early_stopping_patience=early_stopping_patience,
-                seed=fold_seed
+                seed=fold_seed,
+                dropout=dropout,
+                weight_decay=weight_decay,
             )
 
             # Validate on test set for final evaluation of this fold
@@ -906,11 +941,13 @@ class KFoldPipeline:
                 "hidden_dim": model.hidden_dim,
                 "n_classes": model.n_classes,
                 "n_heads": model.n_heads,
+                "dropout": model.dropout,
                 "feature_key": self.feature_key,
                 "tile_key": self.tile_key,
                 "max_tiles": max_tiles,
                 "n_epochs": n_epochs,
                 "random_state": fold_seed,
+                "weight_decay": weight_decay,
             }
             os.makedirs(checkpoint_dir, exist_ok=True)
             checkpoint_path = os.path.join(checkpoint_dir, f"fold_{fold_num}_auc_{fold_auc:.4f}.pt")
@@ -1432,9 +1469,21 @@ def _load_slide_feats(slide_path, zarr_dir, feature_key):
     return feats
 
 @torch.no_grad()
-def _slide_deletion_curve(model, feats, frac_grid, device, n_random=5, rng=None):
+def _slide_deletion_curve(model, feats, frac_grid, device, n_random=5, rng=None, rank_by="attention"):
     """
     Compute deletion curve for a single slide.
+
+    rank_by:
+      - "attention": rank by raw attention magnitude (unsigned salience). Tests
+        whether the model *attends to* faithful tiles, but says nothing about
+        whether those tiles specifically support the predicted class.
+      - "contribution_score": rank by attention * contrast_score, signed relative
+        to the predicted class (i.e. the exact quantity ROI selection uses via
+        `disease_score_col`/`healthy_score_col` in ROISelector). This is the
+        faithfulness check that actually matches what gets cut for DVP: it tests
+        whether removing the tiles roi_selection.py would pick as most
+        disease-driving (or, for a healthy-predicted slide, most healthy-driving)
+        collapses the predicted-class probability faster than random deletion.
     """
     feats = feats.to(device)
     n_tiles = feats.shape[0]
@@ -1444,7 +1493,18 @@ def _slide_deletion_curve(model, feats, frac_grid, device, n_random=5, rng=None)
     contrib = get_tile_contributions(model, feats)
     pred_idx = int(torch.argmax(contrib["probabilities"]).item())
     baseline_prob = float(contrib["probabilities"][pred_idx].item())
-    importance = contrib["attention"].numpy()
+
+    if rank_by == "attention":
+        importance = contrib["attention"].numpy()
+    elif rank_by == "contribution_score":
+        contribution_score = contrib["contribution_score"].numpy()
+        # contribution_score > 0 supports class 1 (non-healthy); for a slide
+        # predicted class 0 (healthy), flip the sign so "importance" always
+        # means "supports the predicted class", matching how ROISelector picks
+        # disease_score_col vs healthy_score_col per arm.
+        importance = contribution_score if pred_idx == 1 else -contribution_score
+    else:
+        raise ValueError(f"Unknown rank_by='{rank_by}'; expected 'attention' or 'contribution_score'.")
 
     order = np.argsort(-importance)  # descending: most important tile first
 
@@ -1495,11 +1555,14 @@ def run_deletion_curve_evaluation(
     random_state=42,
     frac_grid=None,
     n_random=5,
-    seed=0
+    seed=0,
+    rank_by="attention",
 ):
     """
     Run out-of-fold deletion curves across an entire dataset, reusing an
     existing K-fold checkpoint set.
+
+    rank_by: "attention" (raw salience faithfulness) or "contribution_score".
     """
     if frac_grid is None:
         frac_grid = np.linspace(0.0, 1.0, 11)  # 0%, 10%, ..., 100%
@@ -1541,7 +1604,7 @@ def run_deletion_curve_evaluation(
 
             # Compute targeted-vs-random deletion curves for this slide
             result = _slide_deletion_curve(
-                model, feats, frac_grid, device, n_random=n_random, rng=rng,
+                model, feats, frac_grid, device, n_random=n_random, rng=rng, rank_by=rank_by,
             )
 
             for frac, imp_prob, rand_prob in zip(frac_grid, result["importance_curve"], result["random_curve"]):
@@ -1550,6 +1613,7 @@ def run_deletion_curve_evaluation(
                     "fold": fold_num,
                     "true_label": row[label_col],
                     "pred_idx": result["pred_idx"],
+                    "rank_by": rank_by,
                     "baseline_prob": result["baseline_prob"], # original class probability before deletion
                     "frac_deleted": frac, # fraction of tiles removed at this step
                     "importance_prob": imp_prob, # probability after deleting highest-importance tiles
@@ -1578,6 +1642,12 @@ def deletion_auc_summary(results_df):
         })
     audc_df = pd.DataFrame(audc_rows)
 
+    ranked_by = results_df["rank_by"].unique()
+    if len(ranked_by) == 1:
+        print(f"\nDeletion curve AUDC summary ({len(audc_df)} slides), ranked by '{ranked_by[0]}':")
+    else:
+        print(f"Deletion curve AUDC summary ({len(audc_df)} slides), ranked by {ranked_by}."
+              "Filter results_df['rank_by'] to select one method for meaningful analysis.")
     print(f"Mean AUDC (importance-guided): {audc_df['audc_importance'].mean():.4f} ± {audc_df['audc_importance'].std():.4f}")
     print(f"Mean AUDC (random baseline):   {audc_df['audc_random'].mean():.4f} ± {audc_df['audc_random'].std():.4f}")
     print(f"Mean gap (random - importance): {audc_df['audc_gap'].mean():.4f} ± {audc_df['audc_gap'].std():.4f}")
