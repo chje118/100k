@@ -27,7 +27,7 @@ class ROISelector:
       `min_attention_pct` drops the bottom fraction of tiles by attention
       from BOTH arms first (to exclude background/blur/ink).
     """
-    def __init__(self, cache_path: str, slide_path: str, disease_k: int = 20, healthy_k: int = 10, sample_pct: float = 0.20, random_state: int | None = 42, disease_score_col: str = "contribution_score", healthy_score_col: str = "contrast_score", attention_floor: float = 0.05):
+    def __init__(self, cache_path: str, slide_path: str, disease_k: int = 20, healthy_k: int = 10, sample_pct: float = 0.20, random_state: int | None = 42, disease_score_col: str = "contribution_score", healthy_score_col: str = "contrast_score", attention_floor: float = 0.05, min_effect_size: float = 0.0):
         self.cache_path = cache_path
         self.slide_path = slide_path
         self.disease_k = disease_k
@@ -37,6 +37,7 @@ class ROISelector:
         self.healthy_score_col = healthy_score_col
         self.disease_score_col = disease_score_col
         self.attention_floor = attention_floor
+        self.min_effect_size = min_effect_size
         self.slide_cache = self.load_cache(cache_path)
         self.slide_data = self.get_slide_data()
 
@@ -92,15 +93,14 @@ class ROISelector:
 
         pool_n = self._get_pool_size(n_tiles, self.sample_pct)
 
-        # Disease arm = top positive contribution_score, with contribution > 0 
+        # Disease arm = top positive contribution_score, above the effect-size floor
         ranked_desc = tile_table.sort_values(self.disease_score_col, ascending=False)
-        ranked_desc = ranked_desc[ranked_desc[self.disease_score_col] > 0].copy()
+        ranked_desc = ranked_desc[ranked_desc[self.disease_score_col] > self.min_effect_size].copy()
 
-        # Control arm = most negative contrast_score, with contrast < 0 (healthy-like tissue)
+        # Control arm = most negative contrast_score, below -effect-size floor (healthy-like tissue)
         ranked_asc = tile_table.sort_values(self.healthy_score_col, ascending=True)
-        ranked_asc = ranked_asc[ranked_asc[self.healthy_score_col] < 0].copy()
-        # TODO: Remove tiles with  abs(contrast_score)  below a minimum effect threshold        
-
+        ranked_asc = ranked_asc[ranked_asc[self.healthy_score_col] < -self.min_effect_size].copy()
+        
         disease_pool = ranked_desc.head(pool_n).copy()
         healthy_pool = ranked_asc.head(pool_n).copy()
 
