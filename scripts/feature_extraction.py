@@ -133,7 +133,10 @@ class ExtractFeatures:
         """Generate tissue tiles and optionally filter out artifact-overlapping tiles."""
         try:
             if self.TILE_KEY not in self.wsi.shapes:
-                zs.pp.tile_tissues(self.wsi, tile_px=self.tile_px, mpp = self.mpp, key_added=self.TILE_KEY, tissue_key=self.TISSUE_KEY)
+                if self.mpp == 0.12:
+                    zs.pp.tile_tissues(self.wsi, tile_px=self.tile_px, key_added=self.TILE_KEY, tissue_key=self.TISSUE_KEY)
+                else:
+                    zs.pp.tile_tissues(self.wsi, tile_px=self.tile_px, mpp = self.mpp, key_added=self.TILE_KEY, tissue_key=self.TISSUE_KEY)
                 
             if self.remove_artifacts:
                 self._remove_artifact_tiles()
