@@ -31,7 +31,7 @@ class ROISelector:
     - 'min_effect_size' is a threshold on the contribution_score or 
       contrast_score to exclude tiles that are too close to neutral (0.0).
     """
-    def __init__(self, cache_path: str, slide_path: str, disease_k: int = 20, healthy_k: int = 10, sample_pct: float = 0.20, random_state: int | None = 42, disease_score_col: str = "contribution_score", healthy_score_col: str = "contrast_score", attention_floor: float = 0.05, min_effect_size: float = 0.0, strict_topk: bool = False):
+    def __init__(self, cache_path: str, slide_path: str, disease_k: int = 20, healthy_k: int = 10, sample_pct: float = 0.20, random_state: int | None = 42, disease_score_col: str = "contribution_score", healthy_score_col: str = "contrast_score", attention_floor: float = 0.05, min_effect_size: float = 0.0, strict_topk: bool = False, min_spatial_distance: float | None = None):
         self.cache_path = cache_path
         self.slide_path = slide_path
         self.disease_k = disease_k
@@ -43,6 +43,7 @@ class ROISelector:
         self.attention_floor = attention_floor
         self.min_effect_size = min_effect_size
         self.strict_topk = strict_topk
+        self.min_spatial_distance = min_spatial_distance
         self.slide_cache = self.load_cache(cache_path)
         self.slide_data = self._slide_data()
 
@@ -61,6 +62,23 @@ class ROISelector:
         if slide_data is None:
             raise KeyError(f"No cached data found for slide: {self.slide_path}")
         return slide_data
+
+    @staticmethod
+    def _default_min_spatial_distance(pool):
+        """
+        Default minimum center-to-center spacing between randomly sampled
+        tiles, if min_spatial_distance isn't set explicitly:
+        1.5x one tile's own width, so two selected tiles can't default to
+        being immediately adjacent. Falls back to 0.0 (no constraint) if
+        geometry is missing or degenerate.
+        """
+        if len(pool) == 0:
+            return 0.0
+        minx, miny, maxx, maxy = pool.geometry.iloc[0].bounds
+        tile_width = maxx - minx
+        if not np.isfinite(tile_width) or tile_width <= 0:
+            return 0.0
+        return 1.5 * tile_width
 
     def select_tiles(self):
         """
@@ -149,10 +167,59 @@ class ROISelector:
         sample_n = min(k, len(pool))
 
         if self.strict_topk:
+            print(f"[{self.slide_path}] {arm} arm: strict_topk=True, selecting top-{sample_n} tiles without spatial diversity constraint.")
             return pool.head(sample_n).copy()
 
-        return pool.sample(n=sample_n, random_state=self.random_state, replace=False).copy()
+        min_distance = self.min_spatial_distance
+        if min_distance is None:
+            min_distance = self._default_min_spatial_distance(pool)
+        print(f"[{self.slide_path}] {arm} arm: selecting up to {sample_n} tiles with min_spatial_distance={min_distance:.2f}.")
+        
+        return self._sample_with_min_distance(pool, sample_n, min_distance)
 
+    def _sample_with_min_distance(self, pool, k, min_distance):
+        """
+        Randomly draw up to k tiles from `pool` such that every pair of drawn
+        tiles has centroid distance >= min_distance, so a "diverse" random draw
+        can't still land entirely within one contiguous patch of tissue.
+        Greedy: shuffle the pool, then accept a tile only if it clears
+        min_distance from every tile already accepted. If fewer than k tiles
+        can be accepted under the constraint, returns as many as fit.
+        """
+        pool = pool.copy()
+        if not isinstance(pool, gpd.GeoDataFrame):
+            pool = gpd.GeoDataFrame(pool, geometry="geometry")
+
+        centroids = pool.geometry.centroid
+        coords = np.column_stack([centroids.x.to_numpy(), centroids.y.to_numpy()])
+
+        rng = np.random.RandomState(self.random_state)
+        shuffled_order = rng.permutation(len(pool))
+
+        accepted_idx = []
+        accepted_coords = []
+        for i in shuffled_order:
+            if len(accepted_idx) >= k:
+                break
+            xy = coords[i]
+            if accepted_coords:
+                dists = np.linalg.norm(np.array(accepted_coords) - xy, axis=1)
+                if dists.min() < min_distance:
+                    continue
+            accepted_idx.append(i)
+            accepted_coords.append(xy)
+
+        if len(accepted_idx) < k:
+            warnings.warn(
+                f"[{self.slide_path}] Spatial-diversity sampling with min_spatial_distance="
+                f"{min_distance} could only place {len(accepted_idx)}/{k} tiles without "
+                "violating the minimum-distance constraint from this pool. Consider a "
+                "smaller min_spatial_distance or a larger sample_pct.",
+                stacklevel=3,
+            )
+
+        return pool.iloc[accepted_idx].copy()
+    
     def _sort_tiles_tsp(self, tiles_gdf):
         """Sort tiles by greedy nearest-neighbor from top-left corner."""
         if len(tiles_gdf) <= 1:
