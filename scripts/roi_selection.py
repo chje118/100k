@@ -31,7 +31,7 @@ class ROISelector:
     - 'min_effect_size' is a threshold on the contribution_score or 
       contrast_score to exclude tiles that are too close to neutral (0.0).
     """
-    def __init__(self, cache_path: str, slide_path: str, disease_k: int = 20, healthy_k: int = 10, sample_pct: float = 0.20, random_state: int | None = 42, disease_score_col: str = "contribution_score", healthy_score_col: str = "contrast_score", attention_floor: float = 0.05, min_effect_size: float = 0.0):
+    def __init__(self, cache_path: str, slide_path: str, disease_k: int = 20, healthy_k: int = 10, sample_pct: float = 0.20, random_state: int | None = 42, disease_score_col: str = "contribution_score", healthy_score_col: str = "contrast_score", attention_floor: float = 0.05, min_effect_size: float = 0.0, strict_topk: bool = False):
         self.cache_path = cache_path
         self.slide_path = slide_path
         self.disease_k = disease_k
@@ -42,6 +42,7 @@ class ROISelector:
         self.disease_score_col = disease_score_col
         self.attention_floor = attention_floor
         self.min_effect_size = min_effect_size
+        self.strict_topk = strict_topk
         self.slide_cache = self.load_cache(cache_path)
         self.slide_data = self._slide_data()
 
@@ -132,7 +133,7 @@ class ROISelector:
         """
         if len(pool) == 0:
             warnings.warn(
-                f"[{self.slide_path}] {arm} arm: candidate pool is EMPTY after effect-size/"
+                f"[{self.slide_path}] {arm} arm: candidate pool is EMPTY after score/effect-size/"
                 f"attention-floor filtering. 0/{k} tiles selected for this arm on this slide.",
                 stacklevel=3,
             )
@@ -146,6 +147,10 @@ class ROISelector:
             )
 
         sample_n = min(k, len(pool))
+
+        if self.strict_topk:
+            return pool.head(sample_n).copy()
+
         return pool.sample(n=sample_n, random_state=self.random_state, replace=False).copy()
 
     def _sort_tiles_tsp(self, tiles_gdf):
