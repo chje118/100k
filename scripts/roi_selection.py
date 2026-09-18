@@ -37,6 +37,13 @@ class ROISelector:
         self.disease_k = disease_k
         self.healthy_k = healthy_k
         self.sample_pct = sample_pct
+        if random_state is None:
+            warnings.warn(
+                f"ROISelector for {slide_path!r} created with random_state=None: "
+                "tile selection within each candidate pool will NOT be reproducible "
+                "across runs. Pass a fixed int unless non-determinism is intentional.",
+                stacklevel=2,
+            )
         self.random_state = random_state
         self.healthy_score_col = healthy_score_col
         self.disease_score_col = disease_score_col
@@ -174,7 +181,7 @@ class ROISelector:
         if min_distance is None:
             min_distance = self._default_min_spatial_distance(pool)
         print(f"[{self.slide_path}] {arm} arm: selecting up to {sample_n} tiles with min_spatial_distance={min_distance:.2f}.")
-        
+
         return self._sample_with_min_distance(pool, sample_n, min_distance)
 
     def _sample_with_min_distance(self, pool, k, min_distance):
