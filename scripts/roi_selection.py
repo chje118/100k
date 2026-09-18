@@ -23,9 +23,9 @@ class ROISelector:
       read as healthy", independent of whether the model happened to need
       it for this particular slide's verdict. 
       
-      `min_attention_pct`: tiles in the bottom `min_attention_pct` of
-      attention are dropped from BOTH pools before ranking, so 
-      background/blur/ink won't be picked.
+      Note this independence is only within the attention-floored pool:
+      `min_attention_pct` drops the bottom fraction of tiles by attention
+      from BOTH arms first (to exclude background/blur/ink).
     """
     def __init__(self, cache_path: str, slide_path: str, disease_k: int = 20, healthy_k: int = 10, sample_pct: float = 0.20, random_state: int | None = 42, disease_score_col: str = "contribution_score", healthy_score_col: str = "contrast_score", attention_floor: float = 0.05):
         self.cache_path = cache_path
