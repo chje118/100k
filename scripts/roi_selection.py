@@ -13,13 +13,13 @@ import os
 class ROISelector:
     """ Handle ROI selection from cached ABMIL inference results.
 
-    - Disease arm: ranked by `top_score_col` ("contribution_score"
+    - Disease arm: ranked by `disease_score_col` ("contribution_score"
       = attention * contrast_score). This is the EXACT per-tile
       contribution to the model's class logit.
       It answers "what tissue actually drove the non-healthy call" - the
       tiles you want as diagnostic evidence for DVP.
 
-    - Healthy arm: ranked by `bottom_score_col` ("contrast_score",
+    - Healthy arm: ranked by `healthy_score_col` ("contrast_score",
       NOT attention-weighted). This answers "does this tile's own tissue
       read as healthy", independent of whether the model happened to need
       it for this particular slide's verdict. 
@@ -81,7 +81,7 @@ class ROISelector:
         """
         if len(pool) == 0:
             return 0.0
-        minx, miny, maxx, maxy = pool.geometry.iloc[0].bounds
+        minx, miny, maxx, maxy = pool["geometry"].iloc[0].bounds
         tile_width = maxx - minx
         if not np.isfinite(tile_width) or tile_width <= 0:
             return 0.0
