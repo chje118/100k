@@ -1,3 +1,4 @@
+import json
 import os
 import pickle
 import torch
@@ -899,6 +900,12 @@ class KFoldPipeline:
                 print(f"Using existing checkpoint for fold {fold_num}: {checkpoint_path}")
                 model, _, _ = load_checkpoint(checkpoint_path)
 
+                # Load the test slide assignment for this fold
+                fold_assignment_path = os.path.join(checkpoint_dir, f"fold_{fold_num}_test_slides.json")
+                if not os.path.exists(fold_assignment_path):
+                    with open(fold_assignment_path, "w") as f:
+                        json.dump(test_df[self.filename_col].tolist(), f)
+
                 all_labels, all_preds, all_probs, fold_auc, fold_accuracy = self._evaluate_fold(model, test_dataset)
 
                 fold_auc_scores.append(fold_auc)
@@ -952,6 +959,11 @@ class KFoldPipeline:
             os.makedirs(checkpoint_dir, exist_ok=True)
             checkpoint_path = os.path.join(checkpoint_dir, f"fold_{fold_num}_auc_{fold_auc:.4f}.pt")
             save_checkpoint(model, config, label_mapping, checkpoint_path)
+
+            # Persist which slides this fold held out
+            fold_assignment_path = os.path.join(checkpoint_dir, f"fold_{fold_num}_test_slides.json")
+            with open(fold_assignment_path, "w") as f:
+                json.dump(test_df["slide_path"].tolist(), f)
 
         # Compute mean and std across folds
         results_dict = {
@@ -1577,15 +1589,24 @@ def run_deletion_curve_evaluation(
             f"run_deletion_curve_evaluation currently supports binary classification only, but found {df2[label_col].nunique()} classes."
         )
 
-    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     rng = np.random.RandomState(seed)
-
     rows = []
 
-    # Iterate over the CV folds, only using held-out indices for evaluation
-    for fold_idx, (_, test_idx) in enumerate(sgkf.split(df2, df2[label_col], groups=df2[patient_col])): 
-        fold_num = fold_idx + 1
-        test_df = df2.iloc[test_idx].reset_index(drop=True)
+    # Iterate over folds using the actual held-out slide lists saved during training
+    for fold_num in range(1, n_splits + 1):
+        fold_assignment_path = os.path.join(checkpoint_dir, f"fold_{fold_num}_test_slides.json")
+        with open(fold_assignment_path) as f:
+            test_slides = set(json.load(f))
+
+        test_df = df2[df2[filename_col].isin(test_slides)].reset_index(drop=True)
+
+        if len(test_df) != len(test_slides):
+            raise ValueError(
+                f"Fold {fold_num}: expected {len(test_slides)} held-out slides "
+                f"(from {fold_assignment_path}), found {len(test_df)} in the "
+                f"supplied df. Check you're passing the same slide set used "
+                f"for KFoldPipeline training."
+            )
 
         checkpoint_path = _find_fold_checkpoint(checkpoint_dir, fold_num)
         model, config, _ = load_checkpoint(checkpoint_path)
