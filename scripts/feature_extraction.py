@@ -149,11 +149,11 @@ class ExtractFeatures:
 
     def extract_features(self):
         """ Extract tile embeddings for the foundation model. """
+        if self.FEATURE_KEY in self.wsi.shapes:
+            print(f"Features already extracted: {self.FEATURE_KEY}")
+            return self.wsi
+        
         try:
-            if self.FEATURE_KEY in self.wsi.shapes:
-                print(f"Features already extracted: {self.FEATURE_KEY}")
-                return    
-
             if self.FEATURE_KEY not in self.wsi.tables:
                 if self.foundation_model == "conch":
                     start_time = datetime.now()
