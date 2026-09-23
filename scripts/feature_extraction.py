@@ -202,7 +202,7 @@ class ExtractFeatures:
 # --------------------
 
 class ExtractMany:
-    """Batch feature extraction with pickle caching and error recovery."""
+    """Batch feature extraction with optional pickle caching and error recovery."""
 
     def __init__(
         self,
@@ -217,9 +217,11 @@ class ExtractMany:
         feature_num_workers=None,
         feature_autocast_dtype=None,
         retry_on_previous_errors=False,
+        use_cache=True,
     ):
         self.wsi_paths = wsi_paths
         self.cache_path = cache_path
+        self.use_cache = use_cache
         self.zarr_dir = zarr_dir
         self.foundation_model = foundation_model
         self.mpp = mpp
@@ -229,10 +231,16 @@ class ExtractMany:
         self.feature_num_workers = feature_num_workers
         self.feature_autocast_dtype = feature_autocast_dtype
         self.retry_on_previous_errors = retry_on_previous_errors
-        
-        # Load cache and track processed slides
-        self.cache = _load_cache(cache_path)
-        self.processed = _get_processed_entries(self.cache)
+
+        # Load cache and track processed slides only when caching is enabled.
+        if self.use_cache:
+            if not self.cache_path:
+                raise ValueError("cache_path is required when use_cache=True")
+            self.cache = _load_cache(cache_path)
+            self.processed = _get_processed_entries(self.cache)
+        else:
+            self.cache = {}
+            self.processed = {}
         
         self.extract_features()
 
@@ -252,7 +260,7 @@ class ExtractMany:
             # Check if already processed
             fm_key = f"{self.foundation_model}_mpp{self.mpp}" if self.mpp != 0.12 else self.foundation_model
             cache_key = (slide_name, "features", fm_key)
-            if cache_key in self.processed:
+            if self.use_cache and cache_key in self.processed:
                 status = self.processed[cache_key].get("status")
                 if status == "complete":
                     print(f"Skipping {slide_name} — already processed")
@@ -306,10 +314,12 @@ class ExtractMany:
                 **feature_summary,
                 "status": status,
             }
-            _store_processed_entry(self.cache, slide_name, "features", fm_key, slide_data)
-            _save_cache(self.cache, self.cache_path)
-            
-            print(f"Saved result for {slide_name} → {self.cache_path}")
+            if self.use_cache:
+                _store_processed_entry(self.cache, slide_name, "features", fm_key, slide_data)
+                _save_cache(self.cache, self.cache_path)
+                print(f"Saved result for {slide_name} → {self.cache_path}")
+            else:
+                print(f"Completed {slide_name} with caching disabled")
             gc.collect()
         
         print(f"\nExtraction complete. Skipped {skipped} already-processed slides.")
@@ -324,4 +334,10 @@ if __name__ == "__main__":
     cache_file = "path/to/cache.pkl"
     zarr_dir = "path/to/zarr/dir"
 
-    extractor = ExtractMany(all_slides, cache_file, zarr_dir=zarr_dir, foundation_model="h-optimus-0")
+    extractor = ExtractMany(
+        all_slides,
+        cache_file,
+        zarr_dir=zarr_dir,
+        foundation_model="h-optimus-0",
+        use_cache=True,
+    )
