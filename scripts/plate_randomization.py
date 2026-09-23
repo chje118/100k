@@ -115,3 +115,9 @@ def summarize_plate_composition(plate_assignment: pd.DataFrame, group_col: str) 
     return plate_assignment.groupby(["plate", group_col]).size().unstack(fill_value=0)
 
 
+def get_rekvnr_in_plate(plate_assignment: pd.DataFrame, id_col: str, plate_number: int):
+    print(f"Patients on plate {plate_number}:")
+    plate_df = plate_assignment[plate_assignment["plate"] == plate_number]
+    plate_df = plate_df.sample(frac=1, random_state=42).reset_index(drop=True)
+    for _, row in plate_df.iterrows():
+        print(f"  {row[id_col]}")
