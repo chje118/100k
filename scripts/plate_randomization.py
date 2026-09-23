@@ -14,9 +14,9 @@ What it does:
   comparison (the primary analysis).
 
 Usage as a library:
-    from plate_randomization import PlateConfig, build_acquisition_plan
-    plan = build_acquisition_plan(patients_df, id_col="patient_id",
-                                   group_col="subtype", config=PlateConfig())
+    from plate_randomization import PlateConfig, stratified_plate_assignment, summarize_plate_composition
+        assigned_df = stratified_plate_assignment(patients_df, id_col="patient_id", group_col="subtype", config=PlateConfig())
+        print(summarize_plate_composition(assigned_df, group_col="subtype"))
 """
 
 from __future__ import annotations
