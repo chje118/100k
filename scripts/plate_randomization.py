@@ -89,7 +89,7 @@ def stratified_plate_assignment(patients_df: pd.DataFrame, id_col: str, group_co
     # Rebalance any plates that are over capacity
     _rebalance_overflow(df, config, rng)
 
-    return df.sort_values(["plate", group_col, id_col]).reset_index(drop=True)
+    return df.sort_values(["plate"]).reset_index(drop=True)
 
 
 def _rebalance_overflow(df: pd.DataFrame, config: PlateConfig, rng: np.random.Generator) -> None:
@@ -115,3 +115,28 @@ def summarize_plate_composition(plate_assignment: pd.DataFrame, group_col: str) 
     return plate_assignment.groupby(["plate", group_col]).size().unstack(fill_value=0)
 
 
+def get_rekvnr_on_plate(plate_assignment: pd.DataFrame, id_col: str, plate_number: int):
+    print(f"Patients on plate {plate_number}:")
+    plate_df = plate_assignment[plate_assignment["plate"] == plate_number]
+    plate_df = plate_df.sample(frac=1, random_state=42).reset_index(drop=True)
+    for _, row in plate_df.iterrows():
+        print(f"  {row[id_col]}")
+
+def prepare_blinded_plate_assignment(patients_df: pd.DataFrame, id_col: str, group_col: str,
+                                 config: PlateConfig) -> pd.DataFrame:
+    # Assign patients to plates
+    assigned_df = stratified_plate_assignment(patients_df, id_col=id_col, group_col=group_col, config=config)
+
+    # Keep only id and plate columns (blinded to group)
+    cols_to_keep = [id_col, "plate"]
+    blinded_df = assigned_df[cols_to_keep]
+
+    # Prepare table with one row per tile (disease + healthy) for each patient
+    blinded_df = pd.DataFrame(np.repeat(blinded_df.values, config.tiles_per_patient, axis=0), columns=blinded_df.columns)
+    blinded_df = blinded_df.reset_index(drop=True)
+    blinded_df["tile_group"] = np.tile(["healthy"] * config.healthy_tiles + ["disease"] * config.disease_tiles, len(blinded_df) // config.tiles_per_patient)
+
+    # Add empty col for well assignment
+    blinded_df["well"] = ""
+
+    return blinded_df
