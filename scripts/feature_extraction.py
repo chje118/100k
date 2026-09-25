@@ -47,7 +47,7 @@ _configure_h100()
 # --------------------
 
 class ExtractFeatures:
-    """Extract tile embeddings and aggregate slide-level features for a single WSI."""
+    """Extract tile embeddings and optionally aggregate slide-level features for a single WSI."""
 
     TISSUE_CANDIDATES = ["tissue_default", "tissue_grandqc", "tissue_threshold"]
 
@@ -59,6 +59,7 @@ class ExtractFeatures:
         mpp=0.12,
         tile_px=224,
         remove_artifacts=False,
+        aggregate_features=False,
         feature_batch_size=512,
         feature_num_workers=None,
         feature_autocast_dtype=None,
@@ -71,6 +72,7 @@ class ExtractFeatures:
         self.mpp = mpp
         self.tile_px = tile_px
         self.remove_artifacts = remove_artifacts
+        self.aggregate_features_enabled = aggregate_features
 
         cpu_count = os.cpu_count() or 8
         self.feature_batch_size = feature_batch_size
@@ -109,7 +111,7 @@ class ExtractFeatures:
         self.wsi.shapes[self.TILE_KEY] = tiles.drop(index=overlapping.index.unique())
 
     def process_slide(self):
-        """Run validation, tiling, feature extraction, and aggregation."""
+        """Run validation, tiling, feature extraction, and optional aggregation."""
         try:
             self.TISSUE_KEY = self._get_tissue_key()
 
@@ -121,7 +123,8 @@ class ExtractFeatures:
                     raise RuntimeError("No tiles generated")
     
             self.extract_features()
-            self.aggregate_features()
+            if self.aggregate_features_enabled:
+                self.aggregate_features()
             
             print(f"Processing complete for {self.wsi.path}")
             return 
@@ -217,6 +220,7 @@ class ExtractMany:
         mpp=0.12,
         tile_px=224, 
         remove_artifacts=False,
+        aggregate_features=False,
         feature_batch_size=512,
         feature_num_workers=None,
         feature_autocast_dtype=None,
@@ -231,6 +235,7 @@ class ExtractMany:
         self.mpp = mpp
         self.tile_px = tile_px 
         self.remove_artifacts = remove_artifacts
+        self.aggregate_features = aggregate_features
         self.feature_batch_size = feature_batch_size
         self.feature_num_workers = feature_num_workers
         self.feature_autocast_dtype = feature_autocast_dtype
@@ -286,6 +291,7 @@ class ExtractMany:
                     mpp=self.mpp,
                     tile_px=self.tile_px, 
                     remove_artifacts=self.remove_artifacts,
+                    aggregate_features=self.aggregate_features,
                     feature_batch_size=self.feature_batch_size,
                     feature_num_workers=self.feature_num_workers,
                     feature_autocast_dtype=self.feature_autocast_dtype,
@@ -343,5 +349,6 @@ if __name__ == "__main__":
         cache_file,
         zarr_dir=zarr_dir,
         foundation_model="h-optimus-0",
+        aggregate_features=False,
         use_cache=True,
     )
