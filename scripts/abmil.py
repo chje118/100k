@@ -963,7 +963,7 @@ class KFoldPipeline:
             # Persist which slides this fold held out
             fold_assignment_path = os.path.join(checkpoint_dir, f"fold_{fold_num}_test_slides.json")
             with open(fold_assignment_path, "w") as f:
-                json.dump(test_df["slide_path"].tolist(), f)
+                json.dump(test_df[self.filename_col].tolist(), f)
 
         # Compute mean and std across folds
         results_dict = {
