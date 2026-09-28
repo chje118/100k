@@ -702,6 +702,8 @@ class TrainABMILPipeline:
         """Retrain on all valid slides for best_epoch epochs and save the checkpoint."""
         if self.best_epoch is None and n_epochs is None:
             raise ValueError("best_epoch is not set. Run train_abmil() first.")
+        else: 
+            print(f"Retraining on all valid slides for {self.best_epoch if n_epochs is None else n_epochs} epochs.")
 
         train_kwargs = getattr(self, "_train_kwargs", dict(dropout=0.1, weight_decay=1e-4))
 
