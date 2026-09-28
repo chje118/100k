@@ -599,7 +599,7 @@ class TrainABMILPipeline:
     Train ABMIL with validation, then retrain on all valid slides for the
     best epoch count and save checkpoint.
     """
-    def __init__(self, df, filename_col, label_col, patient_col, feature_key, tile_key, zarr_dir, save_path):
+    def __init__(self, df, filename_col, label_col, patient_col, feature_key, tile_key, zarr_dir, save_path, tissue_col=None):
         self.df = df.copy()
         self.filename_col = filename_col
         self.label_col = label_col
@@ -608,6 +608,7 @@ class TrainABMILPipeline:
         self.tile_key = tile_key
         self.zarr_dir = zarr_dir
         self.save_path = save_path
+        self.tissue_col = tissue_col
         self.label_mapping = create_label_mapping(self.df, self.label_col)
         self.device = require_cuda()
 
@@ -646,6 +647,18 @@ class TrainABMILPipeline:
         self.df = self.df.iloc[valid_indices].reset_index(drop=True)
 
         print(f"Validation complete: {len(self.df)} valid slides (removed {len_before - len(self.df)})")
+        
+        # Overview of validated slides
+        if self.tissue_col:
+            overview = (
+                self.df.groupby([self.tissue_col, self.label_col])
+                .agg(n_slides=(self.patient_col, "size"), n_patients=(self.patient_col, pd.Series.nunique),)
+                .reset_index()
+                .sort_values([self.tissue_col, self.label_col])
+            )
+            print("\nSlide overview after validation:")
+            print(overview.to_string(index=False))
+            
         return self.df
 
     def train_abmil(self, max_tiles=50000, n_epochs=100, seed=42, validation_fraction=0.10,
