@@ -650,12 +650,7 @@ class TrainABMILPipeline:
         
         # Overview of validated slides
         if self.tissue_col:
-            overview = (
-                self.df.groupby([self.tissue_col, self.label_col])
-                .agg(n_slides=(self.patient_col, "size"), n_patients=(self.patient_col, pd.Series.nunique),)
-                .reset_index()
-                .sort_values([self.tissue_col, self.label_col])
-            )
+            overview = self.df.groupby([self.tissue_col, self.label_col]).agg(n_slides=(self.patient_col, "size"), n_patients=(self.patient_col, pd.Series.nunique)).reset_index()
             print("\nSlide overview after validation:")
             print(overview.to_string(index=False))
             
