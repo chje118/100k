@@ -115,12 +115,41 @@ def summarize_plate_composition(plate_assignment: pd.DataFrame, group_col: str) 
     return plate_assignment.groupby(["plate", group_col]).size().unstack(fill_value=0)
 
 
-def get_rekvnr_on_plate(plate_assignment: pd.DataFrame, id_col: str, plate_number: int):
+def _format_microscopy_nr(patient_id: object) -> str:
+    digits = "".join(ch for ch in str(patient_id) if ch.isdigit())
+    if len(digits) != 8:
+        raise ValueError(f"Expected an 8-digit patient ID, got {patient_id!r}")
+    return f"{digits[:2]}-{digits[2:]}"
+
+
+def load_microscopy_table_mapping(excel_path: str, microscopy_col: str = "Microscopy number", table_id_col: str = "Table Id") -> pd.DataFrame:
+    """Load microscopy number -> table ID mapping from Excel."""
+    mapping = pd.read_excel(excel_path, usecols=[microscopy_col, table_id_col], dtype=str)
+    mapping = mapping.rename(columns={microscopy_col: "microscopy_nr", table_id_col: "table_id"})
+    mapping["microscopy_nr"] = mapping["microscopy_nr"].astype(str).str.strip()
+    mapping["table_id"] = mapping["table_id"].astype(str).str.strip()
+    return mapping.drop_duplicates(subset=["microscopy_nr"]).reset_index(drop=True)
+
+
+def get_rekvnr_on_plate(plate_assignment: pd.DataFrame, id_col: str, plate_number: int, microscopy_mapping: pd.DataFrame):
+    mapping_lookup = {}
+    if microscopy_mapping is not None:
+        mapping_lookup = dict(zip(microscopy_mapping["microscopy_nr"], microscopy_mapping["table_id"]))
+
+    print(f"Plate: {plate_number}, Patients:", plate_assignment.loc[plate_assignment["plate"] == plate_number, id_col].nunique(), "Tiles:", len(plate_assignment.loc[plate_assignment["plate"] == plate_number]),"\n")
     print(f"Patients on plate {plate_number}:")
-    plate_df = plate_assignment[plate_assignment["plate"] == plate_number]
+    plate_df = plate_assignment.drop_duplicates(subset=[id_col])
+    plate_df = plate_df[plate_df["plate"] == plate_number]
     plate_df = plate_df.sample(frac=1, random_state=42).reset_index(drop=True)
-    for _, row in plate_df.iterrows():
-        print(f"  {row[id_col]}")
+    for n, (_, row) in enumerate(plate_df.iterrows(), start=1):
+        microscopy_nr = _format_microscopy_nr(row[id_col])
+        table_id = mapping_lookup.get(microscopy_nr, "")
+        if table_id:
+            print(f"  {row[id_col]}  -  {microscopy_nr}  -  {table_id}")
+        else:
+            print(f"  {row[id_col]}  -  {microscopy_nr}")
+        if n % 12 == 0 and n < len(plate_df):
+            print("-" * 40)
 
 def prepare_blinded_plate_assignment(patients_df: pd.DataFrame, id_col: str, group_col: str,
                                  config: PlateConfig) -> pd.DataFrame:
