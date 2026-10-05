@@ -140,18 +140,18 @@ def get_rekvnr_on_plate(plate_assignment: pd.DataFrame, id_col: str, plate_numbe
     print(f"Patients on plate {plate_number}:")
     plate_df = plate_assignment.drop_duplicates(subset=[id_col])
     plate_df = plate_df[plate_df["plate"] == plate_number]
-    if "table_id" in plate_df.columns:
-        plate_df = plate_df.sort_values("table_id")
-    else:
-        plate_df = plate_df.sort_values(id_col)
+    plate_df = plate_df.copy()
+    plate_df["microscopy_nr"] = plate_df[id_col].apply(_format_microscopy_nr)
+    plate_df["table_id"] = plate_df["microscopy_nr"].map(mapping_lookup).fillna("")
+    plate_df = plate_df.sort_values(["table_id", id_col])
     for n, (_, row) in enumerate(plate_df.iterrows(), start=1):
-        microscopy_nr = _format_microscopy_nr(row[id_col])
-        table_id = mapping_lookup.get(microscopy_nr, "")
+        microscopy_nr = row["microscopy_nr"]
+        table_id = row["table_id"]
         if table_id:
             print(f"  {row[id_col]}  -  {microscopy_nr}  -  {table_id}")
         else:
             print(f"  {row[id_col]}  -  {microscopy_nr}")
-        if n % 12 == 0 and n < len(plate_df):
+        if n % 5 == 0 and n < len(plate_df):
             print("-" * 40)
 
 def prepare_blinded_plate_assignment(patients_df: pd.DataFrame, id_col: str, group_col: str,
