@@ -140,7 +140,10 @@ def get_rekvnr_on_plate(plate_assignment: pd.DataFrame, id_col: str, plate_numbe
     print(f"Patients on plate {plate_number}:")
     plate_df = plate_assignment.drop_duplicates(subset=[id_col])
     plate_df = plate_df[plate_df["plate"] == plate_number]
-    plate_df = plate_df.sample(frac=1, random_state=42).reset_index(drop=True)
+    if "table_id" in plate_df.columns:
+        plate_df = plate_df.sort_values("table_id")
+    else:
+        plate_df = plate_df.sort_values(id_col)
     for n, (_, row) in enumerate(plate_df.iterrows(), start=1):
         microscopy_nr = _format_microscopy_nr(row[id_col])
         table_id = mapping_lookup.get(microscopy_nr, "")
