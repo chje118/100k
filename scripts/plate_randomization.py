@@ -21,6 +21,7 @@ Usage as a library:
 
 from __future__ import annotations
 from dataclasses import dataclass
+import os
 import numpy as np
 import pandas as pd
 
@@ -188,22 +189,28 @@ def get_rekvnr_on_plate(plate_assignment: pd.DataFrame, id_col: str, plate_numbe
     return plate_df
 
 
+# --------------------------------------------------------------------------
+# Plate layout (384-well, outer wells excluded)
+# --------------------------------------------------------------------------
 
-def prepare_blinded_plate_assignment(patients_df: pd.DataFrame, id_col: str, group_col: str,
-                                 config: PlateConfig) -> pd.DataFrame:
-    # Assign patients to plates
-    assigned_df = stratified_plate_assignment(patients_df, id_col=id_col, group_col=group_col, config=config)
+PLATE_ROWS = "ABCDEFGHIJKLMNOP"   # 16 rows
+PLATE_COLS = 24
 
-    # Keep only id and plate columns (blinded to group)
-    cols_to_keep = [id_col, "plate"]
-    blinded_df = assigned_df[cols_to_keep]
 
-    # Prepare table with one row per tile (disease + healthy) for each patient
-    blinded_df = pd.DataFrame(np.repeat(blinded_df.values, config.tiles_per_patient, axis=0), columns=blinded_df.columns)
-    blinded_df = blinded_df.reset_index(drop=True)
-    blinded_df["tile_group"] = np.tile(["healthy"] * config.healthy_tiles + ["disease"] * config.disease_tiles, len(blinded_df) // config.tiles_per_patient)
+def inner_wells_384() -> list[str]:
+    """Wells B2..O23 in row-major order (308 wells; rows A/P and columns 1/24 excluded)."""
+    return [f"{r}{c}" for r in PLATE_ROWS[1:-1] for c in range(2, PLATE_COLS)]
 
-    # Add empty col for well assignment
-    blinded_df["well"] = ""
-
-    return blinded_df
+def well_quadrant(well: str) -> str:
+    """
+    384 -> 4x96 quadrant (follows the interleaved pattern):
+      Q1: rows A,C,E,... x odd columns    Q2: rows A,C,E,... x even columns
+      Q3: rows B,D,F,... x odd columns    Q4: rows B,D,F,... x even columns
+    """
+    row_idx = PLATE_ROWS.index(well[0])          # A=0
+    col = int(well[1:])
+    odd_row_letter = row_idx % 2 == 0            # A, C, E, ...
+    odd_col = col % 2 == 1
+    if odd_row_letter:
+        return "Q1" if odd_col else "Q2"
+    return "Q3" if odd_col else "Q4"
