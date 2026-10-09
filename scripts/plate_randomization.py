@@ -131,28 +131,63 @@ def load_microscopy_table_mapping(excel_path: str, microscopy_col: str = "Micros
     return mapping.drop_duplicates(subset=["microscopy_nr"]).reset_index(drop=True)
 
 
-def get_rekvnr_on_plate(plate_assignment: pd.DataFrame, id_col: str, plate_number: int, microscopy_mapping: pd.DataFrame):
-    mapping_lookup = {}
-    if microscopy_mapping is not None:
-        mapping_lookup = dict(zip(microscopy_mapping["microscopy_nr"], microscopy_mapping["table_id"]))
+# --------------------------------------------------------------------------
+# Box helpers (slides are stored 25 per box: PR86_0001-0025 = box 1, ...)
+# --------------------------------------------------------------------------
 
-    print(f"Plate: {plate_number}, Patients:", plate_assignment.loc[plate_assignment["plate"] == plate_number, id_col].nunique(), "Tiles:", len(plate_assignment.loc[plate_assignment["plate"] == plate_number]),"\n")
-    print(f"Patients on plate {plate_number}:")
-    plate_df = plate_assignment.drop_duplicates(subset=[id_col])
-    plate_df = plate_df[plate_df["plate"] == plate_number]
-    plate_df = plate_df.copy()
-    plate_df["microscopy_nr"] = plate_df[id_col].apply(_format_microscopy_nr)
-    plate_df["table_id"] = plate_df["microscopy_nr"].map(mapping_lookup).fillna("")
-    plate_df = plate_df.sort_values(["table_id", id_col])
-    for n, (_, row) in enumerate(plate_df.iterrows(), start=1):
-        microscopy_nr = row["microscopy_nr"]
-        table_id = row["table_id"]
-        if table_id:
-            print(f"  {row[id_col]}  -  {microscopy_nr}  -  {table_id}")
-        else:
-            print(f"  {row[id_col]}  -  {microscopy_nr}")
-        if n % 5 == 0 and n < len(plate_df):
-            print("-" * 40)
+SLIDES_PER_BOX = 25
+
+def _table_id_number(table_id: object) -> int | None:
+    """'PR86_0027' -> 27. Returns None if there is no trailing number."""
+    table_id_string = str(table_id).strip()
+    if not table_id_string or table_id_string.lower() == "nan":
+        return None
+    tail = table_id_string.rsplit("_", 1)[-1]
+    return int(tail) if tail.isdigit() else None
+
+def _box_of(table_id: object, slides_per_box: int = SLIDES_PER_BOX) -> int | None:
+    """Given a table_id like 'PR86_0027', return the box number (1-indexed)."""
+    table_id = _table_id_number(table_id)
+    return None if table_id is None else (table_id - 1) // slides_per_box + 1
+
+def _plate_patients(plate_assignment: pd.DataFrame, id_col: str, plate_number: int,
+                    microscopy_mapping: pd.DataFrame | None) -> pd.DataFrame:
+    """One row per patient on `plate_number`, with microscopy_nr / table_id / box, sorted by table_id."""
+    lookup = {}
+    if microscopy_mapping is not None:
+        lookup = dict(zip(microscopy_mapping["microscopy_nr"], microscopy_mapping["table_id"]))
+
+    df = plate_assignment[plate_assignment["plate"] == plate_number].drop_duplicates(subset=[id_col]).copy()
+    df["microscopy_nr"] = df[id_col].apply(_format_microscopy_nr)
+    df["table_id"] = df["microscopy_nr"].map(lookup).fillna("")
+    df["box"] = df["table_id"].apply(_box_of).astype("Int64")
+    df["_table_num"] = df["table_id"].apply(_table_id_number)
+    # Patients without a table_id go last
+    df = df.sort_values(["_table_num", id_col], na_position="last").drop(columns="_table_num")
+    return df.reset_index(drop=True)
+
+def get_rekvnr_on_plate(plate_assignment: pd.DataFrame, id_col: str, plate_number: int,
+                        microscopy_mapping: pd.DataFrame | None = None) -> pd.DataFrame:
+    """
+    Print the slides to pull for one plate, grouped by storage box
+    (25 slides per box, from the table_id number), so you can pull one box at a time.
+    Returns the per-patient table as well.
+    """
+    plate_df = _plate_patients(plate_assignment, id_col, plate_number, microscopy_mapping)
+    n_tiles = int((plate_assignment["plate"] == plate_number).sum())
+    print(f"Plate: {plate_number}, Patients: {len(plate_df)}, Rows in assignment: {n_tiles}\n")
+
+    for box, box_df in plate_df.groupby("box", dropna=False, sort=False):
+        header = f"Box {box}" if pd.notna(box) else "No table_id (box unknown)"
+        print(f"{header}  ({len(box_df)} slides)")
+        for _, row in box_df.iterrows():
+            tid = f"  -  {row['table_id']}" if row["table_id"] else ""
+            print(f"  {row[id_col]}  -  {row['microscopy_nr']}{tid}")
+        print("-" * 40)
+
+    return plate_df
+
+
 
 def prepare_blinded_plate_assignment(patients_df: pd.DataFrame, id_col: str, group_col: str,
                                  config: PlateConfig) -> pd.DataFrame:
