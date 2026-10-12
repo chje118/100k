@@ -9,19 +9,20 @@ What it does:
   so plate-level batch effects cancel in the paired within-patient
   comparison (the primary analysis).
 - Per plate: a box-by-box slide list to pull, then a metadata CSV with one
-  row per well (= one LMD cut = one MS sample), which ROISelector fills in
-  as each slide's ROIs are written to LMD XML.
+  row per well (= one LMD cut = one MS sample). ROISelector fills in the
+  ROI columns via record_rois() when it writes each slide's LMD XML.
 
 Usage:
-    planner = PlatePlanner(patients_df, id_col="patient_id", group_col="subtype",
-                           mapping_excel="mapping.xlsx", metadata_dir="meta")
+    cfg = PlateConfig(disease_tiles=5, healthy_tiles=5)
+    planner = PlatePlanner(patients_df, project_id="DVP1", project_dir="meta",
+                           config=cfg, mapping_excel="mapping.xlsx")
     planner.summarize()
-    planner.get_rekvnr_on_plate(1)          # 1) pull + scan the slides
-    planner.prepare_well_assignment(1)      # 2) prepare the well assignment, ROI/MS columns empty
-
-    # TO BE IMPLEMENTED
-    sel.write_to_lmd(planner=planner)       # 3) per slide: fills its rows, then writes XML
-   """
+    planner.get_rekvnr_on_plate(plate_id=1)          1) pull + scan the slides
+    planner.prepare_well_assignment(plate_id=1)      2) well assignment, ROI/MS columns empty
+    
+    3) per slide: 
+    ROISelector(...).write_lmd_and_metadata(planner.well_assignment_path(plate_id=1), patient_id)
+"""
 
 from __future__ import annotations
 from dataclasses import dataclass
@@ -56,9 +57,10 @@ SLIDES_PER_BOX = 25
 PLATE_ROWS = "ABCDEFGHIJKLMNOP"   # 16 rows
 PLATE_COLS = 24
 
-ROI_COLUMNS = ["slide_path", "tile_id", "attention", "contribution_score", 
-               "contrast_score", "lmd_xml"]
-LATER_COLUMNS = ["evotip", "injection_order", "notes"]
+ARMS = ("healthy", "disease")
+SCORE_COLUMNS = ["attention", "contribution_score", "contrast_score"]
+# lmd_shape_index = position of the tile in its arm's LMD XML (0-based, = cut order)
+ROI_COLUMNS = ["slide_path", "lmd_xml", "lmd_shape_index", "tile_id", "notes"] + SCORE_COLUMNS   
 _TEXT_COLUMNS = ["patient_id", "table_id", "slide_path", "tile_id", "lmd_xml", "notes"]
 
 def _format_microscopy_nr(patient_id: object) -> str:
@@ -106,9 +108,86 @@ def load_microscopy_table_mapping(excel_path: str, microscopy_col: str = "Micros
     return mapping.drop_duplicates(subset=["microscopy_nr"]).reset_index(drop=True)
 
 def load_well_assignment(path: str) -> pd.DataFrame:
-    # Text columns as object so IDs keep leading zeros and empty columns accept strings
-    return pd.read_csv(path, dtype={c: "object" for c in _TEXT_COLUMNS})
+    # Text columns as object so IDs keep leading zeros and empty columns accept strings;
+    # Shape index as nullable int so it stays an integer while some wells are empty.
+    dtypes = {c: "object" for c in _TEXT_COLUMNS}
+    dtypes["lmd_shape_index"] = "Int64"
+    return pd.read_csv(path, dtype=dtypes)
 
+def _write_csv_atomic(df: pd.DataFrame, path: str) -> None:
+    """Write to a temp file then rename, so a crash never leaves a half-written plate CSV."""
+    tmp = f"{path}.tmp"
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, path)
+
+# --------------------------------------------------------------------------
+# Filling ROI columns (called by ROISelector after writing the LMD XML)
+# --------------------------------------------------------------------------
+
+def record_rois(well_assignment_path: str, patient_id: object, arm: str, tiles: pd.DataFrame,
+                slide_path: str, lmd_xml: str | None, overwrite: bool = False) -> pd.DataFrame:
+    """
+    Write one arm's selected tiles into that patient's wells, in XML order.
+
+    `tiles` must be the exact (Geo)DataFrame passed to the LMD XML, in the same
+    row order: row k -> lmd_shape_index k -> the patient's k-th well for this arm.
+
+    - Raises if the patient/arm has no wells on this plate, if there are more
+      tiles than wells, or if the wells are already filled (unless overwrite=True).
+    - Fewer tiles than wells: the extra wells stay empty and get a note.
+    """
+    if arm not in ARMS:
+        raise ValueError(f"arm must be one of {ARMS}, got {arm!r}")
+
+    # Read the plate CSV fresh from disk every call (build on the latest state)
+    df = load_well_assignment(well_assignment_path)
+
+    # Get rows for this patient/arm
+    pid = str(patient_id)
+    rows = df.index[(df["patient_id"] == pid) & (df["arm"] == arm)]
+    n_wells, n_tiles = len(rows), len(tiles)
+
+    # No wells means this patient isn't on this plate: most likely the wrong plate CSV passed
+    if n_wells == 0:
+        raise KeyError(f"Patient {pid!r} has no {arm} wells in {well_assignment_path} - wrong plate?")
+
+    # More tiles than wells (usually caused by ROISelector disease_k/healthy_k != PlateConfig)
+    if n_tiles > n_wells:
+        raise ValueError(
+            f"Patient {pid!r} {arm}: {n_tiles} tiles selected but only {n_wells} wells. "
+            "Set ROISelector disease_k/healthy_k to PlateConfig disease_tiles/healthy_tiles."
+        )
+
+    # Wells already have a tile_id: this slide was recorded and possibly cut before
+    if not overwrite and df.loc[rows, "tile_id"].notna().any():
+        raise ValueError(
+            f"Patient {pid!r} {arm} wells are already filled in {well_assignment_path}. "
+            "Pass overwrite=True to replace (make sure the old XML is replaced too)."
+        )
+
+    # Clear previous ROI values (matters on overwrite))
+    df.loc[rows, ROI_COLUMNS] = np.nan  # Blank all ROI columns for these wells
+
+    # Fill wells, one tile per well, in XML order
+    used = rows[:n_tiles]
+    tile_ids = tiles.index
+    df.loc[used, "slide_path"] = slide_path            # which slide the cut came from
+    df.loc[used, "lmd_xml"] = lmd_xml                  # which XML file holds the shape
+    df.loc[used, "lmd_shape_index"] = np.arange(n_tiles)  # position of the shape in that XML (0-based)
+    df.loc[used, "tile_id"] = [str(t) for t in tile_ids]  # as text, e.g. so IDs keep leading zeros
+
+    # Copy ABMIL scores (attention, contribution_score, contrast_score)
+    for col in SCORE_COLUMNS: 
+        df.loc[used, col] = tiles[col].to_numpy() if col in tiles.columns else np.nan
+
+    # Fewer tiles than wells (small pool, spacing constraint, ...)
+    if n_tiles < n_wells:
+        df.loc[rows[n_tiles:], "notes"] = f"no tile: only {n_tiles}/{n_wells} {arm} tiles selected"
+
+    _write_csv_atomic(df, well_assignment_path)
+    print(f"Recorded {n_tiles}/{n_wells} {arm} tiles for patient {pid} -> {well_assignment_path}")
+
+    return df.loc[rows]
 
 # --------------------------------------------------------------------------
 # PlatePlanner
@@ -121,15 +200,18 @@ class PlatePlanner:
     so re-creating the planner with the same inputs gives the same plates.
     """
     def __init__(self, patients_df: pd.DataFrame, project_id: str, project_dir: str, 
-                 id_col: str = "patient_id", group_col: str = "subtype", config: PlateConfig | None = None,
-                 mapping_excel: str | None = None, microscopy_mapping: pd.DataFrame | None = None):
-        
+                 id_col: str = "rekvnr", group_col: str = "diagnose", filename_col: str = "filename",
+                 config: PlateConfig | None = None, mapping_excel: str | None = None, 
+                 microscopy_mapping: pd.DataFrame | None = None):
+         
         self.project_id = project_id
         self.project_dir = project_dir
         self.id_col = id_col
         self.group_col = group_col
+        self.filename_col = filename_col
         self.config = config or PlateConfig()
-        
+
+        # Load microscopy number -> table ID mapping from Excel if not provided
         if microscopy_mapping is None and mapping_excel is not None:
             microscopy_mapping = load_microscopy_table_mapping(mapping_excel)
         self.mapping = microscopy_mapping
@@ -246,7 +328,7 @@ class PlatePlanner:
         healthy_tiles healthy rows then disease_tiles disease rows, in
         consecutive inner wells from B2. 
         
-        ROI and MS columns are left empty.
+        ROI and MS columns are left empty (ROI columns are filled by record_rois).
         """
         cfg = self.config
         path = self.well_assignment_path(plate_number)
@@ -271,10 +353,10 @@ class PlatePlanner:
         df.insert(2, "quadrant", [well_quadrant(w) for w in wells])
         df.insert(0, "run_id", [f"P{plate_number}_{well_quadrant(w)}_{w}" for w in wells])
 
-        for col in ROI_COLUMNS + LATER_COLUMNS:
+        for col in ROI_COLUMNS:
             df[col] = np.nan
 
         os.makedirs(self.project_dir, exist_ok=True)
-        df.to_csv(path, index=False)
+        _write_csv_atomic(df, path)
         print(f"Wrote {len(df)} rows ({len(patients)} patients) for plate {plate_number} -> {path}")
         return df
