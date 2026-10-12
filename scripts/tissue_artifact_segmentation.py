@@ -104,6 +104,29 @@ def is_empty_array(arr) -> bool:
     except Exception:
         return len(arr) == 0
 
+def get_failed_slides(cache_file, slide_paths=None, categories=("tissue", "features")) -> pd.DataFrame:
+    """
+    List slides from slide_paths whose tissue detection or feature extraction failed.
+
+    cache_file:  one cache path.
+    slide_paths: optional list of slide paths or file names; only these slides are
+                 returned (matched by file name, so directories don't need to agree).
+    categories:  which steps to include ("tissue", "artifact", "features").
+    """
+    names = {os.path.basename(p): p for p in slide_paths}
+    entries = _get_processed_entries(_load_cache(cache_file))
+
+    rows = [
+        {"slide_path": names[slide], "step": category, "model": model,
+         "error": str(data.get("status"))[len("error:"):].strip()}
+        for (slide, category, model), data in entries.items()
+        if slide in names
+        and category in ("tissue", "features")
+        and str(data.get("status", "")).startswith("error:")
+    ]
+    return pd.DataFrame(rows, columns=["slide_path", "step", "model", "error"])
+
+
 # --------------------
 # Tissue Segmentation
 # --------------------
