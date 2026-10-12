@@ -10,6 +10,8 @@ from spatialdata.models import PointsModel, ShapesModel
 from dvpio.write import write_lmd
 import os
 
+from plate_randomization import record_rois, load_well_assignment
+
 class ROISelector:
     """ Handle ROI selection from cached ABMIL inference results.
 
@@ -30,8 +32,11 @@ class ROISelector:
 
     - 'min_effect_size' is a threshold on the contribution_score or 
       contrast_score to exclude tiles that are too close to neutral (0.0).
+
+    - The selection is computed once and cached, so plots, LMD XML and the
+      well assignment CSV all use the same tiles in the same order.
     """
-    def __init__(self, cache_path: str, slide_path: str, disease_k: int = 20, healthy_k: int = 10, sample_pct: float = 0.20, random_state: int | None = 42, disease_score_col: str = "contribution_score", healthy_score_col: str = "contrast_score", attention_floor: float = 0.05, min_effect_size: float = 0.0, strict_topk: bool = False, min_spatial_distance: float | None = None):
+    def __init__(self, cache_path: str, slide_path: str, disease_k: int = 5, healthy_k: int = 5, sample_pct: float = 0.20, random_state: int | None = 42, disease_score_col: str = "contribution_score", healthy_score_col: str = "contrast_score", attention_floor: float = 0.05, min_effect_size: float = 0.0, strict_topk: bool = False, min_spatial_distance: float | None = None):
         self.cache_path = cache_path
         self.slide_path = slide_path
         self.disease_k = disease_k
@@ -53,6 +58,7 @@ class ROISelector:
         self.min_spatial_distance = min_spatial_distance
         self.slide_cache = self.load_cache(cache_path)
         self.slide_data = self._slide_data()
+        self._selection = None
 
     @staticmethod
     def load_cache(input_path: str):
@@ -87,7 +93,13 @@ class ROISelector:
             return 0.0
         return 1.5 * tile_width
 
-    def select_tiles(self):
+    def select_tiles(self, refresh: bool = False):
+        """Return (disease_tiles, healthy_tiles). Computed once and cached; refresh=True redraws."""
+        if self._selection is None or refresh:
+            self._selection = self._compute_tiles()
+        return self._selection
+
+    def _compute_tiles(self):
         """
         Return  healthy_k and disease_k tiles sampled at random from top 
         sample_pct% by `self.disease_score_col` (disease arm) and bottom
@@ -364,7 +376,7 @@ class ROISelector:
         return self.wsi
     
     def get_sdata_lmd(self):
-        self.sdata = self.wsi.to_spatialdata()
+        self.sdata = self.get_wsi().to_spatialdata()
         disease_gdf, healthy_gdf = self.select_tiles()
         self.sdata.shapes["disease_tiles"] = ShapesModel.parse(disease_gdf)
         self.sdata.shapes["healthy_tiles"] = ShapesModel.parse(healthy_gdf)
@@ -452,7 +464,9 @@ class ROISelector:
 
     def write_to_lmd(self):
         slide_name = os.path.splitext(os.path.basename(self.slide_path))[0]
+        paths = {}
         try:
+            os.makedirs(os.path.join(self.lmd_dir, slide_name), exist_ok=True)
             for tiles in ["disease", "healthy"]:
                 path_lmd = os.path.join(self.lmd_dir, slide_name, f'{slide_name}_{tiles}.xml')
                 
@@ -473,6 +487,46 @@ class ROISelector:
                     affine_transformation=affine_transformation
                 )
                 print(f"Wrote LMD file for {tiles} tiles: {path_lmd}")
+                paths[tiles] = path_lmd
 
         except Exception as e:
-            print(f"Error writing LMD files: {e}")
+            raise RuntimeError(f"Error writing LMD files: {e}") from e
+
+        return paths
+
+    def patient_id_from_plate(self, well_assignment_path: str) -> str:
+        """
+        Find which patient on this plate the slide belongs to: the one whose
+        patient_id (or microscopy_nr) appears in the slide filename.
+        Raises if none match (slide not on this plate) or several match.
+        """
+        slide_name = os.path.splitext(os.path.basename(self.slide_path))[0]
+        patients = load_well_assignment(well_assignment_path)[["patient_id", "microscopy_nr"]].drop_duplicates()
+
+        matches = [
+            row.patient_id for row in patients.itertuples()
+            if str(row.patient_id) in slide_name or str(row.microscopy_nr) in slide_name
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"{slide_name!r}: expected 1 matching patient in {well_assignment_path}, "
+                f"found {len(matches)} {matches} - slide not on this plate?"
+            )
+        return matches[0]
+
+    def write_lmd_and_metadata(self, well_assignment_path: str, overwrite: bool = False):
+        """
+        Write LMD XMLs, then record the same tiles (same order) in the plate's
+        well assignment CSV: shape k in the XML -> the patient's k-th well for that arm.
+        The patient is inferred from the slide filename.
+        """
+        patient_id = self.patient_id_from_plate(well_assignment_path) 
+
+        self.add_calibration_points()
+        paths = self.write_to_lmd()
+
+        disease_tiles, healthy_tiles = self.select_tiles()
+        for arm, tiles in [("disease", disease_tiles), ("healthy", healthy_tiles)]:
+            record_rois(well_assignment_path, patient_id, arm, tiles,
+                        slide_path=self.slide_path, lmd_xml=paths[arm], overwrite=overwrite)
+        return paths
