@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import pandas as pd
+import hashlib
 from contextlib import nullcontext
 from torch.utils.data import Dataset, DataLoader
 from wsidata import open_wsi
@@ -206,13 +207,13 @@ def get_tile_contributions(model: ABMIL, feats: torch.Tensor):
     probabilities = torch.softmax(logits, dim=0)
 
     return {
-        "logits": logits.cpu(),
-        "probabilities": probabilities.cpu(),
-        "attention": attention.cpu(),
-        "healthy_score": healthy_score.cpu(),
-        "disease_score": disease_score.cpu(),
-        "contrast_score": contrast_score.cpu(),
-        "contribution_score": contribution_score.cpu(),
+        "logits": logits.float().cpu(),
+        "probabilities": probabilities.float().cpu(),
+        "attention": attention.float().cpu(),
+        "healthy_score": healthy_score.float().cpu(),
+        "disease_score": disease_score.float().cpu(),
+        "contrast_score": contrast_score.float().cpu(),
+        "contribution_score": contribution_score.float().cpu(),
     }
 
 # ----------------------------------------
@@ -282,6 +283,14 @@ def autocast_context():
     if not torch.cuda.is_available():
         return nullcontext()
     return torch.autocast(device_type="cuda", dtype=get_amp_dtype())
+
+def file_sha256(path):
+    """SHA-256 of a file, used to tie cached results to the exact checkpoint."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 def save_checkpoint(model, config, label_mapping, path):
     """Save model checkpoint with configuration and label mapping."""
@@ -483,9 +492,8 @@ def validate_ABMIL(model, val_dataset):
             if feats.shape[0] == 0:
                 continue
 
-            # Forward pass with mixed precision for speed and memory efficiency
-            with autocast_context():
-                logits = model(feats)["logits"]
+            # Forward pass in fp32: reported metrics and early stopping use exact probabilities
+            logits = model(feats)["logits"]
 
             # Compute predicted class and probabilities
             probs = torch.softmax(logits.float(), dim=0).cpu().numpy()
@@ -1019,11 +1027,14 @@ class ABMILInference:
         self._slide_cache = {}
         self._skipped_slides = []
 
-        # Load cached inference results if available
+        # Load cached inference results only if produced by this exact checkpoint
+        self.checkpoint_sha256 = file_sha256(self.checkpoint_path)
         if self.cache_path and os.path.exists(self.cache_path):
             loaded_cache = self.load_cache(self.cache_path)
-            if isinstance(loaded_cache, dict):
-                self._slide_cache = loaded_cache
+            if isinstance(loaded_cache, dict) and loaded_cache.get("checkpoint_sha256") == self.checkpoint_sha256:
+                self._slide_cache = loaded_cache["slide_cache"]
+            else:
+                print(f"Ignoring cache {self.cache_path}: not produced by this checkpoint. Slides will be re-inferred.")
 
         # Load the trained model
         self.model, self.config, self.label_mapping = load_checkpoint(self.checkpoint_path)
@@ -1041,7 +1052,7 @@ class ABMILInference:
         tmp_path = f"{self.cache_path}.tmp"
 
         with open(tmp_path, "wb") as f:
-            pickle.dump(self._slide_cache, f)
+            pickle.dump({"checkpoint_sha256": self.checkpoint_sha256, "slide_cache": self._slide_cache}, f)
 
         os.replace(tmp_path, self.cache_path)
         return self._slide_cache
@@ -1074,9 +1085,9 @@ class ABMILInference:
 
         feats = feats.to(self.device, non_blocking=True)
 
+        # fp32 (no autocast): tile scores are used for ROI ranking and must be exact
         with torch.no_grad():
-            with autocast_context():
-                contrib = get_tile_contributions(self.model, feats)
+            contrib = get_tile_contributions(self.model, feats)
 
         probs = contrib["probabilities"].numpy()
         pred_idx = int(np.argmax(probs))
@@ -1534,9 +1545,8 @@ def _slide_deletion_curve(model, feats, frac_grid, device, n_random=5, rng=None,
         if len(keep_idx) == 0:
             return np.nan
         sub_feats = feats[keep_idx]
-        with autocast_context():
-            out = model(sub_feats)
-        probs = torch.softmax(out["logits"], dim=0)
+        out = model(sub_feats)  # fp32, same precision as baseline_prob
+        probs = torch.softmax(out["logits"].float(), dim=0)
         return float(probs[pred_idx].item())
 
     importance_curve = []
