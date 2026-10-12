@@ -351,7 +351,7 @@ class PlatePlanner:
         df.insert(0, "plate", plate_number)
         df.insert(1, "well", wells)
         df.insert(2, "quadrant", [well_quadrant(w) for w in wells])
-        df.insert(0, "run_id", [f"P{plate_number}_{well_quadrant(w)}_{w}" for w in wells])
+        df.insert(0, "run_id", [f"{self.project_id}_P{plate_number}_{well_quadrant(w)}_{w}" for w in wells])
 
         for col in ROI_COLUMNS:
             df[col] = np.nan
