@@ -318,7 +318,8 @@ class PlatePlanner:
     # --------------------------------------------------------------------------
 
     def well_assignment_path(self, plate_number: int) -> str:
-        return os.path.join(self.project_dir, f"{self.project_id}_well_assignment_P{plate_number}.csv")
+        plate_dir = os.path.join(self.project_dir, f"P{plate_number}")
+        return os.path.join(plate_dir, f"{self.project_id}_well_assignment_P{plate_number}.csv")
 
     def prepare_well_assignment(self, plate_number: int) -> pd.DataFrame:
         """
@@ -356,7 +357,7 @@ class PlatePlanner:
         for col in ROI_COLUMNS:
             df[col] = np.nan
 
-        os.makedirs(self.project_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         _write_csv_atomic(df, path)
         print(f"Wrote {len(df)} rows ({len(patients)} patients) for plate {plate_number} -> {path}")
         return df
