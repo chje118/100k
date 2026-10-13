@@ -435,12 +435,81 @@ class ROISelector:
 
         return polygons_disease, polygons_healthy
 
-    def set_paths(self, annotations_path: str, lmd_dir: str):
-        self.annotations_path = annotations_path
-        self.lmd_dir = lmd_dir
-        os.makedirs(self.lmd_dir, exist_ok=True)
-        print(f"Set annotations path: {self.annotations_path}")
-        print(f"Set LMD directory: {self.lmd_dir}")
+    @property
+    def slide_name(self) -> str:
+        return os.path.splitext(os.path.basename(self.slide_path))[0]
+
+    def set_paths(self, annotations_path: str | None, lmd_dir: str | None,
+                  screenshot_dir: str | None = None,
+                  tile_inspection_dir: str | None = None):
+        
+        if annotations_path is not None:
+            self.annotations_path = annotations_path
+            print(f"Set annotations path: {self.annotations_path}")
+        if lmd_dir is not None:
+            self.lmd_dir = lmd_dir
+            print(f"Set LMD directory: {self.lmd_dir}")
+        if screenshot_dir is not None:
+            self.screenshot_dir = screenshot_dir
+            print(f"Set screenshot directory: {self.screenshot_dir}")
+        if tile_inspection_dir is not None:
+            self.tile_inspection_dir = tile_inspection_dir
+            print(f"Set tile inspection directory: {self.tile_inspection_dir}")
+
+    def paths_from_plate(self, plate_dir: str) -> dict:
+        """
+        Generate (and set) all per-slide output locations under `plate_dir`:
+            <plate_dir>/lmd/
+            <plate_dir>/annotations/<slide>_annotations.json
+            <plate_dir>/calibration_points/<slide>/
+            <plate_dir>/tile_inspection/<slide>/
+        """
+        slide_name = self.slide_name
+        paths = {
+            "lmd_dir": os.path.join(plate_dir, "lmd"),
+            "annotations_path": os.path.join(plate_dir, "annotations", f"{slide_name}_annotations.json"),
+            "screenshot_dir": os.path.join(plate_dir, "calibration_points", slide_name),
+            "tile_inspection_dir": os.path.join(plate_dir, "tile_inspection", slide_name),
+        }
+        os.makedirs(os.path.dirname(paths["annotations_path"]), exist_ok=True)
+        self.set_paths(**paths)
+        return paths
+
+    def launch_calibration_viewer(self, plate_dir: str | None = None, **viewer_kwargs):
+        """
+        Open the calibration viewer for this slide with the selected tiles
+        (disease = top/red, healthy = bottom/blue). If `plate_dir` is given,
+        all output paths are generated with paths_from_plate(); otherwise
+        the paths from a previous set_paths()/paths_from_plate() call are used.
+        Tile inspection images are written on Save & close.
+        Extra kwargs go to interactive_viewer.launch_calibration_viewer.
+        Returns (viewer, url).
+        """
+        from interactive_viewer import launch_calibration_viewer
+
+        if plate_dir is not None:
+            self.paths_from_plate(plate_dir)
+        if not hasattr(self, "annotations_path"):
+            raise AttributeError("Paths not set. Pass plate_dir or call paths_from_plate() first.")
+
+        disease_polys, healthy_polys = self.viewer_polygons()
+
+        kwargs = dict(
+            save_json=self.annotations_path,
+            polygon_input_order="xy",
+        )
+        if getattr(self, "screenshot_dir", None):
+            kwargs["screenshot_dir"] = self.screenshot_dir
+        if getattr(self, "tile_inspection_dir", None):
+            kwargs["tile_inspection_dir"] = self.tile_inspection_dir
+        kwargs.update(viewer_kwargs)
+
+        return launch_calibration_viewer(
+            slide_path=self.slide_data["slide_path"],
+            top_polygons=disease_polys,
+            bottom_polygons=healthy_polys,
+            **kwargs,
+        )
 
     def _open_annotations(self):
         if not hasattr(self, "annotations_path"):
