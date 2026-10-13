@@ -1,4 +1,5 @@
 from wsidata import open_wsi
+import pandas as pd
 import lazyslide as zs
 import os
 from tqdm import tqdm
