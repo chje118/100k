@@ -1,5 +1,6 @@
 import base64
 import json
+import math
 import socket
 import threading
 import time
@@ -20,6 +21,7 @@ from flask import (
     send_from_directory,
 )
 from openslide.deepzoom import DeepZoomGenerator
+from PIL import Image, ImageDraw, ImageFont
 from werkzeug.serving import make_server
 
 
@@ -1083,7 +1085,27 @@ class NotebookWSIViewer:
         port: Optional[int] = None,
         strict: bool = True,
         internet: bool = True,
+        tile_inspection: bool = True,
+        tile_inspection_dir: str = "tile_inspection",
+        overview_max_px: Optional[int] = None,
+        tile_max_px: Optional[int] = None,
     ):
+        self.tile_inspection = bool(tile_inspection)
+
+        self.tile_inspection_dir = str(
+            Path(tile_inspection_dir)
+            .expanduser()
+            .resolve()
+        )
+
+        # None = infer from tile size (see generate_tile_inspection)
+        self.overview_max_px = (
+            int(overview_max_px) if overview_max_px is not None else None
+        )
+        self.tile_max_px = (
+            int(tile_max_px) if tile_max_px is not None else None
+        )
+
         self.slide_path = str(
             Path(slide_path)
             .expanduser()
@@ -1338,6 +1360,336 @@ class NotebookWSIViewer:
 
         return normalized
 
+    # ------------------------------------------------------------------
+    # Tile inspection images (rendered server-side from the slide itself)
+    # ------------------------------------------------------------------
+    # Auto-sizing for tile inspection images (used when *_max_px is None)
+    AUTO_OVERVIEW_PX_PER_TILE = 64
+    AUTO_OVERVIEW_MIN = 1024
+    AUTO_OVERVIEW_MAX = 8192
+    AUTO_TILE_CAP = 4096
+
+    _TILE_COLORS = {
+        "top": (255, 45, 45),
+        "bottom": (45, 108, 255),
+    }
+
+    def _tile_list(self) -> List[Dict]:
+        """One entry per polygon (top first, then bottom) with its bbox."""
+        tiles: List[Dict] = []
+
+        for group, polys in (
+            ("top", self.top_polygons),
+            ("bottom", self.bottom_polygons),
+        ):
+            for i, poly in enumerate(polys, start=1):
+                arr = np.asarray(poly, dtype=float)
+                x0, y0 = arr.min(axis=0)
+                x1, y1 = arr.max(axis=0)
+
+                tiles.append(
+                    {
+                        "id": f"{group}_{i:02d}",
+                        "group": group,
+                        "polygon": poly,
+                        "bbox": [
+                            float(x0), float(y0),
+                            float(x1), float(y1),
+                        ],
+                    }
+                )
+
+        return tiles
+
+    @staticmethod
+    def _font(size: int):
+        size = max(10, int(size))
+        for name in ("DejaVuSans-Bold.ttf", "Arial Bold.ttf", "arialbd.ttf"):
+            try:
+                return ImageFont.truetype(name, size)
+            except (OSError, IOError):
+                continue
+        try:
+            return ImageFont.load_default(size=size)  # Pillow >= 10.1
+        except TypeError:
+            return ImageFont.load_default()
+
+    def _read_region_scaled(
+        self,
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+        max_px: int,
+    ) -> Tuple[Image.Image, float, int, int]:
+        """
+        Render the level-0 box [x0, x1) x [y0, y1) so that its longest side
+        is at most `max_px` pixels. Never upsamples beyond level-0
+        resolution. Anything outside the slide is filled white, so a tile
+        near the slide edge still ends up centred.
+
+        Reads in chunks, so even a huge overview on a slide without a
+        pyramid stays within memory.
+
+        Returns (image, downsample, int_x0, int_y0).
+        """
+        ix0, iy0 = int(math.floor(x0)), int(math.floor(y0))
+        ix1, iy1 = int(math.ceil(x1)), int(math.ceil(y1))
+        w0, h0 = ix1 - ix0, iy1 - iy0
+
+        ds = max(1.0, max(w0, h0) / float(max_px))
+        out_w = max(1, int(round(w0 / ds)))
+        out_h = max(1, int(round(h0 / ds)))
+
+        out = Image.new("RGB", (out_w, out_h), "white")
+
+        # Only read the part that actually lies on the slide.
+        sw, sh = self.slide_dimensions
+        rx0, ry0 = max(ix0, 0), max(iy0, 0)
+        rx1, ry1 = min(ix1, sw), min(iy1, sh)
+        if rx1 <= rx0 or ry1 <= ry0:
+            return out, ds, ix0, iy0
+
+        level = self.slide.get_best_level_for_downsample(ds)
+        lds = float(self.slide.level_downsamples[level])
+
+        chunk0 = max(1, int(4096 * lds))  # chunk edge in level-0 px
+
+        yy = ry0
+        while yy < ry1:
+            ch = min(chunk0, ry1 - yy)
+            xx = rx0
+            while xx < rx1:
+                cw = min(chunk0, rx1 - xx)
+
+                rw = max(1, int(math.ceil(cw / lds)))
+                rh = max(1, int(math.ceil(ch / lds)))
+
+                region = self.slide.read_region(
+                    (int(xx), int(yy)), level, (rw, rh)
+                ).convert("RGBA")
+
+                rgb = Image.new("RGB", region.size, "white")
+                rgb.paste(region, mask=region.split()[3])
+
+                px0 = int(round((xx - ix0) / ds))
+                py0 = int(round((yy - iy0) / ds))
+                px1 = int(round((xx + cw - ix0) / ds))
+                py1 = int(round((yy + ch - iy0) / ds))
+
+                if px1 > px0 and py1 > py0:
+                    out.paste(
+                        rgb.resize(
+                            (px1 - px0, py1 - py0),
+                            Image.LANCZOS,
+                        ),
+                        (px0, py0),
+                    )
+
+                xx += cw
+            yy += ch
+
+        return out, ds, ix0, iy0
+
+    def _draw_tile_overlay(
+        self,
+        img: Image.Image,
+        x0: int,
+        y0: int,
+        ds: float,
+        tiles: List[Dict],
+        highlight_id: Optional[str] = None,
+        label_all: bool = True,
+        calibration_points: Optional[List[Optional[Dict]]] = None,
+    ) -> None:
+        draw = ImageDraw.Draw(img)
+
+        scale = max(1.0, min(img.size) / 700.0)
+        base_w = max(1, int(round(1.5 * scale)))
+        font = self._font(14 * scale)
+
+        def to_px(x: float, y: float) -> Tuple[float, float]:
+            return ((x - x0) / ds, (y - y0) / ds)
+
+        for t in tiles:
+            pts = [to_px(x, y) for x, y in t["polygon"]]
+            if len(pts) < 2:
+                continue
+            if pts[0] != pts[-1]:
+                pts.append(pts[0])
+
+            is_hl = t["id"] == highlight_id
+            w = base_w * (2 if is_hl else 1)
+            color = self._TILE_COLORS[t["group"]]
+
+            draw.line(pts, fill=(0, 0, 0), width=w + 2 * base_w, joint="curve")
+            draw.line(pts, fill=color, width=w, joint="curve")
+
+            if label_all or is_hl:
+                bx0, by0 = to_px(t["bbox"][0], t["bbox"][1])
+                draw.text(
+                    (bx0, by0 - 4 * scale),
+                    t["id"],
+                    fill=color,
+                    font=font,
+                    anchor="ld",
+                    stroke_width=max(1, int(2 * scale)),
+                    stroke_fill=(0, 0, 0),
+                )
+
+        for idx, p in enumerate(calibration_points or [], start=1):
+            if not p:
+                continue
+            cx, cy = to_px(float(p["x"]), float(p["y"]))
+            r = 8 * scale
+            green = (0, 255, 102)
+            draw.ellipse(
+                [cx - r, cy - r, cx + r, cy + r],
+                outline=(0, 0, 0),
+                width=base_w + 2,
+            )
+            draw.ellipse(
+                [cx - r, cy - r, cx + r, cy + r],
+                outline=green,
+                width=base_w,
+            )
+            draw.text(
+                (cx + r + 2, cy - r - 2),
+                f"P{idx}",
+                fill=green,
+                font=font,
+                anchor="ld",
+                stroke_width=max(1, int(2 * scale)),
+                stroke_fill=(0, 0, 0),
+            )
+
+    def generate_tile_inspection(
+        self,
+        out_dir: Optional[str] = None,
+        calibration_points: Optional[List[Optional[Dict]]] = None,
+    ) -> Dict:
+        """
+        Write tile-inspection images:
+
+        - overview.png: all tiles visible, with a margin of 2 tile sizes
+          around their joint bounding box.
+        - <group>_<nn>.png (e.g. top_01.png): one per tile, the tile centred
+          with a margin of one tile size on every side (3x3 tile field of
+          view), at native (level-0) resolution.
+        - tile_inspection.json: tile ids, bboxes, rendered regions and
+          downsample factors, so pixels can be mapped back to slide coords.
+
+        Output sizes are inferred from the tile size unless set explicitly:
+        - per tile: the 3x3 field at native resolution, i.e.
+          ceil(3 * tile edge) px (capped at AUTO_TILE_CAP px for very large
+          tiles);
+        - overview: each tile drawn ~AUTO_OVERVIEW_PX_PER_TILE px wide,
+          clamped to [AUTO_OVERVIEW_MIN, AUTO_OVERVIEW_MAX] px.
+
+        Can also be called directly from the notebook, without the GUI.
+        """
+        out = Path(out_dir or self.tile_inspection_dir)
+        out.mkdir(parents=True, exist_ok=True)
+
+        tiles = self._tile_list()
+        if not tiles:
+            return {}
+
+        manifest: Dict = {
+            "slide_path": self.slide_path,
+            "slide_dimensions": list(self.slide_dimensions),
+            "mpp_x": self.slide.properties.get("openslide.mpp-x"),
+            "mpp_y": self.slide.properties.get("openslide.mpp-y"),
+            "tiles": [],
+        }
+
+        # --- overview ---------------------------------------------------
+        bboxes = np.asarray([t["bbox"] for t in tiles], dtype=float)
+        tile_w = float(np.median(bboxes[:, 2] - bboxes[:, 0]))
+        tile_h = float(np.median(bboxes[:, 3] - bboxes[:, 1]))
+
+        ox0 = bboxes[:, 0].min() - 2 * tile_w
+        oy0 = bboxes[:, 1].min() - 2 * tile_h
+        ox1 = bboxes[:, 2].max() + 2 * tile_w
+        oy1 = bboxes[:, 3].max() + 2 * tile_h
+
+        overview_px = self.overview_max_px
+        if overview_px is None:
+            tiles_across = max(
+                (ox1 - ox0) / max(tile_w, 1.0),
+                (oy1 - oy0) / max(tile_h, 1.0),
+            )
+            overview_px = int(np.clip(
+                math.ceil(tiles_across * self.AUTO_OVERVIEW_PX_PER_TILE),
+                self.AUTO_OVERVIEW_MIN,
+                self.AUTO_OVERVIEW_MAX,
+            ))
+
+        img, ds, ix0, iy0 = self._read_region_scaled(
+            ox0, oy0, ox1, oy1, overview_px
+        )
+        self._draw_tile_overlay(
+            img, ix0, iy0, ds, tiles,
+            label_all=True,
+            calibration_points=calibration_points,
+        )
+        overview_path = out / "overview.png"
+        img.save(overview_path)
+
+        manifest["overview"] = {
+            "path": str(overview_path),
+            "region_level0": [ix0, iy0, ix0 + round(img.width * ds), iy0 + round(img.height * ds)],
+            "downsample": ds,
+            "margin_tile_size": [tile_w, tile_h],
+        }
+
+        # --- one image per tile -----------------------------------------
+        for t in tiles:
+            bx0, by0, bx1, by1 = t["bbox"]
+            w, h = bx1 - bx0, by1 - by0
+            cx, cy = (bx0 + bx1) / 2.0, (by0 + by1) / 2.0
+
+            # tile + one tile size on each side = 3x the tile extent
+            rx0, ry0 = cx - 1.5 * w, cy - 1.5 * h
+            rx1, ry1 = cx + 1.5 * w, cy + 1.5 * h
+
+            tile_px = self.tile_max_px
+            if tile_px is None:
+                tile_px = min(
+                    int(math.ceil(3 * max(w, h))),
+                    self.AUTO_TILE_CAP,
+                )
+
+            img, ds, ix0, iy0 = self._read_region_scaled(
+                rx0, ry0, rx1, ry1, tile_px
+            )
+            # draw neighbours too (clipped), but highlight this tile
+            self._draw_tile_overlay(
+                img, ix0, iy0, ds, tiles,
+                highlight_id=t["id"],
+                label_all=False,
+                calibration_points=calibration_points,
+            )
+            tile_path = out / f"{t['id']}.png"
+            img.save(tile_path)
+
+            manifest["tiles"].append(
+                {
+                    "id": t["id"],
+                    "group": t["group"],
+                    "bbox_level0": t["bbox"],
+                    "path": str(tile_path),
+                    "region_level0": [ix0, iy0, ix0 + round(img.width * ds), iy0 + round(img.height * ds)],
+                    "downsample": ds,
+                }
+            )
+
+        (out / "tile_inspection.json").write_text(
+            json.dumps(manifest, indent=2)
+        )
+
+        return manifest
+
     def _setup_routes(self) -> None:
         app = self.app
         outer = self
@@ -1562,6 +1914,36 @@ class NotebookWSIViewer:
                 "saved_screenshot_paths"
             ] = saved_screens
 
+            tile_msg = ""
+            if outer.tile_inspection:
+                try:
+                    manifest = outer.generate_tile_inspection(
+                        calibration_points=data.get(
+                            "calibration_points"
+                        ),
+                    )
+                    data["tile_inspection"] = {
+                        "dir": outer.tile_inspection_dir,
+                        "overview": manifest.get(
+                            "overview", {}
+                        ).get("path"),
+                        "tiles": {
+                            t["id"]: t["path"]
+                            for t in manifest.get("tiles", [])
+                        },
+                    }
+                    tile_msg = (
+                        f" Tile inspection images "
+                        f"({len(manifest.get('tiles', []))} tiles "
+                        f"+ overview) in "
+                        f"{outer.tile_inspection_dir}."
+                    )
+                except Exception as exc:  # never lose the calibration
+                    data["tile_inspection_error"] = repr(exc)
+                    tile_msg = (
+                        f" Tile inspection failed: {exc!r}"
+                    )
+
             save_json_path.write_text(
                 json.dumps(
                     data,
@@ -1584,7 +1966,8 @@ class NotebookWSIViewer:
                         f"Saved annotations to "
                         f"{save_json_path} and "
                         f"screenshots to "
-                        f"{screenshot_dir_path}"
+                        f"{screenshot_dir_path}."
+                        f"{tile_msg}"
                 }
             )
 
@@ -1665,6 +2048,11 @@ class NotebookWSIViewer:
         )
 
         print(
+            f"tile_inspection_dir: "
+            f"{self.tile_inspection_dir if self.tile_inspection else 'disabled'}"
+        )
+
+        print(
             f"port: "
             f"{self.port}"
         )
@@ -1738,6 +2126,10 @@ def launch_calibration_viewer(
     open_browser: bool = False,
     strict: bool = True,
     internet: bool = True,
+    tile_inspection: bool = True,
+    tile_inspection_dir: str = "tile_inspection",
+    overview_max_px: Optional[int] = None,
+    tile_max_px: Optional[int] = None,
 ):
     viewer = NotebookWSIViewer(
         slide_path=slide_path,
@@ -1750,6 +2142,10 @@ def launch_calibration_viewer(
         port=port,
         strict=strict,
         internet=internet,
+        tile_inspection=tile_inspection,
+        tile_inspection_dir=tile_inspection_dir,
+        overview_max_px=overview_max_px,
+        tile_max_px=tile_max_px,
     )
 
     url = viewer.start(
