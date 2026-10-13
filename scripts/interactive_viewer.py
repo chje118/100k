@@ -1086,11 +1086,25 @@ class NotebookWSIViewer:
         strict: bool = True,
         internet: bool = True,
         tile_inspection: bool = True,
-        tile_inspection_dir: str = "tile_inspection",
+        tile_inspection_dir: Optional[str] = None,
         overview_max_px: Optional[int] = None,
         tile_max_px: Optional[int] = None,
     ):
         self.tile_inspection = bool(tile_inspection)
+
+        if tile_inspection_dir is None:
+            # Follow the plate layout:
+            #   <plate>/annotations/<slide>_annotations.json
+            #   -> <plate>/tile_inspection/<slide>/
+            ann_parent = Path(save_json).expanduser().resolve().parent
+            plate_dir = (
+                ann_parent.parent
+                if ann_parent.name == "annotations"
+                else ann_parent
+            )
+            tile_inspection_dir = (
+                plate_dir / "tile_inspection" / Path(slide_path).stem
+            )
 
         self.tile_inspection_dir = str(
             Path(tile_inspection_dir)
@@ -1576,8 +1590,6 @@ class NotebookWSIViewer:
         - <group>_<nn>.png (e.g. top_01.png): one per tile, the tile centred
           with a margin of one tile size on every side (3x3 tile field of
           view), at native (level-0) resolution.
-        - tile_inspection.json: tile ids, bboxes, rendered regions and
-          downsample factors, so pixels can be mapped back to slide coords.
 
         Output sizes are inferred from the tile size unless set explicitly:
         - per tile: the 3x3 field at native resolution, i.e.
@@ -1683,10 +1695,6 @@ class NotebookWSIViewer:
                     "downsample": ds,
                 }
             )
-
-        (out / "tile_inspection.json").write_text(
-            json.dumps(manifest, indent=2)
-        )
 
         return manifest
 
@@ -2127,7 +2135,7 @@ def launch_calibration_viewer(
     strict: bool = True,
     internet: bool = True,
     tile_inspection: bool = True,
-    tile_inspection_dir: str = "tile_inspection",
+    tile_inspection_dir: Optional[str] = None,
     overview_max_px: Optional[int] = None,
     tile_max_px: Optional[int] = None,
 ):
