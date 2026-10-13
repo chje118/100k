@@ -1403,7 +1403,8 @@ class NotebookWSIViewer:
 
                 tiles.append(
                     {
-                        "id": f"{group}_{i:02d}",
+                        # top = disease (d1, d2, ...), bottom = healthy (h1, h2, ...)
+                        "id": f"{'d' if group == 'top' else 'h'}{i}",
                         "group": group,
                         "polygon": poly,
                         "bbox": [
@@ -1587,7 +1588,7 @@ class NotebookWSIViewer:
 
         - overview.png: all tiles visible, with a margin of 2 tile sizes
           around their joint bounding box.
-        - <group>_<nn>.png (e.g. top_01.png): one per tile, the tile centred
+        - d<n>.png / h<n>.png (disease / healthy): one per tile, the tile centred
           with a margin of one tile size on every side (3x3 tile field of
           view), at native (level-0) resolution.
 
