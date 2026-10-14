@@ -1,38 +1,33 @@
-"""
+r"""
 Pathologist review app: whole-slide viewer + notes.
 
-The pathologist logs in with a shared password, picks a plate, then a slide.
-The slide opens in a zoomable whole-slide viewer (OpenSeadragon + OpenSlide
-DeepZoom, like interactive_viewer.py), with the disease (red, d1, d2, ...) and
-healthy (blue, h1, h2, ...) tiles drawn on top. Next to it she writes
-disease_tile_notes, healthy_tile_notes and diagnosis, then submits. One CSV row
-per slide; submitted slides are marked done.
+The pathologist picks a plate, then a slide. The slide opens in a zoomable
+whole-slide viewer (OpenSeadragon + OpenSlide DeepZoom, like
+interactive_viewer.py), with the disease (red, d1, d2, ...) and healthy
+(blue, h1, h2, ...) tiles drawn on top. Next to it she writes
+disease_tile_notes, healthy_tile_notes and suggested_diagnosis, then submits. One CSV
+row per slide; submitted slides are marked done.
 
-Expected layout (as written by interactive_viewer.py):
+Expected project folder:
 
-    <DATA_ROOT>/<plate>/annotations/<slide>_annotations.json   (disease/healthy polygons)
+    <PROJECT_DIR>/<plate>/annotations/<slide>_annotations.json   (from interactive_viewer.py)
+    <PROJECT_DIR>/slides/...                   slide files, found by file name (searched recursively)
+    <PROJECT_DIR>/pathologist_reviews.csv      one row per slide, created / updated by the app
 
-The slide file itself (<slide>.mrxs) is looked up by file name under 
---slide-root (default: DATA_ROOT), or given explicitly in a
---slide-map CSV (columns slide_id,slide_path).
 
 Run:
-    pip install flask pillow waitress openslide-python openslide-bin
-    python review_app.py --data-root /path/to/plates --slide-root /path/to/wsis
+    python review_app.py E:\Christine\100k_lymphoma
 """
 
 import argparse
 import csv
-import getpass
 import json
 import os
-import secrets
 import sys
 import threading
 import time
 from collections import OrderedDict
-from datetime import datetime, timedelta
-from functools import wraps
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -43,30 +38,31 @@ from flask import (
     Response,
     abort,
     jsonify,
-    redirect,
     render_template_string,
     request,
-    session,
     url_for,
 )
 from openslide.deepzoom import DeepZoomGenerator
-from werkzeug.security import check_password_hash, generate_password_hash
 
-# Only accept .mrxs slide files for this review app
-WSI_EXTENSIONS = {".mrxs"}
+WSI_EXTENSIONS = {
+    ".svs", ".ndpi", ".tif", ".tiff", ".mrxs", ".scn",
+    ".vms", ".vmu", ".bif", ".svslide", ".dcm",
+}
 
 CSV_FIELDS = [
     "plate",
     "slide_id",
     "status",
-    "suggested_diagnosis",
     "disease_tile_notes",
     "healthy_tile_notes",
-    "diagnosis",
+    "suggested_diagnosis",
     "updated_at",
     "completed_at",
 ]
-NOTE_FIELDS = ["disease_tile_notes", "healthy_tile_notes", "diagnosis"]
+NOTE_FIELDS = ["disease_tile_notes", "healthy_tile_notes", "suggested_diagnosis"]
+
+# Quick-pick buttons above the suggested-diagnosis field (override with --diagnoses).
+DEFAULT_DIAGNOSES = ["FL", "DLBCL", "cHL", "Nodular hyperplasia"]
 
 ANN_SUFFIX = "_annotations.json"
 
@@ -87,7 +83,7 @@ LAYOUT = r"""<!doctype html>
 body{margin:0;font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--ink)}
 header{display:flex;align-items:center;gap:14px;padding:10px 20px;background:var(--panel);border-bottom:1px solid var(--line);min-height:52px}
 .crumbs a{color:var(--accent);text-decoration:none}.crumbs span{color:var(--muted);margin:0 6px}
-.spacer{flex:1}a.logout{color:var(--muted);font-size:13px}
+.spacer{flex:1}
 main{padding:24px 20px;max-width:1100px;margin:0 auto}
 h1{font-size:22px;margin:0 0 4px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
@@ -111,26 +107,10 @@ button:hover,.btn:hover{border-color:#c5cad3}
 </head><body>{{ body|safe }}</body></html>"""
 
 
-LOGIN = r"""
-<main style="max-width:380px;margin-top:12vh">
-  <div class="card" style="padding:28px">
-    <h1>Slide review</h1>
-    <p class="muted" style="margin-top:0">Please enter the access password.</p>
-    <form method="post">
-      <input type="password" name="password" autofocus autocomplete="current-password"
-        style="font:inherit;padding:10px 12px;border:1px solid var(--line);border-radius:8px;width:100%">
-      {% if error %}<p style="color:var(--err);margin:10px 0 0">{{ error }}</p>{% endif %}
-      <button class="primary" style="width:100%;margin-top:14px">Log in</button>
-    </form>
-  </div>
-</main>
-"""
-
 
 PLATES = r"""
 <header>
   <div class="crumbs"><b>Plates</b></div><div class="spacer"></div>
-  <a class="logout" href="{{ url_for('logout') }}">Log out</a>
 </header>
 <main>
   <div class="top"><div><h1>Plates</h1><div class="muted">Choose a plate to see its slides.</div></div></div>
@@ -155,7 +135,6 @@ PLATE = r"""
 <header>
   <div class="crumbs"><a href="{{ url_for('index') }}">Plates</a><span>›</span><b>{{ plate }}</b></div>
   <div class="spacer"></div>
-  <a class="logout" href="{{ url_for('logout') }}">Log out</a>
 </header>
 <main>
   <div class="top">
@@ -208,7 +187,10 @@ body{overflow:hidden}
 .sec .dot{width:10px;height:10px;border-radius:50%}
 .sec .muted{font-size:13px;margin:0 0 8px}
 textarea{width:100%;min-height:110px;font:inherit;font-size:14px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;resize:vertical}
-.suggest{background:#f5f6f8;border-radius:8px;padding:8px 10px;margin-bottom:8px;font-size:14px}
+.picks{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+.picks button{font-size:13px;padding:4px 11px;border-radius:999px}
+.picks button.on{background:#e8eefc;border-color:var(--accent);color:var(--accent);font-weight:600}
+#dx{width:100%;font:inherit;font-size:14px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;margin-bottom:8px}
 #msg{color:var(--err);font-size:14px;min-height:1em}
 #save-state{font-size:13px}
 kbd{font:600 11px ui-monospace,monospace;border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;padding:0 4px;background:#fafbfc}
@@ -221,7 +203,6 @@ kbd{font:600 11px ui-monospace,monospace;border:1px solid var(--line);border-bot
   <span id="status-badge"></span>
   <div class="spacer"></div>
   <span id="save-state" class="muted"></span>
-  <a class="logout" href="{{ url_for('logout') }}">Log out</a>
 </header>
 
 <div class="review">
@@ -266,10 +247,12 @@ kbd{font:600 11px ui-monospace,monospace;border:1px solid var(--line);border-bot
       </div>
       {% endif %}
       <div class="sec">
-        <h3>Diagnosis</h3>
-        {% if suggested %}<div class="suggest"><span class="muted">Suggested:</span> <b>{{ suggested }}</b></div>{% endif %}
-        <p class="muted">{{ 'Do you agree with the suggested diagnosis? Your diagnosis / comments.' if suggested else 'Your (suspected) diagnosis and comments.' }}</p>
-        <textarea name="diagnosis"></textarea>
+        <h3>Suggested diagnosis</h3>
+        <p class="muted">Pick one or type your own (e.g. “FL, possibly transformed”).</p>
+        {% if diagnoses %}<div class="picks" id="picks">
+          {% for d in diagnoses %}<button type="button" data-dx="{{ d }}">{{ d }}</button>{% endfor %}
+        </div>{% endif %}
+        <input id="dx" name="suggested_diagnosis" type="text" placeholder="Suggested diagnosis">
       </div>
     </form>
     <p id="msg"></p>
@@ -305,7 +288,6 @@ async function post(action) {
     r = await fetch(CFG.save_url, {method: 'POST', headers: {'Content-Type': 'application/json'},
                                    body: JSON.stringify(payload(action))});
   } catch (e) { setState('⚠ Not saved – connection problem'); return null; }
-  if (r.status === 401) { location.href = CFG.login_url + '?next=' + encodeURIComponent(location.pathname); return null; }
   if (!r.ok) { setState('⚠ Not saved (error ' + r.status + ')'); return null; }
   const data = await r.json();
   dirty = false;
@@ -326,7 +308,7 @@ document.getElementById('submit').onclick = async () => {
   const v = k => (form.elements[k] ? form.elements[k].value.trim() : 'n/a');
   if (!v('disease_tile_notes')) missing.push('disease tile notes');
   if (!v('healthy_tile_notes')) missing.push('healthy tile notes');
-  if (!v('diagnosis')) missing.push('diagnosis');
+  if (!v('suggested_diagnosis')) missing.push('suggested diagnosis');
   if (missing.length) { msg.textContent = 'Please fill in: ' + missing.join(', ') + '.'; return; }
   msg.textContent = '';
   clearTimeout(timer);
@@ -334,6 +316,14 @@ document.getElementById('submit').onclick = async () => {
   if (data) location.href = data.next_url || CFG.plate_url;
 };
 setBadge(CFG.review.status);
+
+// quick-pick diagnosis buttons fill the text field
+const dx = form.elements['suggested_diagnosis'];
+const picks = [...document.querySelectorAll('#picks [data-dx]')];
+function markPicks() { picks.forEach(b => b.classList.toggle('on', b.dataset.dx === dx.value.trim())); }
+picks.forEach(b => b.onclick = () => { dx.value = b.dataset.dx; markPicks(); schedule(); });
+dx.addEventListener('input', markPicks);
+markPicks();
 
 // ---------------- tile chips ----------------
 const tiles = CFG.tiles;            // [{id, group:'d'|'h', poly:[[x,y],...], bbox:[x0,y0,x1,y1]}]
@@ -542,12 +532,9 @@ class SlideStore:
 def create_app(
     data_root: str,
     csv_path: str,
-    password_hash: str,
     slide_root: Optional[str] = None,
     slide_map_csv: Optional[str] = None,
-    diagnoses_csv: Optional[str] = None,
-    secure_cookies: bool = False,
-    secret_key: Optional[str] = None,
+    diagnoses: Optional[List[str]] = None,
 ) -> Flask:
     root = Path(data_root).expanduser().resolve()
     csv_file = Path(csv_path).expanduser().resolve()
@@ -561,9 +548,8 @@ def create_app(
     slides_store = SlideStore(
         wsi_root, _load_two_col(slide_map_csv, "slide_path") if slide_map_csv else {}
     )
-    suggested = _load_two_col(diagnoses_csv, "diagnosis") if diagnoses_csv else {}
+    diagnoses = DEFAULT_DIAGNOSES if diagnoses is None else diagnoses
     lock = threading.Lock()
-    failed_logins: Dict[str, List[float]] = {}
     ann_cache: Dict[str, Tuple[float, List[Dict]]] = {}
 
     # Local copy of OpenSeadragon (static/openseadragon.min.js next to this
@@ -574,13 +560,6 @@ def create_app(
         "/static/openseadragon.min.js"
         if (static_dir / "openseadragon.min.js").is_file()
         else "https://cdn.jsdelivr.net/npm/openseadragon@5.0.1/build/openseadragon/openseadragon.min.js"
-    )
-    app.config.update(
-        SECRET_KEY=secret_key or secrets.token_hex(32),
-        SESSION_COOKIE_HTTPONLY=True,
-        SESSION_COOKIE_SAMESITE="Lax",
-        SESSION_COOKIE_SECURE=secure_cookies,
-        PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
     )
 
     # ---------------- data helpers ----------------
@@ -612,8 +591,7 @@ def create_app(
         except (OSError, ValueError):
             data = {}
         tiles = []
-        # annotations use `disease_polygons` / `healthy_polygons` keys
-        for prefix, key in (("d", "disease_polygons"), ("h", "healthy_polygons")):
+        for prefix, key in (("d", "top_polygons"), ("h", "bottom_polygons")):
             for i, poly in enumerate(data.get(key) or [], start=1):
                 pts = [[float(p[0]), float(p[1])] for p in poly if len(p) >= 2]
                 if len(pts) < 2:
@@ -630,16 +608,36 @@ def create_app(
     def load_reviews() -> Dict[Tuple[str, str], Dict[str, str]]:
         if not csv_file.exists():
             return {}
+        rows: Dict[Tuple[str, str], Dict[str, str]] = {}
         with csv_file.open(newline="", encoding="utf-8-sig") as fh:
-            return {(r["plate"], r["slide_id"]): r for r in csv.DictReader(fh)}
+            for r in csv.DictReader(fh):
+                r = {k.strip(): (v or "").strip() for k, v in r.items() if k}
+                sid = r.get("slide_id", "")
+                if not sid:
+                    continue
+                key = (r.get("plate", ""), sid)
+                if not key[0]:
+                    # Row added by hand without a plate: attach it to the plate that has this slide.
+                    for p in list_plates():
+                        if sid in list_slides(p):
+                            key = (p, sid)
+                            r["plate"] = p
+                            break
+                rows[key] = {**rows.get(key, {}), **{k: v for k, v in r.items() if v}}
+        return rows
 
     def write_reviews(rows: Dict[Tuple[str, str], Dict[str, str]]) -> None:
         tmp = csv_file.with_suffix(csv_file.suffix + ".tmp")
         with tmp.open("w", newline="", encoding="utf-8-sig") as fh:  # utf-8-sig: Excel-friendly (æøå)
-            w = csv.DictWriter(fh, fieldnames=CSV_FIELDS, extrasaction="ignore")
+            # keep any extra columns added by hand, after the standard ones
+            extra = []
+            for r in rows.values():
+                extra += [k for k in r if k not in CSV_FIELDS and k not in extra]
+            fields = CSV_FIELDS + extra
+            w = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
             w.writeheader()
             for key in sorted(rows):
-                w.writerow({k: rows[key].get(k, "") for k in CSV_FIELDS})
+                w.writerow({k: rows[key].get(k, "") for k in fields})
         os.replace(tmp, csv_file)  # atomic: the CSV is never half-written
 
     def next_todo(plate: str, after: Optional[str], reviews) -> Optional[str]:
@@ -656,17 +654,7 @@ def create_app(
     def now() -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # ---------------- auth ----------------
-    def login_required(view):
-        @wraps(view)
-        def wrapped(*a, **kw):
-            if not session.get("auth"):
-                if request.path.startswith(("/api/", "/dzi/")):
-                    return jsonify({"error": "not logged in"}), 401
-                return redirect(url_for("login", next=request.path))
-            return view(*a, **kw)
-        return wrapped
-
+    # ---------------- headers ----------------
     @app.after_request
     def headers(resp):
         resp.headers["X-Frame-Options"] = "DENY"
@@ -679,39 +667,8 @@ def create_app(
             resp.headers["Cache-Control"] = "no-store"
         return resp
 
-    @app.route("/login", methods=["GET", "POST"])
-    def login():
-        error = None
-        if request.method == "POST":
-            ip = request.remote_addr or "?"
-            t = time.time()
-            recent = [x for x in failed_logins.get(ip, []) if t - x < 900]
-            if len(recent) >= 8:
-                error = "Too many attempts. Please wait 15 minutes."
-            elif check_password_hash(password_hash, request.form.get("password", "")):
-                failed_logins.pop(ip, None)
-                session.clear()
-                session["auth"] = True
-                session.permanent = True
-                nxt = request.args.get("next", "")
-                if not nxt.startswith("/") or nxt.startswith("//"):
-                    nxt = url_for("index")
-                return redirect(nxt)
-            else:
-                recent.append(t)
-                time.sleep(1.0)
-                error = "Wrong password."
-            failed_logins[ip] = recent
-        return page("Log in", LOGIN, error=error)
-
-    @app.route("/logout")
-    def logout():
-        session.clear()
-        return redirect(url_for("login"))
-
     # ---------------- pages ----------------
     @app.route("/")
-    @login_required
     def index():
         reviews = load_reviews()
         plates = []
@@ -722,7 +679,6 @@ def create_app(
         return page("Plates", PLATES, plates=plates)
 
     @app.route("/plate/<plate>")
-    @login_required
     def plate(plate):
         if plate not in list_plates():
             abort(404)
@@ -744,7 +700,6 @@ def create_app(
                     next_todo=next_todo(plate, None, reviews))
 
     @app.route("/slide/<plate>/<slide>")
-    @login_required
     def slide(plate, slide):
         check(plate, slide)
         tiles = load_tiles(plate, slide)
@@ -756,7 +711,6 @@ def create_app(
             except openslide.OpenSlideError:
                 path = None
         review = load_reviews().get((plate, slide), {})
-        sugg = suggested.get(slide, "")
         cfg = {
             "tiles": tiles,
             "has_wsi": path is not None,
@@ -766,10 +720,9 @@ def create_app(
             "note_fields": NOTE_FIELDS,
             "save_url": url_for("save_review", plate=plate, slide=slide),
             "plate_url": url_for("plate", plate=plate),
-            "login_url": url_for("login"),
         }
         return page(slide, SLIDE, plate=plate, slide=slide, cfg=cfg, osd_js=osd_js,
-                    has_wsi=path is not None, suggested=sugg,
+                    has_wsi=path is not None, diagnoses=diagnoses,
                     n_d=sum(t["group"] == "d" for t in tiles),
                     n_h=sum(t["group"] == "h" for t in tiles))
 
@@ -782,12 +735,10 @@ def create_app(
         return slides_store.deepzoom(path)[0]
 
     @app.route("/dzi/<plate>/<slide>.dzi")
-    @login_required
     def dzi(plate, slide):
         return Response(get_dz(plate, slide).get_dzi("jpeg"), mimetype="application/xml")
 
     @app.route("/dzi/<plate>/<slide>_files/<int:level>/<int:col>_<int:row>.jpeg")
-    @login_required
     def dzi_tile(plate, slide, level, col, row):
         dz = get_dz(plate, slide)
         try:
@@ -800,7 +751,6 @@ def create_app(
 
     # ---------------- saving ----------------
     @app.route("/api/review/<plate>/<slide>", methods=["POST"])
-    @login_required
     def save_review(plate, slide):
         check(plate, slide)
         if not request.is_json:
@@ -816,10 +766,10 @@ def create_app(
             status = "done" if action == "done" else (prev.get("status") or "draft")
             ts = now()
             row = {
+                **prev,
                 "plate": plate,
                 "slide_id": slide,
                 "status": status,
-                "suggested_diagnosis": suggested.get(slide, ""),
                 "updated_at": ts,
                 "completed_at": prev.get("completed_at") or (ts if status == "done" else ""),
             }
@@ -849,56 +799,46 @@ def _load_two_col(path: str, value_col: str) -> Dict[str, str]:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Pathologist whole-slide review app")
-    ap.add_argument("--data-root", help="Folder containing the plate folders (<plate>/annotations/...)")
+    ap = argparse.ArgumentParser(
+        description="Pathologist whole-slide review app",
+        epilog="Example: python review_app.py E:\\Christine\\100k_lymphoma",
+    )
+    ap.add_argument("project_dir",
+                    help="Project folder: contains the plate folders, slides/ and pathologist_reviews.csv")
     ap.add_argument("--slide-root", default=None,
-                    help="Folder searched (recursively) for the slide files, matched by file name. Default: --data-root")
+                    help="Override: folder searched for slide files (default: <project_dir>/slides, "
+                         "or <project_dir> if there is no slides folder)")
+    ap.add_argument("--csv", default=None,
+                    help="Override: reviews CSV (default: <project_dir>/pathologist_reviews.csv)")
     ap.add_argument("--slide-map", default=None, help="Optional CSV: slide_id,slide_path (overrides the search)")
-    ap.add_argument("--csv", default="pathologist_reviews.csv", help="Where reviews are stored")
-    ap.add_argument("--diagnoses", default=None, help="Optional CSV: slide_id,diagnosis (suggested diagnosis)")
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--diagnoses", default=None,
+                    help='Quick-pick diagnosis buttons, comma separated (default: "FL,DLBCL,cHL,Nodular hyperplasia"; "" for none)')
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="127.0.0.1 = only this machine; 0.0.0.0 = reachable from the network/VPN")
     ap.add_argument("--port", type=int, default=8050)
-    ap.add_argument("--https", action="store_true",
-                    help="Mark cookies Secure. Use whenever the app is reached over HTTPS (tunnel/reverse proxy).")
-    ap.add_argument("--behind-proxy", action="store_true",
-                    help="Trust X-Forwarded-* from one proxy (tunnel/reverse proxy) for client IPs.")
-    ap.add_argument("--hash-password", action="store_true",
-                    help="Print a password hash for REVIEW_PASSWORD_HASH and exit.")
     args = ap.parse_args()
 
-    if args.hash_password:
-        pw = getpass.getpass("New password: ")
-        if pw != getpass.getpass("Repeat: "):
-            sys.exit("Passwords do not match.")
-        print(generate_password_hash(pw))
-        return
+    project = Path(args.project_dir).expanduser().resolve()
+    if not project.is_dir():
+        sys.exit(f"Project folder not found: {project}")
 
-    if not args.data_root:
-        ap.error("--data-root is required")
-
-    pw_hash = os.environ.get("REVIEW_PASSWORD_HASH")
-    if not pw_hash:
-        pw = getpass.getpass("Set access password for this session: ")
-        if len(pw) < 10:
-            sys.exit("Use at least 10 characters – this protects patient data.")
-        pw_hash = generate_password_hash(pw)
+    slides_dir = project / "slides"
+    slide_root = Path(args.slide_root) if args.slide_root else (slides_dir if slides_dir.is_dir() else project)
+    csv_path = Path(args.csv) if args.csv else project / "pathologist_reviews.csv"
 
     app = create_app(
-        data_root=args.data_root,
-        csv_path=args.csv,
-        password_hash=pw_hash,
-        slide_root=args.slide_root,
+        data_root=str(project),
+        csv_path=str(csv_path),
+        slide_root=str(slide_root),
         slide_map_csv=args.slide_map,
-        diagnoses_csv=args.diagnoses,
-        secure_cookies=args.https,
-        secret_key=os.environ.get("REVIEW_SECRET_KEY"),
+        diagnoses=None if args.diagnoses is None else [d.strip() for d in args.diagnoses.split(",") if d.strip()],
     )
-    if args.behind_proxy:
-        from werkzeug.middleware.proxy_fix import ProxyFix
-        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
-    print(f"Reviews CSV: {Path(args.csv).resolve()}")
-    print(f"Serving on http://{args.host}:{args.port}/")
+    print(f"Project:     {project}")
+    print(f"Slides:      {slide_root}")
+    print(f"Reviews CSV: {csv_path}")
+    url_host = "localhost" if args.host in ("127.0.0.1", "0.0.0.0") else args.host
+    print(f"Open http://{url_host}:{args.port}/ in a browser  (Ctrl+C to stop)")
     try:
         from waitress import serve
         serve(app, host=args.host, port=args.port, threads=8)
