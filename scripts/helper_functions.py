@@ -68,6 +68,23 @@ def find_files(root: str, suffix: str = ".mrxs") -> list[str]:
 
     return sorted(files)
 
+def find_files_df(root: str, suffix: str = ".mrxs") -> pd.DataFrame:
+    """
+    Recursively walk `root`, return a DataFrame with one row per file,
+    containing the filename-derived `table_id` and the absolute `path`.
+    """
+    rows = []
+    all_paths = find_files(root, suffix=suffix)
+
+    for path in all_paths:
+        filename = os.path.basename(path)
+        table_id = os.path.splitext(filename)[0]
+        if "_20x" in table_id:
+            table_id = table_id.replace("_20x", "")
+        rows.append({"table_id": table_id, "path": path})
+
+    return pd.DataFrame(rows, columns=["table_id", "path"]), all_paths
+
 
 # --------- Methods to subset a dataframe ----------
 
@@ -107,58 +124,44 @@ def subset_df_word(df, col, word):
     mask = df[col].apply(contains_word, args=(word,))
     return df[mask].copy()
 
-def subset_df_processed(df, cache_file, category=None, status=None, model=None, filename_col="filename", **filters):
+def subset_df_processed(df, cache_file, category=None, status=None, model=None, filename_col="filename"):
     """Return dataframe rows that match processed cache entries.
- 
-    Filters are optional and can be combined (all must match the same entry):
+
+    Filters are optional and can be combined:
     - category: e.g. "features", "tissue", "artifact"
     - status: prefix match, e.g. "complete" or "error:"
     - model: case-insensitive substring match, e.g. "h-optimus-0"
-    - any other field stored in the cache entry, e.g. pct, n_tiles, tile_key, feature_key.
-      Give a value for an exact match, or a function for anything else:
-          subset_df_processed(df, cache_file, category="artifact", pct=lambda p: p < 5)
     """
     cache = _load_cache(cache_file)
     entries = _get_processed_entries(cache)
- 
+
     model_lower = str(model).lower() if model is not None else None
     selected_paths = set()
- 
+
     for (_, entry_category, entry_model), data in entries.items():
         if category is not None and entry_category != category:
             continue
- 
+
         entry_status = str(data.get("status", ""))
         if status is not None and not entry_status.startswith(str(status)):
             continue
- 
+
         if model_lower is not None:
             model_text = str(data.get("model", entry_model)).lower()
             if model_lower not in model_text:
                 continue
- 
-        if not all(_field_matches(data.get(field), cond) for field, cond in filters.items()):
-            continue
- 
+
         wsi_path = data.get("wsi_path")
         if wsi_path:
             selected_paths.add(str(wsi_path))
- 
+
     df_subset = df[df[filename_col].isin(selected_paths)].copy()
-    extra = "".join(f", {k}={v}" for k, v in filters.items())
     print(
-        "Dataframe subset length:", len(df_subset),
-        f"(category={category}, status={status}, model={model}{extra})",
+        "Dataframe subset length:", len(df_subset), 
+        f"(category={category}, status={status}, model={model})",
     )
- 
-    return df_subset, selected_paths
- 
-def _field_matches(value, cond):
-    """Exact match for values; call the function for callables (errors count as no match)."""
-    try:
-        return bool(cond(value)) if callable(cond) else bool(value == cond)
-    except Exception:
-        return False
+    
+    return df_subset
 
 
 # ---------- Extract metadata from text columns ----------
