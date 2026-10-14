@@ -816,6 +816,7 @@ def main() -> None:
     ap.add_argument("--host", default="127.0.0.1",
                     help="127.0.0.1 = only this machine; 0.0.0.0 = reachable from the network/VPN")
     ap.add_argument("--port", type=int, default=8050)
+    ap.add_argument("--no-browser", action="store_true", help="Don't open the page in a browser on start")
     args = ap.parse_args()
 
     project = Path(args.project_dir).expanduser().resolve()
@@ -838,7 +839,12 @@ def main() -> None:
     print(f"Slides:      {slide_root}")
     print(f"Reviews CSV: {csv_path}")
     url_host = "localhost" if args.host in ("127.0.0.1", "0.0.0.0") else args.host
-    print(f"Open http://{url_host}:{args.port}/ in a browser  (Ctrl+C to stop)")
+    url = f"http://{url_host}:{args.port}/"
+    print(f"Open {url} in a browser  (Ctrl+C to stop)")
+    if not args.no_browser:
+        import webbrowser
+        # open once the server is up
+        threading.Timer(1.5, lambda: webbrowser.open(url)).start()
     try:
         from waitress import serve
         serve(app, host=args.host, port=args.port, threads=8)
