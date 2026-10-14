@@ -235,7 +235,7 @@ kbd{font:600 11px ui-monospace,monospace;border:1px solid var(--line);border-bot
       {% if n_d %}
       <div class="sec">
         <h3><span class="dot" style="background:var(--dis)"></span>Disease tiles ({{ n_d }})</h3>
-        <p class="muted">What do you see? Do you agree they are disease? Refer to tiles by label, e.g. “d3, d7: mostly stroma”.</p>
+        <p class="muted">What do you see? Do you agree they are disease?</p>
         <textarea name="disease_tile_notes"></textarea>
       </div>
       {% endif %}
@@ -248,7 +248,7 @@ kbd{font:600 11px ui-monospace,monospace;border:1px solid var(--line);border-bot
       {% endif %}
       <div class="sec">
         <h3>Suggested diagnosis</h3>
-        <p class="muted">Pick one or type your own (e.g. “FL, possibly transformed”).</p>
+        <p class="muted">Pick one or type your own.</p>
         {% if diagnoses %}<div class="picks" id="picks">
           {% for d in diagnoses %}<button type="button" data-dx="{{ d }}">{{ d }}</button>{% endfor %}
         </div>{% endif %}
