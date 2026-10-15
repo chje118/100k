@@ -379,9 +379,13 @@ class ROISelector:
     def get_sdata_lmd(self):
         self.sdata = self.get_wsi().to_spatialdata()
         disease_gdf, healthy_gdf = self.select_tiles()
-        self.sdata.shapes["disease_tiles"] = ShapesModel.parse(disease_gdf)
-        self.sdata.shapes["healthy_tiles"] = ShapesModel.parse(healthy_gdf)
-        export_layers = ["wsi", "disease_tiles", "healthy_tiles"]
+        export_layers = ["wsi"]
+        for arm, gdf in [("disease", disease_gdf), ("healthy", healthy_gdf)]:
+            if len(gdf) == 0:
+                warnings.warn(f"[{self.slide_path}] {arm} arm has 0 tiles - skipped in LMD export.", stacklevel=2)
+                continue
+            self.sdata.shapes[f"{arm}_tiles"] = ShapesModel.parse(gdf)
+            export_layers.append(f"{arm}_tiles")
         sdata_lmd = self.sdata.subset(element_names=export_layers)
         return sdata_lmd
 
@@ -544,6 +548,8 @@ class ROISelector:
         try:
             os.makedirs(os.path.join(self.lmd_dir, slide_name), exist_ok=True)
             for tiles in ["disease", "healthy"]:
+                if f"{tiles}_tiles" not in self.sdata_lmd.shapes:
+                    continue  # empty arm, warned in get_sdata_lmd
                 path_lmd = os.path.join(self.lmd_dir, slide_name, f'{slide_name}_{tiles}.xml')
                 
                 # Transform coordinates to LMD coordinate system
@@ -605,6 +611,8 @@ class ROISelector:
 
         disease_tiles, healthy_tiles = self.select_tiles()
         for arm, tiles in [("disease", disease_tiles), ("healthy", healthy_tiles)]:
+            if arm not in paths:
+                continue  # empty arm, no XML written
             record_rois(well_assignment_path, patient_id, arm, tiles,
                         slide_path=self.slide_path, lmd_xml=paths[arm], overwrite=overwrite)
         return paths
