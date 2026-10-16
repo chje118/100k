@@ -150,7 +150,7 @@ class SegmentTissue:
         self.wsi_path = wsi_path
         self.zarr_path = os.path.join(zarr_dir, os.path.basename(wsi_path).replace(".mrxs", ".zarr"))
         os.makedirs(zarr_dir, exist_ok=True)
-        self.wsi = open_wsi(wsi_path, self.zarr_path) if os.path.exists(self.zarr_path) else open_wsi(wsi_path)
+        self.wsi = open_wsi(wsi_path, self.zarr_path, attach_images = True) if os.path.exists(self.zarr_path) else open_wsi(wsi_path, attach_images = True)
         self.version = version
         self.tissue_key = f"tissue_{version}"
         self.elapsed_time = None
