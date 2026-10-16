@@ -7,6 +7,7 @@ import warnings
 from wsidata import open_wsi
 import geopandas as gpd
 from spatialdata.models import PointsModel, ShapesModel
+from spatialdata import get_pyramid_levels
 from dvpio.write import write_lmd
 import os
 
@@ -372,15 +373,19 @@ class ROISelector:
     def get_wsi(self):
         slide_path = self.slide_data["slide_path"]
         zarr_path = self.slide_data["zarr_path"]
-        self.wsi = open_wsi(slide_path, zarr_path)
+        self.wsi = open_wsi(slide_path, zarr_path, attach_images = True)
         return self.wsi
     
     def get_sdata_lmd(self):
         self.sdata = self.get_wsi().to_spatialdata()
         disease_gdf, healthy_gdf = self.select_tiles()
-        self.sdata.shapes["disease_tiles"] = ShapesModel.parse(disease_gdf)
-        self.sdata.shapes["healthy_tiles"] = ShapesModel.parse(healthy_gdf)
-        export_layers = ["wsi_thumbnail", "disease_tiles", "healthy_tiles"]
+        export_layers = ["wsi"]
+        for arm, gdf in [("disease", disease_gdf), ("healthy", healthy_gdf)]:
+            if len(gdf) == 0:
+                warnings.warn(f"[{self.slide_path}] {arm} arm has 0 tiles - skipped in LMD export.", stacklevel=2)
+                continue
+            self.sdata.shapes[f"{arm}_tiles"] = ShapesModel.parse(gdf)
+            export_layers.append(f"{arm}_tiles")
         sdata_lmd = self.sdata.subset(element_names=export_layers)
         return sdata_lmd
 
@@ -531,16 +536,24 @@ class ROISelector:
         self.sdata_lmd.points["calibration_points"] = PointsModel.parse(coords)
         return self.sdata_lmd
 
+    def _image_height(self, key="wsi"):
+        img = self.sdata_lmd.images[key]
+        if hasattr(img, "children") and len(img.children) > 0:   # multiscale DataTree
+            img = get_pyramid_levels(img, n=0)                   # scale0 DataArray
+        return img.sizes["y"]
+
     def write_to_lmd(self):
         slide_name = os.path.splitext(os.path.basename(self.slide_path))[0]
         paths = {}
         try:
             os.makedirs(os.path.join(self.lmd_dir, slide_name), exist_ok=True)
             for tiles in ["disease", "healthy"]:
+                if f"{tiles}_tiles" not in self.sdata_lmd.shapes:
+                    continue  # empty arm, warned in get_sdata_lmd
                 path_lmd = os.path.join(self.lmd_dir, slide_name, f'{slide_name}_{tiles}.xml')
                 
                 # Transform coordinates to LMD coordinate system
-                H = self.sdata_lmd.images["wsi_thumbnail"].data.shape[1]
+                H = self._image_height("wsi")
                 
                 affine_transformation = np.array([
                     [1,  0, 0],
@@ -566,15 +579,17 @@ class ROISelector:
     def patient_id_from_plate(self, well_assignment_path: str) -> str:
         """
         Find which patient on this plate the slide belongs to: the one whose
-        patient_id (or microscopy_nr) appears in the slide filename.
+        table_id appears in the slide filename.
         Raises if none match (slide not on this plate) or several match.
         """
         slide_name = os.path.splitext(os.path.basename(self.slide_path))[0]
-        patients = load_well_assignment(well_assignment_path)[["patient_id", "microscopy_nr"]].drop_duplicates()
+        if "_20x" in slide_name:
+            slide_name = slide_name.replace("_20x", "")
+        patients = load_well_assignment(well_assignment_path)[["patient_id", "table_id"]].drop_duplicates()
 
         matches = [
             row.patient_id for row in patients.itertuples()
-            if str(row.patient_id) in slide_name or str(row.microscopy_nr) in slide_name
+            if str(row.table_id).strip() and str(row.table_id).lower() != "nan" and str(row.table_id) in slide_name
         ]
         if len(matches) != 1:
             raise ValueError(
@@ -596,6 +611,8 @@ class ROISelector:
 
         disease_tiles, healthy_tiles = self.select_tiles()
         for arm, tiles in [("disease", disease_tiles), ("healthy", healthy_tiles)]:
+            if arm not in paths:
+                continue  # empty arm, no XML written
             record_rois(well_assignment_path, patient_id, arm, tiles,
                         slide_path=self.slide_path, lmd_xml=paths[arm], overwrite=overwrite)
         return paths
