@@ -208,8 +208,8 @@ HTML = r"""
   </div>
 
 <script>
-const initialTop = {{ top_polygons | safe }};
-const initialBottom = {{ bottom_polygons | safe }};
+const initialDisease = {{ disease_polygons | safe }};
+const initialHealthy = {{ healthy_polygons | safe }};
 const initialSessionId = {{ session_id | tojson }};
 
 const steps = [
@@ -409,8 +409,8 @@ function drawMarker(point, label, isPending=false) {
 
 function fitToAllPolygons() {
   const allPolys = [
-    ...initialTop,
-    ...initialBottom
+    ...initialDisease,
+    ...initialHealthy
   ];
 
   if (!allPolys.length) return;
@@ -469,12 +469,12 @@ function redraw() {
   clearCanvas();
 
   drawPolygons(
-    initialTop,
+    initialDisease,
     "#ff2d2d"
   );
 
   drawPolygons(
-    initialBottom,
+    initialHealthy,
     "#2d6cff"
   );
 
@@ -974,11 +974,11 @@ async function saveAndClose() {
     calibration_point_3:
       records.calibration_point_3,
 
-    top_polygons:
-      initialTop,
+    disease_polygons:
+      initialDisease,
 
-    bottom_polygons:
-      initialBottom,
+    healthy_polygons:
+      initialHealthy,
 
     screenshots:
       screenshots,
@@ -1072,10 +1072,10 @@ class NotebookWSIViewer:
     def __init__(
         self,
         slide_path: str,
-        top_polygons: Sequence[
+        disease_polygons: Sequence[
             Sequence[Sequence[float]]
         ],
-        bottom_polygons: Sequence[
+        healthy_polygons: Sequence[
             Sequence[Sequence[float]]
         ],
         save_json: str = "annotations.json",
@@ -1176,27 +1176,27 @@ class NotebookWSIViewer:
 
         self._validate_paths_and_environment()
 
-        self.top_polygons = (
+        self.disease_polygons = (
             self._normalize_polygons(
-                top_polygons,
-                self.polygon_input_order
+                disease_polygons,
+                self.polygon_input_order,
             )
         )
 
-        self.bottom_polygons = (
+        self.healthy_polygons = (
             self._normalize_polygons(
-                bottom_polygons,
-                self.polygon_input_order
+                healthy_polygons,
+                self.polygon_input_order,
             )
         )
 
         if (
             self.strict
-            and not self.top_polygons
-            and not self.bottom_polygons
+            and not self.disease_polygons
+            and not self.healthy_polygons
         ):
             raise ValueError(
-                "Both top_polygons and bottom_polygons "
+                "Both disease_polygons and healthy_polygons "
                 "are empty. Refusing to launch in strict mode."
             )
 
@@ -1732,17 +1732,17 @@ class NotebookWSIViewer:
             return Response(
                 render_template_string(
                     HTML,
-                    top_polygons=json.dumps(
-                        outer.top_polygons
+                    disease_polygons=json.dumps(
+                        outer.disease_polygons
                     ),
-                    bottom_polygons=json.dumps(
-                        outer.bottom_polygons
+                    healthy_polygons=json.dumps(
+                        outer.healthy_polygons
                     ),
                     session_id=outer.session_id,
                     openseadragon_js=openseadragon_js,
                     html2canvas_js=html2canvas_js,
                 ),
-                mimetype="text/html",
+                mimetype="text/html"
             )
 
         @app.route(
@@ -2032,13 +2032,13 @@ class NotebookWSIViewer:
         )
 
         print(
-            f"top_polygons: "
-            f"{len(self.top_polygons)}"
+          f"disease_polygons: "
+          f"{len(self.disease_polygons)}"
         )
 
         print(
-            f"bottom_polygons: "
-            f"{len(self.bottom_polygons)}"
+          f"healthy_polygons: "
+          f"{len(self.healthy_polygons)}"
         )
 
         print(
@@ -2120,13 +2120,13 @@ def _find_free_port(
 
 
 def launch_calibration_viewer(
-    slide_path: str,
-    top_polygons: Sequence[
-        Sequence[Sequence[float]]
-    ],
-    bottom_polygons: Sequence[
-        Sequence[Sequence[float]]
-    ],
+  slide_path: str,
+  disease_polygons: Sequence[
+    Sequence[Sequence[float]]
+  ],
+  healthy_polygons: Sequence[
+    Sequence[Sequence[float]]
+  ],
     save_json: str = "annotations.json",
     screenshot_dir: str = "annotation_screenshots",
     polygon_input_order: str = "xy",
@@ -2142,8 +2142,8 @@ def launch_calibration_viewer(
 ):
     viewer = NotebookWSIViewer(
         slide_path=slide_path,
-        top_polygons=top_polygons,
-        bottom_polygons=bottom_polygons,
+      disease_polygons=disease_polygons,
+      healthy_polygons=healthy_polygons,
         save_json=save_json,
         screenshot_dir=screenshot_dir,
         polygon_input_order=polygon_input_order,
