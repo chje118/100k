@@ -351,7 +351,7 @@ class ROISelector:
             linewidth=1.5,
             alpha=0.35,
         )
-        ax.set_title(f"Top {len(disease_tiles_gdf)} (red) and bottom {len(healthy_tiles_gdf)} (blue) tiles selected for cutting")
+        ax.set_title(f"Disease {len(disease_tiles_gdf)} (red) and healthy {len(healthy_tiles_gdf)} (blue) tiles selected for cutting")
         ax.axis("off")
         plt.tight_layout()
 
