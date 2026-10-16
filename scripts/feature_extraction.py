@@ -49,7 +49,7 @@ _configure_h100()
 class ExtractFeatures:
     """Extract tile embeddings and optionally aggregate slide-level features for a single WSI."""
 
-    TISSUE_CANDIDATES = ["tissue_default", "tissue_grandqc", "tissue_threshold"]
+    TISSUE_CANDIDATES = ["tissue_default", "tissue_grandqc", "tissue_threshold", "tissue_entropy"]
 
     def __init__(
         self,
