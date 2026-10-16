@@ -511,8 +511,8 @@ class ROISelector:
 
         return launch_calibration_viewer(
             slide_path=self.slide_data["slide_path"],
-            top_polygons=disease_polys,
-            bottom_polygons=healthy_polys,
+            disease_polygons=disease_polys,
+            healthy_polygons=healthy_polys,
             **kwargs,
         )
 
