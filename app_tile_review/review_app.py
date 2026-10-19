@@ -591,8 +591,16 @@ def create_app(
         except (OSError, ValueError):
             data = {}
         tiles = []
-        for prefix, key in (("d", "top_polygons"), ("h", "bottom_polygons")):
-            for i, poly in enumerate(data.get(key) or [], start=1):
+        for prefix, keys in (
+          ("d", ("disease_polygons")),
+          ("h", ("healthy_polygons")),
+        ):
+          polys = None
+          for key in keys:
+            if key in data:
+              polys = data.get(key) or []
+              break
+          for i, poly in enumerate(polys or [], start=1):
                 pts = [[float(p[0]), float(p[1])] for p in poly if len(p) >= 2]
                 if len(pts) < 2:
                     continue
