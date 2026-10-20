@@ -1,0 +1,18 @@
+{
+  "_help": "One entry per project. Write paths with / (or \\\\). Optional per project: slide_root, csv, slide_map, diagnoses. Restart the app (Close app, then the icon) after editing.",
+  "port": 8050,
+  "host": "127.0.0.1",
+  "auto_close_minutes": 15,
+  "projects": [
+    {
+      "name": "Lymphoma",
+      "folder": "E:/Christine/100k_lymphoma",
+      "diagnoses": ["FL", "DLBCL", "cHL", "Nodular hyperplasia"]
+    },
+    {
+      "name": "Endometrium",
+      "folder": "E:/Christine/100k_endometrium",
+      "diagnoses": ["Endometrioid carcinoma", "Serous carcinoma", "Atypical hyperplasia", "Benign endometrium"]
+    }
+  ]
+}
