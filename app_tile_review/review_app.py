@@ -1,129 +1,48 @@
 r"""
 Pathologist review app: whole-slide viewer + notes.
 
-FOR THE PATHOLOGIST
-    Double-click the "Slide review" icon on the desktop. The app starts in the
-    background (no black terminal window) and opens in the web browser.
-    Choose a project (e.g. Lymphoma / Endometrium), then a plate, then a slide.
-    When finished, click "Close app" (top right). Notes are saved automatically.
-    If the browser tab is just closed instead, the app stops by itself after a
-    while (see "auto_close_minutes"). Double-clicking the icon while the app is
-    already running simply opens it again.
+The pathologist picks a plate, then a slide. The slide opens in a zoomable
+whole-slide viewer (OpenSeadragon + OpenSlide DeepZoom, like
+interactive_viewer.py), with the disease (red, d1, d2, ...) and healthy
+(blue, h1, h2, ...) tiles drawn on top. Next to it she writes
+disease_tile_notes, healthy_tile_notes and suggested_diagnosis, then submits. One CSV
+row per slide; submitted slides are marked done.
 
-ONE-TIME SET-UP (researcher)
-    1. Edit review_projects.json next to this file: one entry per project.
-    2. From the Python environment that has openslide / flask / waitress:
-           python make_shortcut.py
-       -> creates the "Slide review" shortcut on the desktop.
-    Errors are written to review_app.log next to this file (and shown in a
-    pop-up if the app cannot start at all).
+Expected project folder:
 
-Expected project folder (one per project):
+    <PROJECT_DIR>/<plate>/annotations/<slide>_annotations.json   (from interactive_viewer.py)
+    <PROJECT_DIR>/slides/...                   slide files, found by file name (searched recursively)
+    <PROJECT_DIR>/pathologist_reviews.csv      one row per slide, created / updated by the app
 
-    <folder>/<plate>/annotations/<slide>_annotations.json   (from interactive_viewer.py)
-    <folder>/slides/...                   slide files, found by file name (searched recursively)
-    <folder>/pathologist_reviews.csv      one row per slide, created / updated by the app
 
-Developer use from a terminal still works:
-    python review_app.py                                 # projects from review_projects.json
-    python review_app.py E:\Christine\100k_lymphoma      # one ad-hoc project folder
+Run:
+    python review_app.py E:\Christine\100k_lymphoma
 """
 
 import argparse
 import csv
 import json
-import logging
 import os
-import re
 import sys
 import threading
 import time
-import urllib.request
-import webbrowser
 from collections import OrderedDict
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-APP_ID = "slide-review"
-HERE = Path(__file__).resolve().parent
-LOG_FILE = HERE / "review_app.log"
-CONFIG_FILE = HERE / "review_projects.json"
-
-
-# ----------------------------------------------------------------------
-# Running without a terminal (pythonw.exe)
-# ----------------------------------------------------------------------
-def _setup_logging() -> None:
-    """pythonw has no console (sys.stdout/stderr are None): send output to a log file."""
-    if sys.stdout is None or sys.stderr is None:
-        try:
-            if LOG_FILE.exists() and LOG_FILE.stat().st_size > 5_000_000:
-                LOG_FILE.replace(LOG_FILE.with_name(LOG_FILE.name + ".old"))
-            fh = open(LOG_FILE, "a", encoding="utf-8", buffering=1)
-        except OSError:
-            fh = open(os.devnull, "w")
-        if sys.stdout is None:
-            sys.stdout = fh
-        if sys.stderr is None:
-            sys.stderr = fh
-    logging.basicConfig(
-        level=logging.INFO,
-        stream=sys.stderr,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
-
-def _show_error(msg: str) -> None:
-    """Log the error and, since there may be no terminal, also show a pop-up."""
-    logging.error(msg)
-    try:
-        import tkinter
-        from tkinter import messagebox
-
-        root = tkinter.Tk()
-        root.withdraw()
-        messagebox.showerror("Slide review", msg)
-        root.destroy()
-    except Exception:
-        pass
-
-
-_setup_logging()
-
-# A conda environment started without "conda activate" (as a desktop shortcut
-# does) may not find the OpenSlide DLLs: add the environment's Library\bin.
-if sys.platform == "win32":
-    _lib_bin = Path(sys.prefix) / "Library" / "bin"
-    if _lib_bin.is_dir():
-        os.environ["PATH"] = str(_lib_bin) + os.pathsep + os.environ.get("PATH", "")
-        try:
-            os.add_dll_directory(str(_lib_bin))
-        except (AttributeError, OSError):
-            pass
-
-try:
-    import openslide
-    from flask import (
-        Flask,
-        Response,
-        abort,
-        jsonify,
-        redirect,
-        render_template_string,
-        request,
-        url_for,
-    )
-    from openslide.deepzoom import DeepZoomGenerator
-except (ImportError, OSError) as _exc:
-    _show_error(
-        f"Slide review could not start:\n\n{_exc}\n\n"
-        "The shortcut must use the Python environment that has openslide and "
-        "flask installed. Re-run make_shortcut.py from that environment."
-    )
-    sys.exit(1)
-
+import openslide
+from flask import (
+    Flask,
+    Response,
+    abort,
+    jsonify,
+    render_template_string,
+    request,
+    url_for,
+)
+from openslide.deepzoom import DeepZoomGenerator
 
 WSI_EXTENSIONS = {
     ".svs", ".ndpi", ".tif", ".tiff", ".mrxs", ".scn",
@@ -142,13 +61,10 @@ CSV_FIELDS = [
 ]
 NOTE_FIELDS = ["disease_tile_notes", "healthy_tile_notes", "suggested_diagnosis"]
 
-# Quick-pick buttons above the suggested-diagnosis field (override per project
-# with "diagnoses" in review_projects.json).
+# Quick-pick buttons above the suggested-diagnosis field (override with --diagnoses).
 DEFAULT_DIAGNOSES = ["FL", "DLBCL", "cHL", "Nodular hyperplasia"]
 
 ANN_SUFFIX = "_annotations.json"
-
-QUIT_BTN = '<button type="button" class="quit" onclick="quitApp()" title="Stop the review app">Close app</button>'
 
 
 # ----------------------------------------------------------------------
@@ -185,80 +101,24 @@ tr.row a{color:inherit;text-decoration:none;font-weight:600}
 button,.btn{font:inherit;font-size:14px;padding:7px 13px;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--ink);cursor:pointer;text-decoration:none;display:inline-block}
 button:hover,.btn:hover{border-color:#c5cad3}
 .primary{background:var(--accent);border-color:var(--accent);color:#fff}.primary:hover{background:#2649b0}
-.quit{border-color:#e4b4b7;color:var(--err)}.quit:hover{background:#fde8e9;border-color:var(--err)}
 .muted{color:var(--muted)}
 .top{display:flex;align-items:end;gap:12px;margin-bottom:16px}
-.closed{text-align:center;padding-top:20vh}
 </style>
-</head><body>{{ body|safe }}
-<script>
-// Keep-alive: the app stops by itself some minutes after the last page is closed.
-const APP_PING = {{ ping_url|tojson }}, APP_QUIT = {{ quit_url|tojson }};
-function appPing() { fetch(APP_PING, {method: 'POST'}).catch(() => {}); }
-appPing();
-const appPingTimer = setInterval(appPing, 60000);
+</head><body>{{ body|safe }}</body></html>"""
 
-async function quitApp() {
-  // the slide page saves any unsaved notes first
-  if (window.beforeQuit && !(await window.beforeQuit())
-      && !confirm('Your latest notes could not be saved. Close the app anyway?')) return;
-  try {
-    await fetch(APP_QUIT, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
-  } catch (e) {}
-  clearInterval(appPingTimer);
-  window.beforeQuit = null;
-  document.body.innerHTML = '<main class="closed"><h1>Slide review is closed</h1>' +
-    '<p class="muted">Your notes are saved. You can close this browser tab.</p>' +
-    '<p class="muted">To review again, double-click the Slide review icon.</p></main>';
-  try { window.close(); } catch (e) {}
-}
-</script>
-</body></html>"""
-
-
-PROJECTS = r"""
-<header>
-  <div class="crumbs"><b>Projects</b></div><div class="spacer"></div>{{ quit_btn|safe }}
-</header>
-<main>
-  <div class="top"><div><h1>Slide review</h1><div class="muted">Choose a project.</div></div></div>
-  <div class="card"><table>
-    <tr><th>Project</th><th>Plates</th><th>Slides</th><th>Progress</th></tr>
-    {% for p in projects %}
-    {% if p.ok %}
-    <tr class="row" onclick="location.href='{{ url_for('plates_page', proj=p.key) }}'">
-      <td><a href="{{ url_for('plates_page', proj=p.key) }}">{{ p.name }}</a></td>
-      <td>{{ p.plates }}</td>
-      <td>{{ p.total }}</td>
-      <td><span class="bar"><i style="width:{{ (100 * p.done / p.total) if p.total else 0 }}%"></i></span>
-          <span class="muted">{{ p.done }} / {{ p.total }} done</span></td>
-    </tr>
-    {% else %}
-    <tr>
-      <td><b>{{ p.name }}</b> <span class="badge b-err">{{ p.error }}</span></td>
-      <td colspan="3" class="muted">{{ p.folder }} – please let the researcher know.</td>
-    </tr>
-    {% endif %}
-    {% else %}
-    <tr><td colspan="4" class="muted">No projects configured.</td></tr>
-    {% endfor %}
-  </table></div>
-</main>
-"""
 
 
 PLATES = r"""
 <header>
-  <div class="crumbs"><a href="{{ url_for('home') }}">Projects</a><span>›</span><b>{{ project.name }}</b></div>
-  <div class="spacer"></div>{{ quit_btn|safe }}
+  <div class="crumbs"><b>Plates</b></div><div class="spacer"></div>
 </header>
 <main>
-  <div class="top"><div><h1>{{ project.name }}</h1><div class="muted">Choose a plate to see its slides.</div></div></div>
+  <div class="top"><div><h1>Plates</h1><div class="muted">Choose a plate to see its slides.</div></div></div>
   <div class="card"><table>
     <tr><th>Plate</th><th>Slides</th><th>Progress</th></tr>
     {% for p in plates %}
-    <tr class="row" onclick="location.href='{{ url_for('plate_page', proj=project.key, plate=p.name) }}'">
-      <td><a href="{{ url_for('plate_page', proj=project.key, plate=p.name) }}">{{ p.name }}</a></td>
+    <tr class="row" onclick="location.href='{{ url_for('plate', plate=p.name) }}'">
+      <td><a href="{{ url_for('plate', plate=p.name) }}">{{ p.name }}</a></td>
       <td>{{ p.total }}</td>
       <td><span class="bar"><i style="width:{{ (100 * p.done / p.total) if p.total else 0 }}%"></i></span>
           <span class="muted">{{ p.done }} / {{ p.total }} done</span></td>
@@ -273,21 +133,20 @@ PLATES = r"""
 
 PLATE = r"""
 <header>
-  <div class="crumbs"><a href="{{ url_for('home') }}">Projects</a><span>›</span>
-    <a href="{{ url_for('plates_page', proj=project.key) }}">{{ project.name }}</a><span>›</span><b>{{ plate }}</b></div>
-  <div class="spacer"></div>{{ quit_btn|safe }}
+  <div class="crumbs"><a href="{{ url_for('index') }}">Plates</a><span>›</span><b>{{ plate }}</b></div>
+  <div class="spacer"></div>
 </header>
 <main>
   <div class="top">
     <div><h1>{{ plate }}</h1><div class="muted">{{ done }} of {{ slides|length }} slides done</div></div>
     <div class="spacer"></div>
-    {% if next_todo %}<a class="btn primary" href="{{ url_for('slide_page', proj=project.key, plate=plate, slide=next_todo) }}">Next unreviewed slide →</a>{% endif %}
+    {% if next_todo %}<a class="btn primary" href="{{ url_for('slide', plate=plate, slide=next_todo) }}">Next unreviewed slide →</a>{% endif %}
   </div>
   <div class="card"><table>
     <tr><th>Slide</th><th>Disease tiles</th><th>Healthy tiles</th><th>Status</th><th>Last saved</th></tr>
     {% for s in slides %}
-    <tr class="row" onclick="location.href='{{ url_for('slide_page', proj=project.key, plate=plate, slide=s.name) }}'">
-      <td><a href="{{ url_for('slide_page', proj=project.key, plate=plate, slide=s.name) }}">{{ s.name }}</a>
+    <tr class="row" onclick="location.href='{{ url_for('slide', plate=plate, slide=s.name) }}'">
+      <td><a href="{{ url_for('slide', plate=plate, slide=s.name) }}">{{ s.name }}</a>
           {% if not s.has_wsi %} <span class="badge b-err">slide file not found</span>{% endif %}</td>
       <td>{{ s.n_d }}</td><td>{{ s.n_h }}</td>
       <td>{% if s.status == 'done' %}<span class="badge b-done">✓ Done</span>
@@ -339,13 +198,11 @@ kbd{font:600 11px ui-monospace,monospace;border:1px solid var(--line);border-bot
 </style>
 
 <header>
-  <div class="crumbs"><a href="{{ url_for('home') }}">Projects</a><span>›</span>
-    <a href="{{ url_for('plates_page', proj=project.key) }}">{{ project.name }}</a><span>›</span>
-    <a href="{{ url_for('plate_page', proj=project.key, plate=plate) }}">{{ plate }}</a><span>›</span><b>{{ slide }}</b></div>
+  <div class="crumbs"><a href="{{ url_for('index') }}">Plates</a><span>›</span>
+    <a href="{{ url_for('plate', plate=plate) }}">{{ plate }}</a><span>›</span><b>{{ slide }}</b></div>
   <span id="status-badge"></span>
   <div class="spacer"></div>
   <span id="save-state" class="muted"></span>
-  {{ quit_btn|safe }}
 </header>
 
 <div class="review">
@@ -445,13 +302,6 @@ function schedule() {
 form.addEventListener('input', schedule);
 form.addEventListener('submit', e => e.preventDefault());
 window.addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
-
-// "Close app": save pending notes first (true = nothing left unsaved)
-window.beforeQuit = async () => {
-  clearTimeout(timer);
-  if (!dirty) return true;
-  return (await post('save')) !== null;
-};
 
 document.getElementById('submit').onclick = async () => {
   const msg = document.getElementById('msg'), missing = [];
@@ -629,12 +479,11 @@ class SlideStore:
 
     def _build_index(self) -> None:
         index: Dict[str, List[Path]] = {}
-        if self.slide_root.is_dir():
-            for p in self.slide_root.rglob("*"):
-                if p.suffix.lower() in WSI_EXTENSIONS and p.is_file() and not any(
-                    part.startswith(".") for part in p.relative_to(self.slide_root).parts
-                ):
-                    index.setdefault(p.stem, []).append(p)
+        for p in self.slide_root.rglob("*"):
+            if p.suffix.lower() in WSI_EXTENSIONS and p.is_file() and not any(
+                part.startswith(".") for part in p.relative_to(self.slide_root).parts
+            ):
+                index.setdefault(p.stem, []).append(p)
         self._index = index
         self._indexed_at = time.time()
 
@@ -678,91 +527,90 @@ class SlideStore:
 
 
 # ----------------------------------------------------------------------
-# One review project (e.g. lymphoma, endometrium)
+# App
 # ----------------------------------------------------------------------
-class ReviewProject:
-    def __init__(
-        self,
-        key: str,
-        name: str,
-        folder: str,
-        slide_root: Optional[str] = None,
-        csv_path: Optional[str] = None,
-        slide_map_csv: Optional[str] = None,
-        diagnoses: Optional[List[str]] = None,
-    ):
-        self.key = key
-        self.name = name
-        self.root = Path(folder).expanduser().resolve()
-        self.csv_file = (Path(csv_path).expanduser().resolve() if csv_path
-                         else self.root / "pathologist_reviews.csv")
-        if slide_root:
-            wsi_root = Path(slide_root).expanduser().resolve()
-        else:
-            wsi_root = self.root / "slides" if (self.root / "slides").is_dir() else self.root
-        self.wsi_root = wsi_root
-        slide_map = _load_two_col(slide_map_csv, "slide_path") if slide_map_csv else {}
-        self.slides = SlideStore(wsi_root, slide_map)
-        self.diagnoses = list(DEFAULT_DIAGNOSES if diagnoses is None else diagnoses)
-        self.lock = threading.Lock()
-        self._ann_cache: Dict[str, Tuple[float, List[Dict]]] = {}
+def create_app(
+    data_root: str,
+    csv_path: str,
+    slide_root: Optional[str] = None,
+    slide_map_csv: Optional[str] = None,
+    diagnoses: Optional[List[str]] = None,
+) -> Flask:
+    root = Path(data_root).expanduser().resolve()
+    csv_file = Path(csv_path).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"Data root does not exist: {root}")
+    wsi_root = Path(slide_root).expanduser().resolve() if slide_root else root
+    if not wsi_root.is_dir():
+        raise FileNotFoundError(f"Slide root does not exist: {wsi_root}")
+    csv_file.parent.mkdir(parents=True, exist_ok=True)
 
-    @property
-    def ok(self) -> bool:
-        # checked live, so a drive that is connected later is picked up
-        return self.root.is_dir()
+    slides_store = SlideStore(
+        wsi_root, _load_two_col(slide_map_csv, "slide_path") if slide_map_csv else {}
+    )
+    diagnoses = DEFAULT_DIAGNOSES if diagnoses is None else diagnoses
+    lock = threading.Lock()
+    ann_cache: Dict[str, Tuple[float, List[Dict]]] = {}
+
+    # Local copy of OpenSeadragon (static/openseadragon.min.js next to this
+    # script, same as interactive_viewer.py) if present, otherwise the CDN.
+    static_dir = Path(__file__).resolve().parent / "static"
+    app = Flask(__name__, static_folder=str(static_dir))
+    osd_js = (
+        "/static/openseadragon.min.js"
+        if (static_dir / "openseadragon.min.js").is_file()
+        else "https://cdn.jsdelivr.net/npm/openseadragon@5.0.1/build/openseadragon/openseadragon.min.js"
+    )
 
     # ---------------- data helpers ----------------
-    def list_plates(self) -> List[str]:
-        if not self.ok:
-            return []
+    def list_plates() -> List[str]:
         return sorted(
-            p.name for p in self.root.iterdir()
+            p.name for p in root.iterdir()
             if p.is_dir() and not p.name.startswith(".")
             and (p / "annotations").is_dir()
             and any((p / "annotations").glob("*" + ANN_SUFFIX))
         )
 
-    def list_slides(self, plate: str) -> List[str]:
-        d = self.root / plate / "annotations"
+    def list_slides(plate: str) -> List[str]:
+        d = root / plate / "annotations"
         return sorted(f.name[: -len(ANN_SUFFIX)] for f in d.glob("*" + ANN_SUFFIX) if not f.name.startswith("."))
 
-    def check(self, plate: str, slide: Optional[str] = None) -> None:
+    def check(plate: str, slide: str) -> None:
         # Only names discovered on disk are accepted -> no path traversal.
-        if plate not in self.list_plates() or (slide is not None and slide not in self.list_slides(plate)):
+        if plate not in list_plates() or slide not in list_slides(plate):
             abort(404)
 
-    def load_tiles(self, plate: str, slide: str) -> List[Dict]:
-        f = self.root / plate / "annotations" / f"{slide}{ANN_SUFFIX}"
+    def load_tiles(plate: str, slide: str) -> List[Dict]:
+        f = root / plate / "annotations" / f"{slide}{ANN_SUFFIX}"
         mtime = f.stat().st_mtime
-        hit = self._ann_cache.get(str(f))
+        hit = ann_cache.get(str(f))
         if hit and hit[0] == mtime:
             return hit[1]
         try:
-            data = json.loads(f.read_text(encoding="utf-8"))
+            data = json.loads(f.read_text())
         except (OSError, ValueError):
-            logging.warning("Could not read %s", f)
             data = {}
         tiles = []
         for prefix, key in (("d", "disease_polygons"), ("h", "healthy_polygons")):
-            for i, poly in enumerate(data.get(key) or [], start=1):
+            polys = data.get(key) or []
+            for i, poly in enumerate(polys, start=1):
                 pts = [[float(p[0]), float(p[1])] for p in poly if len(p) >= 2]
                 if len(pts) < 2:
                     continue
                 xs, ys = [p[0] for p in pts], [p[1] for p in pts]
                 tiles.append({"id": f"{prefix}{i}", "group": prefix, "poly": pts,
                               "bbox": [min(xs), min(ys), max(xs), max(ys)]})
-        self._ann_cache[str(f)] = (mtime, tiles)
+        ann_cache[str(f)] = (mtime, tiles)
         return tiles
 
-    def wsi_path(self, plate: str, slide: str) -> Optional[Path]:
-        return self.slides.find(slide, self.root / plate)
+    def wsi_path(plate: str, slide: str) -> Optional[Path]:
+        return slides_store.find(slide, root / plate)
 
-    def load_reviews(self) -> Dict[Tuple[str, str], Dict[str, str]]:
-        if not self.csv_file.exists():
+    def load_reviews() -> Dict[Tuple[str, str], Dict[str, str]]:
+        if not csv_file.exists():
             return {}
         rows: Dict[Tuple[str, str], Dict[str, str]] = {}
-        with self.csv_file.open(newline="", encoding="utf-8-sig") as fh:
+        with csv_file.open(newline="", encoding="utf-8-sig") as fh:
             for r in csv.DictReader(fh):
                 r = {k.strip(): (v or "").strip() for k, v in r.items() if k}
                 sid = r.get("slide_id", "")
@@ -771,17 +619,16 @@ class ReviewProject:
                 key = (r.get("plate", ""), sid)
                 if not key[0]:
                     # Row added by hand without a plate: attach it to the plate that has this slide.
-                    for p in self.list_plates():
-                        if sid in self.list_slides(p):
+                    for p in list_plates():
+                        if sid in list_slides(p):
                             key = (p, sid)
                             r["plate"] = p
                             break
                 rows[key] = {**rows.get(key, {}), **{k: v for k, v in r.items() if v}}
         return rows
 
-    def write_reviews(self, rows: Dict[Tuple[str, str], Dict[str, str]]) -> None:
-        self.csv_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.csv_file.with_suffix(self.csv_file.suffix + ".tmp")
+    def write_reviews(rows: Dict[Tuple[str, str], Dict[str, str]]) -> None:
+        tmp = csv_file.with_suffix(csv_file.suffix + ".tmp")
         with tmp.open("w", newline="", encoding="utf-8-sig") as fh:  # utf-8-sig: Excel-friendly (æøå)
             # keep any extra columns added by hand, after the standard ones
             extra = []
@@ -792,58 +639,30 @@ class ReviewProject:
             w.writeheader()
             for key in sorted(rows):
                 w.writerow({k: rows[key].get(k, "") for k in fields})
-        os.replace(tmp, self.csv_file)  # atomic: the CSV is never half-written
+        os.replace(tmp, csv_file)  # atomic: the CSV is never half-written
 
-    def next_todo(self, plate: str, after: Optional[str], reviews) -> Optional[str]:
-        slides = self.list_slides(plate)
+    def next_todo(plate: str, after: Optional[str], reviews) -> Optional[str]:
+        slides = list_slides(plate)
         start = slides.index(after) + 1 if after in slides else 0
         for s in slides[start:] + slides[:start]:
             if s != after and reviews.get((plate, s), {}).get("status") != "done":
                 return s
         return None
 
-
-# ----------------------------------------------------------------------
-# App
-# ----------------------------------------------------------------------
-def create_app(projects: "OrderedDict[str, ReviewProject]", auto_close_minutes: float = 15) -> Flask:
-    # Local copy of OpenSeadragon (static/openseadragon.min.js next to this
-    # script, same as interactive_viewer.py) if present, otherwise the CDN.
-    static_dir = HERE / "static"
-    app = Flask(__name__, static_folder=str(static_dir))
-    osd_js = (
-        "/static/openseadragon.min.js"
-        if (static_dir / "openseadragon.min.js").is_file()
-        else "https://cdn.jsdelivr.net/npm/openseadragon@5.0.1/build/openseadragon/openseadragon.min.js"
-    )
-    activity = {"last": time.time()}
-
-    def get_project(proj: str) -> ReviewProject:
-        p = projects.get(proj)
-        if p is None or not p.ok:
-            abort(404)
-        return p
-
     def page(title: str, tpl: str, **ctx) -> str:
-        body = render_template_string(tpl, quit_btn=QUIT_BTN, **ctx)
-        return render_template_string(LAYOUT, title=title, body=body,
-                                      ping_url=url_for("api_ping"), quit_url=url_for("api_quit"))
+        return render_template_string(LAYOUT, title=title, body=render_template_string(tpl, **ctx))
 
     def now() -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M")
 
     # ---------------- headers ----------------
-    @app.before_request
-    def touch():
-        activity["last"] = time.time()
-
     @app.after_request
     def headers(resp):
         resp.headers["X-Frame-Options"] = "DENY"
         resp.headers["X-Content-Type-Options"] = "nosniff"
         resp.headers["Referrer-Policy"] = "no-referrer"
         resp.headers["X-Robots-Tag"] = "noindex, nofollow"
-        if "/dzi/" in request.path and resp.status_code == 200:
+        if request.path.startswith("/dzi/") and resp.status_code == 200:
             resp.headers["Cache-Control"] = "private, max-age=3600"
         elif not request.path.startswith("/static/"):
             resp.headers["Cache-Control"] = "no-store"
@@ -851,105 +670,78 @@ def create_app(projects: "OrderedDict[str, ReviewProject]", auto_close_minutes: 
 
     # ---------------- pages ----------------
     @app.route("/")
-    def home():
-        if len(projects) == 1:
-            only = next(iter(projects.values()))
-            if only.ok:
-                return redirect(url_for("plates_page", proj=only.key))
-        rows = []
-        for p in projects.values():
-            if not p.ok:
-                rows.append({"key": p.key, "name": p.name, "ok": False,
-                             "error": "folder not found", "folder": str(p.root)})
-                continue
-            reviews = p.load_reviews()
-            plates = p.list_plates()
-            total = done = 0
-            for pl in plates:
-                slides = p.list_slides(pl)
-                total += len(slides)
-                done += sum(reviews.get((pl, s), {}).get("status") == "done" for s in slides)
-            rows.append({"key": p.key, "name": p.name, "ok": True,
-                         "plates": len(plates), "total": total, "done": done})
-        return page("Projects", PROJECTS, projects=rows)
-
-    @app.route("/p/<proj>/")
-    def plates_page(proj):
-        project = get_project(proj)
-        reviews = project.load_reviews()
+    def index():
+        reviews = load_reviews()
         plates = []
-        for p in project.list_plates():
-            slides = project.list_slides(p)
+        for p in list_plates():
+            slides = list_slides(p)
             done = sum(reviews.get((p, s), {}).get("status") == "done" for s in slides)
             plates.append({"name": p, "total": len(slides), "done": done})
-        return page(project.name, PLATES, project=project, plates=plates)
+        return page("Plates", PLATES, plates=plates)
 
-    @app.route("/p/<proj>/plate/<plate>")
-    def plate_page(proj, plate):
-        project = get_project(proj)
-        project.check(plate)
-        reviews = project.load_reviews()
+    @app.route("/plate/<plate>")
+    def plate(plate):
+        if plate not in list_plates():
+            abort(404)
+        reviews = load_reviews()
         slides = []
-        for s in project.list_slides(plate):
-            tiles = project.load_tiles(plate, s)
+        for s in list_slides(plate):
+            tiles = load_tiles(plate, s)
             r = reviews.get((plate, s), {})
             slides.append({
                 "name": s,
                 "n_d": sum(t["group"] == "d" for t in tiles),
                 "n_h": sum(t["group"] == "h" for t in tiles),
-                "has_wsi": project.wsi_path(plate, s) is not None,
+                "has_wsi": wsi_path(plate, s) is not None,
                 "status": r.get("status", ""),
                 "updated_at": r.get("updated_at", ""),
             })
         done = sum(s["status"] == "done" for s in slides)
-        return page(plate, PLATE, project=project, plate=plate, slides=slides, done=done,
-                    next_todo=project.next_todo(plate, None, reviews))
+        return page(plate, PLATE, plate=plate, slides=slides, done=done,
+                    next_todo=next_todo(plate, None, reviews))
 
-    @app.route("/p/<proj>/slide/<plate>/<slide>")
-    def slide_page(proj, plate, slide):
-        project = get_project(proj)
-        project.check(plate, slide)
-        tiles = project.load_tiles(plate, slide)
-        path = project.wsi_path(plate, slide)
+    @app.route("/slide/<plate>/<slide>")
+    def slide(plate, slide):
+        check(plate, slide)
+        tiles = load_tiles(plate, slide)
+        path = wsi_path(plate, slide)
         mpp = None
         if path is not None:
             try:
-                _, mpp = project.slides.deepzoom(path)
+                _, mpp = slides_store.deepzoom(path)
             except openslide.OpenSlideError:
-                logging.exception("Could not open slide %s", path)
                 path = None
-        review = project.load_reviews().get((plate, slide), {})
+        review = load_reviews().get((plate, slide), {})
         cfg = {
             "tiles": tiles,
             "has_wsi": path is not None,
             "mpp": mpp,
-            "dzi_url": url_for("dzi", proj=proj, plate=plate, slide=slide),
+            "dzi_url": url_for("dzi", plate=plate, slide=slide),
             "review": {k: review.get(k, "") for k in CSV_FIELDS},
             "note_fields": NOTE_FIELDS,
-            "save_url": url_for("save_review", proj=proj, plate=plate, slide=slide),
-            "plate_url": url_for("plate_page", proj=proj, plate=plate),
+            "save_url": url_for("save_review", plate=plate, slide=slide),
+            "plate_url": url_for("plate", plate=plate),
         }
-        return page(slide, SLIDE, project=project, plate=plate, slide=slide, cfg=cfg, osd_js=osd_js,
-                    has_wsi=path is not None, diagnoses=project.diagnoses,
+        return page(slide, SLIDE, plate=plate, slide=slide, cfg=cfg, osd_js=osd_js,
+                    has_wsi=path is not None, diagnoses=diagnoses,
                     n_d=sum(t["group"] == "d" for t in tiles),
                     n_h=sum(t["group"] == "h" for t in tiles))
 
     # ---------------- deep zoom ----------------
-    def get_dz(proj: str, plate: str, slide: str) -> DeepZoomGenerator:
-        project = get_project(proj)
-        project.check(plate, slide)
-        path = project.wsi_path(plate, slide)
+    def get_dz(plate: str, slide: str) -> DeepZoomGenerator:
+        check(plate, slide)
+        path = wsi_path(plate, slide)
         if path is None:
             abort(404)
-        return project.slides.deepzoom(path)[0]
+        return slides_store.deepzoom(path)[0]
 
-    @app.route("/p/<proj>/dzi/<plate>/<slide>.dzi")
-    def dzi(proj, plate, slide):
-        return Response(get_dz(proj, plate, slide).get_dzi("jpeg"), mimetype="application/xml")
+    @app.route("/dzi/<plate>/<slide>.dzi")
+    def dzi(plate, slide):
+        return Response(get_dz(plate, slide).get_dzi("jpeg"), mimetype="application/xml")
 
-    @app.route("/p/<proj>/dzi/<plate>/<slide>_files/<int:level>/<int:col>_<int:row>.jpeg")
-    def dzi_tile(proj, plate, slide, level, col, row):
-        dz = get_dz(proj, plate, slide)
+    @app.route("/dzi/<plate>/<slide>_files/<int:level>/<int:col>_<int:row>.jpeg")
+    def dzi_tile(plate, slide, level, col, row):
+        dz = get_dz(plate, slide)
         try:
             img = dz.get_tile(level, (col, row))
         except ValueError:
@@ -959,10 +751,9 @@ def create_app(projects: "OrderedDict[str, ReviewProject]", auto_close_minutes: 
         return Response(buf.getvalue(), mimetype="image/jpeg")
 
     # ---------------- saving ----------------
-    @app.route("/p/<proj>/api/review/<plate>/<slide>", methods=["POST"])
-    def save_review(proj, plate, slide):
-        project = get_project(proj)
-        project.check(plate, slide)
+    @app.route("/api/review/<plate>/<slide>", methods=["POST"])
+    def save_review(plate, slide):
+        check(plate, slide)
         if not request.is_json:
             abort(400)
         data = request.get_json(silent=True) or {}
@@ -970,8 +761,8 @@ def create_app(projects: "OrderedDict[str, ReviewProject]", auto_close_minutes: 
         if action not in ("save", "done"):
             abort(400)
 
-        with project.lock:
-            rows = project.load_reviews()
+        with lock:
+            rows = load_reviews()
             prev = rows.get((plate, slide), {})
             status = "done" if action == "done" else (prev.get("status") or "draft")
             ts = now()
@@ -986,63 +777,15 @@ def create_app(projects: "OrderedDict[str, ReviewProject]", auto_close_minutes: 
             for k in NOTE_FIELDS:
                 row[k] = str(data.get(k, "")).strip()[:20000]
             rows[(plate, slide)] = row
-            project.write_reviews(rows)
+            write_reviews(rows)
 
-        nxt = project.next_todo(plate, slide, rows) if action == "done" else None
+        nxt = next_todo(plate, slide, rows) if action == "done" else None
         return jsonify({
             "status": status,
-            "next_url": url_for("slide_page", proj=proj, plate=plate, slide=nxt) if nxt else None,
+            "next_url": url_for("slide", plate=plate, slide=nxt) if nxt else None,
         })
 
-    # ---------------- app lifetime ----------------
-    @app.route("/api/ping", methods=["GET", "POST"])
-    def api_ping():
-        return jsonify({"app": APP_ID})
-
-    @app.route("/api/quit", methods=["POST"])
-    def api_quit():
-        # JSON-only, so another website open in the browser cannot stop the app
-        if not request.is_json:
-            abort(400)
-        logging.info("Close requested from the browser.")
-        _shutdown_soon(projects)
-        return jsonify({"ok": True})
-
-    _start_idle_watchdog(activity, projects, auto_close_minutes)
     return app
-
-
-def _shutdown_soon(projects: "OrderedDict[str, ReviewProject]", delay: float = 0.5) -> None:
-    """Stop the whole process shortly (after the HTTP response has gone out)."""
-    def run():
-        time.sleep(delay)
-        for p in projects.values():
-            p.lock.acquire()          # wait for any CSV write in progress
-        logging.info("Slide review stopped.")
-        logging.shutdown()
-        os._exit(0)
-    threading.Thread(target=run, daemon=True).start()
-
-
-def _start_idle_watchdog(activity: Dict[str, float], projects, minutes: float) -> None:
-    """Every open page pings once a minute. With no page open for `minutes`, stop the app."""
-    if not minutes or minutes <= 0:
-        return
-
-    def run():
-        prev = time.time()
-        while True:
-            time.sleep(30)
-            t = time.time()
-            if t - prev > 120:
-                # the computer was asleep: give the open pages time to ping again
-                activity["last"] = t
-            prev = t
-            if t - activity["last"] > minutes * 60:
-                logging.info("No review page open for %s minutes - stopping.", minutes)
-                _shutdown_soon(projects, 0)
-                return
-    threading.Thread(target=run, daemon=True).start()
 
 
 def _load_two_col(path: str, value_col: str) -> Dict[str, str]:
@@ -1056,111 +799,59 @@ def _load_two_col(path: str, value_col: str) -> Dict[str, str]:
     return out
 
 
-def _slug(name: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "project"
-
-
-def load_projects(config_path: Path, extra_dirs: List[str]):
-    """Projects from review_projects.json (+ folders given on the command line)."""
-    settings: Dict = {}
-    entries: List[Dict] = []
-    if config_path.is_file():
-        try:
-            settings = json.loads(config_path.read_text(encoding="utf-8-sig"))
-        except ValueError as e:
-            raise ValueError(
-                f"{config_path} is not valid JSON ({e}).\n"
-                "Tip: write Windows paths with / or \\\\ (e.g. E:/Christine/100k_lymphoma)."
-            ) from e
-        entries += settings.get("projects", [])
-    entries += [{"name": Path(d).name, "folder": d} for d in extra_dirs]
-
-    projects: "OrderedDict[str, ReviewProject]" = OrderedDict()
-    for e in entries:
-        if not e.get("folder"):
-            raise ValueError(f"Project entry without a \"folder\": {e}")
-        name = str(e.get("name") or Path(e["folder"]).name)
-        key = base = _slug(name)
-        n = 2
-        while key in projects:
-            key, n = f"{base}-{n}", n + 1
-        projects[key] = ReviewProject(
-            key, name, e["folder"],
-            slide_root=e.get("slide_root"),
-            csv_path=e.get("csv"),
-            slide_map_csv=e.get("slide_map"),
-            diagnoses=e.get("diagnoses"),
-        )
-    return projects, settings
-
-
-def _already_running(url: str) -> bool:
-    """Is our app already answering on this address?"""
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    try:
-        with opener.open(url + "api/ping", timeout=1.5) as r:
-            return json.loads(r.read().decode("utf-8")).get("app") == APP_ID
-    except Exception:
-        return False
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Pathologist whole-slide review app",
-        epilog="Example: python review_app.py   (projects from review_projects.json)",
+        epilog="Example: python review_app.py E:\\Christine\\100k_lymphoma",
     )
-    ap.add_argument("project_dir", nargs="*",
-                    help="Optional extra project folder(s), in addition to review_projects.json")
-    ap.add_argument("--config", default=str(CONFIG_FILE), help="Projects file (default: review_projects.json next to this script)")
-    ap.add_argument("--host", default=None,
-                    help="127.0.0.1 = only this machine (default); 0.0.0.0 = reachable from the network/VPN")
-    ap.add_argument("--port", type=int, default=None, help="default 8050")
+    ap.add_argument("project_dir",
+                    help="Project folder: contains the plate folders, slides/ and pathologist_reviews.csv")
+    ap.add_argument("--slide-root", default=None,
+                    help="Override: folder searched for slide files (default: <project_dir>/slides, "
+                         "or <project_dir> if there is no slides folder)")
+    ap.add_argument("--csv", default=None,
+                    help="Override: reviews CSV (default: <project_dir>/pathologist_reviews.csv)")
+    ap.add_argument("--slide-map", default=None, help="Optional CSV: slide_id,slide_path (overrides the search)")
+    ap.add_argument("--diagnoses", default=None,
+                    help='Quick-pick diagnosis buttons, comma separated (default: "FL,DLBCL,cHL,Nodular hyperplasia"; "" for none)')
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="127.0.0.1 = only this machine; 0.0.0.0 = reachable from the network/VPN")
+    ap.add_argument("--port", type=int, default=8050)
     ap.add_argument("--no-browser", action="store_true", help="Don't open the page in a browser on start")
     args = ap.parse_args()
 
-    config_path = Path(args.config).expanduser().resolve()
-    try:
-        projects, settings = load_projects(config_path, args.project_dir)
-    except Exception as e:
-        _show_error(f"Could not read the project list:\n\n{e}")
-        sys.exit(1)
-    if not projects:
-        _show_error(f"No projects configured.\n\nAdd them to {config_path}.")
-        sys.exit(1)
+    project = Path(args.project_dir).expanduser().resolve()
+    if not project.is_dir():
+        sys.exit(f"Project folder not found: {project}")
 
-    host = args.host or settings.get("host", "127.0.0.1")
-    port = args.port or int(settings.get("port", 8050))
-    auto_close = float(settings.get("auto_close_minutes", 15))
-    url_host = "localhost" if host in ("127.0.0.1", "0.0.0.0") else host
-    url = f"http://{url_host}:{port}/"
+    slides_dir = project / "slides"
+    slide_root = Path(args.slide_root) if args.slide_root else (slides_dir if slides_dir.is_dir() else project)
+    csv_path = Path(args.csv) if args.csv else project / "pathologist_reviews.csv"
 
-    # Icon double-clicked while the app is already running: just show it again.
-    if _already_running(url):
-        logging.info("Already running - opening %s", url)
-        if not args.no_browser:
-            webbrowser.open(url)
-        return
+    app = create_app(
+        data_root=str(project),
+        csv_path=str(csv_path),
+        slide_root=str(slide_root),
+        slide_map_csv=args.slide_map,
+        diagnoses=None if args.diagnoses is None else [d.strip() for d in args.diagnoses.split(",") if d.strip()],
+    )
 
-    app = create_app(projects, auto_close)
-    logging.info("Slide review starting on %s", url)
-    for p in projects.values():
-        logging.info("  %-14s %s%s", p.name, p.root, "" if p.ok else "   (FOLDER NOT FOUND)")
+    print(f"Project:     {project}")
+    print(f"Slides:      {slide_root}")
+    print(f"Reviews CSV: {csv_path}")
+    url_host = "localhost" if args.host in ("127.0.0.1", "0.0.0.0") else args.host
+    url = f"http://{url_host}:{args.port}/"
+    print(f"Open {url} in a browser  (Ctrl+C to stop)")
     if not args.no_browser:
-        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+        import webbrowser
+        # open once the server is up
+        threading.Timer(1.5, lambda: webbrowser.open(url)).start()
     try:
-        try:
-            from waitress import serve
-        except ImportError:
-            logging.warning("waitress not installed - using Flask's development server (pip install waitress).")
-            app.run(host=host, port=port, threaded=True)
-        else:
-            serve(app, host=host, port=port, threads=8)
-    except OSError as e:
-        _show_error(
-            f"Slide review could not start on port {port}:\n\n{e}\n\n"
-            f"Another program is probably using this port. Change \"port\" in {config_path}."
-        )
-        os._exit(1)
+        from waitress import serve
+        serve(app, host=args.host, port=args.port, threads=8)
+    except ImportError:
+        print("waitress not installed – using Flask's development server (pip install waitress).")
+        app.run(host=args.host, port=args.port, threaded=True)
 
 
 if __name__ == "__main__":
