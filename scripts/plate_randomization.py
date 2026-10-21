@@ -23,7 +23,7 @@ Usage:
     3) per slide: 
     ROISelector(...).write_lmd_and_metadata(planner.well_assignment_path(plate_id=1), patient_id)
 """
-
+import re
 from __future__ import annotations
 from dataclasses import dataclass
 import os
@@ -119,6 +119,18 @@ def _write_csv_atomic(df: pd.DataFrame, path: str) -> None:
     tmp = f"{path}.tmp"
     df.to_csv(tmp, index=False)
     os.replace(tmp, path)
+
+def plate_to_lmd(well):
+    m = re.fullmatch(r"([A-P])(\d{1,2})", str(well).strip().upper())
+    if m is None:
+        raise ValueError(f"Unrecognised well: {well}")
+    row, col = m.group(1), int(m.group(2))
+    if row == "A" or col == 1:
+        raise ValueError(f"{well} has no LMD equivalent (row A / column 1)")
+    return f"{chr(ord(row) - 1)}{col - 1}"
+
+# df = df.rename(columns={"well": "plate_well"})
+# df["LMD_well"] = df["plate_well"].map(plate_to_lmd)
 
 # --------------------------------------------------------------------------
 # Filling ROI columns (called by ROISelector after writing the LMD XML)
