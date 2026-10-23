@@ -24,6 +24,7 @@ Usage:
     ROISelector(...).write_lmd_and_metadata(planner.well_assignment_path(plate_id=1), patient_id)
 """
 from __future__ import annotations
+import re
 from dataclasses import dataclass
 import os
 import numpy as np

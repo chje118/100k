@@ -612,6 +612,16 @@ class ROISelector:
         return matches[0]
 
     @staticmethod
+    def _table_id_for(well_assignment_path: str, patient_id: str) -> str:
+        """The patient's table_id (e.g. 'PR86_0027') from the plate's well assignment CSV."""
+        df = load_well_assignment(well_assignment_path)
+        ids = df.loc[df["patient_id"] == str(patient_id), "table_id"].dropna().astype(str).str.strip().unique()
+        ids = [t for t in ids if t and t.lower() != "nan"]
+        if len(ids) != 1:
+            raise ValueError(f"Patient {patient_id!r}: expected 1 table_id in {well_assignment_path}, found {ids}.")
+        return ids[0]
+
+    @staticmethod
     def _lmd_wells_for(well_assignment_path: str, patient_id: str, arm: str,
                        n_tiles: int, overwrite: bool = False) -> list[str]:
         """
@@ -648,7 +658,7 @@ class ROISelector:
         The patient is inferred from the slide filename.
         """
         patient_id = self.patient_id_from_plate(well_assignment_path)
-
+        table_id = self._table_id_for(well_assignment_path, patient_id)
         self.add_calibration_points()
         disease_tiles, healthy_tiles = self.select_tiles()
 
@@ -662,7 +672,8 @@ class ROISelector:
             shapes = self.sdata_lmd.shapes[key]
             # ShapesModel.parse keeps row order, so shape k == select_tiles() row k
             shapes["LMD_well"] = wells
-            shapes["tile_name"] = shapes.index.astype(str)
+            # Shape name in the XML: <table_id>_d0..d4 (disease) / <table_id>_h0..h4 (healthy), k = cut order
+            shapes["tile_name"] = [f"{table_id}_{arm[0]}{k}" for k in range(len(shapes))]
 
         # 2) Write the XMLs with CapID per shape
         paths = self.write_to_lmd(well_column="LMD_well", name_column="tile_name")
@@ -673,6 +684,7 @@ class ROISelector:
                         slide_path=self.slide_path, lmd_xml=paths.get(arm), overwrite=overwrite)
 
         for arm in paths:
-            wells = self.sdata_lmd.shapes[f"{arm}_tiles"]["LMD_well"].tolist()
-            print(f"{arm}: shapes -> LMD wells {wells}")
+            shapes = self.sdata_lmd.shapes[f"{arm}_tiles"]
+            pairs = list(zip(shapes["tile_name"], shapes["LMD_well"]))
+            print(f"{arm}: shape -> LMD well {pairs}")
         return paths
