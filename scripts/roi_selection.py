@@ -36,6 +36,10 @@ class ROISelector:
 
     - The selection is computed once and cached, so plots, LMD XML and the
       well assignment CSV all use the same tiles in the same order.
+
+    - LMD wells: write_lmd_and_metadata() reads each tile's LMD_well from the
+      plate's well assignment CSV and writes it as the shape's <CapID>, so
+      shape k in the XML is cut into the patient's k-th well for that arm.
     """
     def __init__(self, cache_path: str, slide_path: str, disease_k: int = 5, healthy_k: int = 5, sample_pct: float = 0.20, random_state: int | None = 42, disease_score_col: str = "contribution_score", healthy_score_col: str = "contrast_score", attention_floor: float = 0.05, min_effect_size: float = 0.0, strict_topk: bool = False, min_spatial_distance: float | None = None):
         self.cache_path = cache_path
@@ -542,7 +546,14 @@ class ROISelector:
             img = get_pyramid_levels(img, n=0)                   # scale0 DataArray
         return img.sizes["y"]
 
-    def write_to_lmd(self):
+    def write_to_lmd(self, well_column: str | None = None, name_column: str | None = None):
+        """
+        Write one LMD XML per arm.
+
+        well_column: column in the shapes holding the LMD well per tile; written
+                     as each shape's <CapID> so the LMD software assigns the well.
+        name_column: column written as each shape's name (e.g. the tile ID).
+        """
         slide_name = os.path.splitext(os.path.basename(self.slide_path))[0]
         paths = {}
         try:
@@ -561,12 +572,14 @@ class ROISelector:
                     [0,  0, 1]
                 ])
 
-                # Write LMD file with tiles and calibration points
+                # Write LMD file with tiles, wells (CapID) and calibration points
                 write_lmd(
                     path = path_lmd,
                     annotation = self.sdata_lmd.shapes[f"{tiles}_tiles"],
                     calibration_points=self.sdata_lmd.points["calibration_points"],
-                    affine_transformation=affine_transformation
+                    affine_transformation=affine_transformation,
+                    annotation_well_column=well_column,
+                    annotation_name_column=name_column,
                 )
                 print(f"Wrote LMD file for {tiles} tiles: {path_lmd}")
                 paths[tiles] = path_lmd
@@ -598,21 +611,68 @@ class ROISelector:
             )
         return matches[0]
 
+    @staticmethod
+    def _lmd_wells_for(well_assignment_path: str, patient_id: str, arm: str,
+                       n_tiles: int, overwrite: bool = False) -> list[str]:
+        """
+        The patient's LMD wells for this arm, in the same row order record_rois
+        fills them (row k -> k-th well). Checks run before any XML is written.
+        """
+        df = load_well_assignment(well_assignment_path)
+        rows = df[(df["patient_id"] == str(patient_id)) & (df["arm"] == arm)]
+        if rows.empty:
+            raise KeyError(f"Patient {patient_id!r} has no {arm} wells in {well_assignment_path} - wrong plate?")
+        if n_tiles > len(rows):
+            raise ValueError(
+                f"Patient {patient_id!r} {arm}: {n_tiles} tiles selected but only {len(rows)} wells. "
+                "Set ROISelector disease_k/healthy_k to PlateConfig disease_tiles/healthy_tiles."
+            )
+        if not overwrite and rows["tile_id"].notna().any():
+            raise ValueError(
+                f"Patient {patient_id!r} {arm} wells are already filled in {well_assignment_path}. "
+                "Pass overwrite=True to replace (make sure the old XML is replaced too)."
+            )
+        if "LMD_well" not in rows.columns:
+            raise KeyError(f"{well_assignment_path} has no 'LMD_well' column - rebuild with prepare_well_assignment().")
+        wells = rows["LMD_well"].astype(str).str.strip().tolist()[:n_tiles]
+        bad = [w for w in wells if not w or w.lower() == "nan"]
+        if bad:
+            raise ValueError(f"Patient {patient_id!r} {arm}: empty LMD_well value(s) in {well_assignment_path}.")
+        return wells
+
     def write_lmd_and_metadata(self, well_assignment_path: str, overwrite: bool = False):
         """
-        Write LMD XMLs, then record the same tiles (same order) in the plate's
-        well assignment CSV: shape k in the XML -> the patient's k-th well for that arm.
+        Write LMD XMLs with each shape's well (<CapID>), then record the same
+        tiles (same order) in the plate's well assignment CSV:
+        shape k in the XML -> the patient's k-th well for that arm.
         The patient is inferred from the slide filename.
         """
-        patient_id = self.patient_id_from_plate(well_assignment_path) 
+        patient_id = self.patient_id_from_plate(well_assignment_path)
 
         self.add_calibration_points()
-        paths = self.write_to_lmd()
-
         disease_tiles, healthy_tiles = self.select_tiles()
+
+        # 1) Look up and attach wells for every arm before writing anything,
+        #    so a wrong plate / already-filled plate never overwrites an XML.
         for arm, tiles in [("disease", disease_tiles), ("healthy", healthy_tiles)]:
-            if arm not in paths:
-                continue  # empty arm, no XML written
+            wells = self._lmd_wells_for(well_assignment_path, patient_id, arm, len(tiles), overwrite)
+            key = f"{arm}_tiles"
+            if key not in self.sdata_lmd.shapes:
+                continue  # empty arm: no shapes to export
+            shapes = self.sdata_lmd.shapes[key]
+            # ShapesModel.parse keeps row order, so shape k == select_tiles() row k
+            shapes["LMD_well"] = wells
+            shapes["tile_name"] = shapes.index.astype(str)
+
+        # 2) Write the XMLs with CapID per shape
+        paths = self.write_to_lmd(well_column="LMD_well", name_column="tile_name")
+
+        # 3) Record the tiles in the plate CSV (empty arms get a "no tile" note on their wells)
+        for arm, tiles in [("disease", disease_tiles), ("healthy", healthy_tiles)]:
             record_rois(well_assignment_path, patient_id, arm, tiles,
-                        slide_path=self.slide_path, lmd_xml=paths[arm], overwrite=overwrite)
+                        slide_path=self.slide_path, lmd_xml=paths.get(arm), overwrite=overwrite)
+
+        for arm in paths:
+            wells = self.sdata_lmd.shapes[f"{arm}_tiles"]["LMD_well"].tolist()
+            print(f"{arm}: shapes -> LMD wells {wells}")
         return paths
