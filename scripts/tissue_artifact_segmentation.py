@@ -165,7 +165,7 @@ class SegmentTissue:
     - 'grandqc': Deep learning-based segmentation
     - 'threshold': Threshold-based with HSV conversion (threshold=5)
     """
-    VALID_VERSIONS = ["default", "grandqc", "threshold"]
+    VALID_VERSIONS = ["default", "grandqc", "threshold", "entropy"]
     
     def __init__(self, wsi_path, zarr_dir, version="default", overwrite=False):
         if version not in self.VALID_VERSIONS:
@@ -204,7 +204,8 @@ class SegmentTissue:
                 zs.seg._tissue.tissue(self.wsi, model='grandqc', key_added=self.tissue_key, device="cpu")
             elif self.version == "threshold":
                 zs.pp.find_tissues(self.wsi, threshold=5, to_hsv=True, filter_artifacts=False, key_added=self.tissue_key)
-            
+            elif self.version == "entropy":
+                zs.pp.find_tissues(self.wsi, method="entropy", level=-5, key_added=self.tissue_key)
             self.elapsed_time = datetime.now() - start
             self.wsi.write(self.zarr_path)
         except Exception as e:
