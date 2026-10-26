@@ -72,6 +72,30 @@ def _store_processed_entry(cache, slide_name, category, model, data):
     """Store a processed entry using the slide -> category -> model layout."""
     cache.setdefault(slide_name, {}).setdefault(category, {})[model] = data
 
+def _should_force(force_rerun, path):
+    """Return True if this slide must be rerun regardless of cache.
+
+    force_rerun: bool (all slides) or an iterable of slide paths / file names.
+    """
+    if isinstance(force_rerun, bool):
+        return force_rerun
+    names = {os.path.basename(p) for p in force_rerun}
+    return os.path.basename(path) in names
+
+def _drop_wsi_elements(wsi, keys, zarr_path):
+    """Remove shapes/tables from the WSI in memory and from its zarr store, so they get recomputed."""
+    for key in keys:
+        for store in (wsi.shapes, wsi.tables):
+            if key not in store:
+                continue
+            if os.path.exists(zarr_path):
+                try:
+                    wsi.delete_element_from_disk(key)
+                except Exception as e:
+                    print(f"Could not delete {key} from {zarr_path}: {e}")
+            del store[key]
+            print(f"Dropped existing {key} for rerun")
+
 def _remove_zarr_path(zarr_path):
     """Safely remove Zarr directory or file."""
     if os.path.isdir(zarr_path):
@@ -143,7 +167,7 @@ class SegmentTissue:
     """
     VALID_VERSIONS = ["default", "grandqc", "threshold"]
     
-    def __init__(self, wsi_path, zarr_dir, version="default"):
+    def __init__(self, wsi_path, zarr_dir, version="default", overwrite=False):
         if version not in self.VALID_VERSIONS:
             raise ValueError(f"version must be one of {self.VALID_VERSIONS}")
         
@@ -154,6 +178,8 @@ class SegmentTissue:
         self.version = version
         self.tissue_key = f"tissue_{version}"
         self.elapsed_time = None
+        if overwrite:
+            _drop_wsi_elements(self.wsi, [self.tissue_key], self.zarr_path)
         self.process_slide()
 
     def process_slide(self):
@@ -201,7 +227,7 @@ class SegmentArtifacts:
     """
     VALID_VERSIONS = ["default", "10x"]
     
-    def __init__(self, wsi_path: str, zarr_dir: str, version="default"):
+    def __init__(self, wsi_path: str, zarr_dir: str, version="default", overwrite=False):
         if version not in self.VALID_VERSIONS:
             raise ValueError(f"version must be one of {self.VALID_VERSIONS}")
         
@@ -215,6 +241,9 @@ class SegmentArtifacts:
         self.artifact_key = "artifacts_grandqc" if version == "default" else "artifacts_grandqc_10x"
         self.tissue_key = None
         self.elapsed_time = None
+        if overwrite:
+            # Tiles are dropped too, since they depend on the (possibly re-segmented) tissue
+            _drop_wsi_elements(self.wsi, [self.tile_key, self.artifact_key], self.zarr_path)
         self.process_slide()
 
     def _find_tissue_key(self):
@@ -312,7 +341,13 @@ class SegmentArtifacts:
 class SegmentMany:
     """ Batch processing of tissue and artifact segmentation for multiple WSI with checkpointing. """
     
-    def __init__(self, wsi_paths, cache_path, zarr_dir, segmentation_type, version="default", retry_on_previos_errors=False):
+    def __init__(self, wsi_paths, cache_path, zarr_dir, segmentation_type, version="default", retry_on_previos_errors=False, force_rerun=False):
+        """
+        retry_on_previos_errors: rerun slides whose cached status is an error.
+        force_rerun: rerun regardless of cache status and overwrite existing zarr results.
+                     True for all slides, or an iterable of slide paths / file names.
+                     The cache entry is replaced with the new result (complete or error).
+        """
         if segmentation_type not in ["tissue", "artifact"]:
             raise ValueError("segmentation_type must be 'tissue' or 'artifact'")
         
@@ -322,6 +357,7 @@ class SegmentMany:
         self.segmentation_type = segmentation_type
         self.version = version
         self.retry_on_previos_errors = retry_on_previos_errors
+        self.force_rerun = force_rerun
         self.version_key = f"{segmentation_type}_{version}"
         self.cache = _load_cache(cache_path)
         self.processed = _get_processed_entries(self.cache)
@@ -332,12 +368,16 @@ class SegmentMany:
         for path in tqdm(self.wsi_paths, desc=f"{self.segmentation_type} segmentation"):
             slide_name = os.path.basename(path)
             cache_key = (slide_name, self.segmentation_type, self.version)
+            force = _should_force(self.force_rerun, path)
 
-            if cache_key in self.processed and self.processed[cache_key].get("status") == "complete":
+            if force:
+                if cache_key in self.processed:
+                    print(f"Force rerun of {slide_name} — ignoring cached status: {self.processed[cache_key].get('status')}")
+            elif cache_key in self.processed and self.processed[cache_key].get("status") == "complete":
                 print(f"Skipping {slide_name} — already processed")
                 continue
 
-            if (
+            elif (
                 cache_key in self.processed
                 and str(self.processed[cache_key].get("status", "")).startswith("error:")
                 and not self.retry_on_previos_errors
@@ -350,7 +390,7 @@ class SegmentMany:
 
             try:
                 if self.segmentation_type == "tissue":
-                    wsiobj = SegmentTissue(path, self.zarr_dir, version=self.version)
+                    wsiobj = SegmentTissue(path, self.zarr_dir, version=self.version, overwrite=force)
                     slide_data = {
                         "slide": slide_name,
                         "wsi_path": path,
@@ -362,7 +402,7 @@ class SegmentMany:
                         "status": "complete"
                     }
                 elif self.segmentation_type == "artifact":
-                    wsiobj = SegmentArtifacts(path, self.zarr_dir, version=self.version)
+                    wsiobj = SegmentArtifacts(path, self.zarr_dir, version=self.version, overwrite=force)
                     slide_data = {
                         "slide": slide_name,
                         "wsi_path": path,

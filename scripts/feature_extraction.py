@@ -13,6 +13,8 @@ from tissue_artifact_segmentation import (
     _save_cache,
     _get_processed_entries,
     _store_processed_entry,
+    _should_force,
+    _drop_wsi_elements,
 )
 from wsidata import open_wsi
 
@@ -63,6 +65,7 @@ class ExtractFeatures:
         feature_batch_size=512,
         feature_num_workers=None,
         feature_autocast_dtype=None,
+        overwrite=False,
     ):
         self.wsi_path = wsi_path
         self.zarr_path = os.path.join(zarr_dir, os.path.basename(wsi_path).replace(".mrxs", ".zarr"))
@@ -89,6 +92,8 @@ class ExtractFeatures:
         self.FEATURE_KEY = f"{base_feature_key}_mpp{mpp}" if mpp != 0.12 else base_feature_key
 
         self.elapsed_time = None
+        if overwrite:
+            _drop_wsi_elements(self.wsi, [self.TILE_KEY, self.FEATURE_KEY], self.zarr_path)
         self.process_slide()
 
     def _get_tissue_key(self):
@@ -226,7 +231,14 @@ class ExtractMany:
         feature_autocast_dtype=None,
         retry_on_previous_errors=False,
         use_cache=True,
+        force_rerun=False,
     ):
+        """
+        retry_on_previous_errors: rerun slides whose cached status is an error.
+        force_rerun: rerun regardless of cache status and overwrite existing tiles/features in zarr.
+                     True for all slides, or an iterable of slide paths / file names.
+                     The cache entry is replaced with the new result (complete or error).
+        """
         self.wsi_paths = wsi_paths
         self.cache_path = cache_path
         self.use_cache = use_cache
@@ -240,6 +252,7 @@ class ExtractMany:
         self.feature_num_workers = feature_num_workers
         self.feature_autocast_dtype = feature_autocast_dtype
         self.retry_on_previous_errors = retry_on_previous_errors
+        self.force_rerun = force_rerun
 
         # Load cache and track processed slides only when caching is enabled.
         if self.use_cache:
@@ -269,7 +282,10 @@ class ExtractMany:
             # Check if already processed
             fm_key = f"{self.foundation_model}_mpp{self.mpp}" if self.mpp != 0.12 else self.foundation_model
             cache_key = (slide_name, "features", fm_key)
-            if self.use_cache and cache_key in self.processed:
+            force = _should_force(self.force_rerun, path)
+            if force and cache_key in self.processed:
+                print(f"Force rerun of {slide_name} — ignoring cached status: {self.processed[cache_key].get('status')}")
+            elif self.use_cache and cache_key in self.processed:
                 status = self.processed[cache_key].get("status")
                 if status == "complete":
                     print(f"Skipping {slide_name} — already processed")
@@ -295,6 +311,7 @@ class ExtractMany:
                     feature_batch_size=self.feature_batch_size,
                     feature_num_workers=self.feature_num_workers,
                     feature_autocast_dtype=self.feature_autocast_dtype,
+                    overwrite=force,
                 )
                 features = wsiobj.get_features()
                 elapsed_time = wsiobj.elapsed_time
