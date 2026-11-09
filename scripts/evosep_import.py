@@ -2,9 +2,12 @@
 Evosep / Xcalibur import list from a plate's well assignment CSV.
 
 Layout (matches evosep_import_100k_P1.csv):
-- Each 384-well quadrant is one 96-well Evotip box in its own slot:
+- Each 384-well quadrant is one 96-well Evotip box in its own slot. Default
       Q1 -> EvoSlot 3, Q2 -> EvoSlot 4, Q3 -> EvoSlot 5, Q4 -> EvoSlot 6
-  and is run as one block, Q1 first, Q4 last.
+  override with slots=, e.g. slots={"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4}.
+  Each quadrant is run as one block, Q1 first, Q4 last.
+- Only wells with a selected tile (tile_id filled) are written, so no empty
+  tips are run. Pass drop_empty=False to run every assigned well.
 - 384 well -> 96 vial (row-major, 1-96):
       vial = (row_idx // 2) * 12 + (col - 1) // 2 + 1      (row_idx: A=0)
 - Each quadrant block starts with one HeLa then one blank, both in that
@@ -19,7 +22,8 @@ Layout (matches evosep_import_100k_P1.csv):
 
 Usage:
     wa = load_well_assignment(planner.well_assignment_path(1))
-    evo, wa_ms = make_evosep_import(wa, date="20261023", seed=1)
+    evo, wa_ms = make_evosep_import(wa, date="20261023", seed=1,
+                                    slots={"Q1": 3, "Q2": 4, "Q3": 5, "Q4": 6})
     write_evosep_csv(evo, "evosep_import_100k_P1.csv")
     # wa_ms = well assignment + run_order / ms_sample_name / evo_slot / evo_vial
 """
@@ -33,7 +37,7 @@ import pandas as pd
 
 PLATE_ROWS = "ABCDEFGHIJKLMNOP"
 QUADRANTS = ("Q1", "Q2", "Q3", "Q4")
-QUADRANT_SLOT = {"Q1": "EvoSlot 3", "Q2": "EvoSlot 4", "Q3": "EvoSlot 5", "Q4": "EvoSlot 6"}
+QUADRANT_SLOT = {"Q1": 3, "Q2": 4, "Q3": 5, "Q4": 6}   # default EvoSlot per quadrant
 # (HeLa vial, blank vial) per quadrant: outer-ring wells of that quadrant
 QC_VIALS = {"Q1": (1, 12), "Q2": (1, 12), "Q3": (85, 96), "Q4": (85, 96)}
 
@@ -61,6 +65,23 @@ def well_quadrant(well: str) -> str:
     return "Q3" if col % 2 else "Q4"
 
 
+def _slot_map(slots: dict | None) -> dict[str, str]:
+    """{"Q1": 3, ...} or {"Q1": "EvoSlot 3", ...} -> {"Q1": "EvoSlot 3", ...}."""
+    slots = {**QUADRANT_SLOT, **(slots or {})}
+    unknown = set(slots) - set(QUADRANTS)
+    if unknown:
+        raise ValueError(f"Unknown quadrant(s) in slots: {sorted(unknown)}; use {QUADRANTS}.")
+    out = {}
+    for q, s in slots.items():
+        m = re.fullmatch(r"(?:EvoSlot\s*)?(\d+)", str(s).strip(), flags=re.IGNORECASE)
+        if m is None:
+            raise ValueError(f"{q}: slot {s!r} is not a number or 'EvoSlot <n>'.")
+        out[q] = f"EvoSlot {int(m.group(1))}"
+    if len(set(out.values())) != len(out):
+        raise ValueError(f"Two quadrants share a slot: {out}")
+    return out
+
+
 def well_to_vial(well: str) -> int:
     """384 well -> position (1-96, row-major) in its quadrant's 96 Evotip box."""
     row_idx, col = _parse_well(well)
@@ -70,15 +91,19 @@ def well_to_vial(well: str) -> int:
 def make_evosep_import(well_df: pd.DataFrame, date: str | None = None, seed: int = 0,
                        prefix: str = DEFAULT_PREFIX, method: str = DEFAULT_METHOD,
                        output_dir: str = DEFAULT_OUTPUT_DIR, well_col: str = "plate_well",
-                       plate: int | None = None, drop_empty: bool = False):
+                       plate: int | None = None, drop_empty: bool = True,
+                       slots: dict | None = None):
     """
     Build the Evosep import table for ONE plate.
 
     well_df:    the plate's well assignment (one row per well).
     date:       YYYYMMDD prefix for file names (default: today).
     seed:       seed for the within-quadrant run order.
-    drop_empty: drop wells with no tile (tile_id empty, e.g. "no tile" notes).
-                Default False = run every assigned well, like the template.
+    drop_empty: drop wells with no selected tile (tile_id empty, e.g. "no tile"
+                notes) so no empty tips are run. Default True; False = run
+                every assigned well, like the template.
+    slots:      EvoSlot per quadrant, e.g. {"Q1": 3, "Q2": 4} (ints or
+                "EvoSlot 3"). Quadrants left out keep the default 3/4/5/6.
 
     Returns (evosep_df, well_df_with_ms_columns).
     """
@@ -88,8 +113,15 @@ def make_evosep_import(well_df: pd.DataFrame, date: str | None = None, seed: int
         if len(plates) != 1:
             raise ValueError(f"Expected one plate in well_df, found {list(plates)}; pass plate=.")
         plate = int(plates[0])
-    if drop_empty and "tile_id" in df.columns:
+    slot_of = _slot_map(slots)
+    if drop_empty:
+        if "tile_id" not in df.columns:
+            raise ValueError("drop_empty=True needs a 'tile_id' column; pass drop_empty=False to run all wells.")
+        n_before = len(df)
         df = df[df["tile_id"].notna() & (df["tile_id"].astype(str).str.strip() != "")]
+        print(f"Plate {plate}: {len(df)}/{n_before} wells have a selected tile; {n_before - len(df)} empty wells skipped.")
+        if df.empty:
+            raise ValueError(f"Plate {plate}: no wells with a selected tile (tile_id is empty everywhere).")
 
     date = date or _dt.date.today().strftime("%Y%m%d")
     base = f"{date}_{prefix}_P{plate}"
@@ -98,7 +130,7 @@ def make_evosep_import(well_df: pd.DataFrame, date: str | None = None, seed: int
     if "quadrant" in df.columns and (df["quadrant"] != df["_q"]).any():
         raise ValueError("'quadrant' column disagrees with the well positions.")
     df["evo_vial"] = df[well_col].map(well_to_vial)
-    df["evo_slot"] = df["_q"].map(QUADRANT_SLOT)
+    df["evo_slot"] = df["_q"].map(slot_of)
     df["ms_sample_name"] = [
         f"{base}_pos{str(w).strip().lower()}_{q.lower()}_{v}"
         for w, q, v in zip(df[well_col], df["_q"], df["evo_vial"])
@@ -118,8 +150,8 @@ def make_evosep_import(well_df: pd.DataFrame, date: str | None = None, seed: int
             continue
         qc_n += 1
         hela_v, blank_v = QC_VIALS[q]
-        runs.append((QUADRANT_SLOT[q], hela_v, f"{base}_QC_Hela{qc_n:02d}", None))
-        runs.append((QUADRANT_SLOT[q], blank_v, f"{base}_QC_blank{qc_n:02d}", None))
+        runs.append((slot_of[q], hela_v, f"{base}_QC_Hela{qc_n:02d}", None))
+        runs.append((slot_of[q], blank_v, f"{base}_QC_blank{qc_n:02d}", None))
         for idx in rng.permutation(block.index.to_numpy()):
             r = block.loc[idx]
             runs.append((r["evo_slot"], int(r["evo_vial"]), r["ms_sample_name"], idx))
