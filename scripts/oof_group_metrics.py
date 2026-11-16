@@ -1,12 +1,14 @@
 """
-Per-group (e.g. per-tissue) AUC and accuracy from saved K-fold ABMIL checkpoints.
-No retraining: each slide is scored by the fold model that held it out.
+Out-of-fold predictions from saved K-fold ABMIL checkpoints. No retraining:
+each slide is scored by the fold model that held it out, on exactly the same tiles as in training.
 
     from oof_group_metrics import collect_oof_predictions, group_metrics
 
     oof = collect_oof_predictions(df, filename_col="filename", label_col="label", group_col="tissue",
-                                  feature_key=FEATURE_KEY, zarr_dir=ZARR_DIR, checkpoint_dir="checkpoints/")
-    print(group_metrics(oof, "tissue"))
+                                  feature_key=FEATURE_KEY, zarr_dir=ZARR_DIR, checkpoint_dir="checkpoints/",
+                                  patient_col="rekvnr")
+    group_metrics(oof, "tissue") 
+    # oof.attrs["configs"], oof.attrs["skipped"]: training config per fold, unreadable slides
 """
 
 import json
@@ -22,19 +24,20 @@ from abmil import ZarrSlideDataset, load_checkpoint, _find_fold_checkpoint
 
 @torch.no_grad()
 def collect_oof_predictions(df, filename_col, label_col, group_col, feature_key, zarr_dir,
-                            checkpoint_dir, n_splits=5):
-    """One row per held-out slide: fold, group, true label (0/1), P(class 1), predicted class."""
+                            checkpoint_dir, n_splits=5, patient_col=None):
+    """One row per held-out slide: slide, fold, group, (patient), label (0/1), prob_pos, pred, n_tiles."""
     meta = df.set_index(filename_col)
     if not meta.index.is_unique:
         raise ValueError(f"Duplicate values in '{filename_col}'; each slide must appear once.")
 
-    rows, skipped = [], []
+    rows, skipped, configs = [], [], {}
     for fold in range(1, n_splits + 1):
         with open(os.path.join(checkpoint_dir, f"fold_{fold}_test_slides.json")) as f:
             test_slides = json.load(f)
 
         ckpt_path = _find_fold_checkpoint(checkpoint_dir, fold)
         model, config, label_mapping = load_checkpoint(ckpt_path)
+        configs[fold] = dict(config)
         device = next(model.parameters()).device
 
         # Rebuild the fold's test set exactly as in training:
@@ -71,9 +74,11 @@ def collect_oof_predictions(df, filename_col, label_col, group_col, feature_key,
                 "slide": test_df[filename_col].iloc[i],
                 "fold": fold,
                 group_col: test_df[group_col].iloc[i],
+                **({patient_col: test_df[patient_col].iloc[i]} if patient_col else {}),
                 "label": int(label.item()),
                 "prob_pos": float(probs[1].item()),
                 "pred": int(probs.argmax().item()),
+                "n_tiles": int(feats.shape[0]),  # tiles the model saw (capped at max_tiles)
             })
 
         # Sanity check: equals the AUC in the checkpoint filename when no slides were skipped
@@ -86,7 +91,9 @@ def collect_oof_predictions(df, filename_col, label_col, group_col, feature_key,
 
     oof = pd.DataFrame(rows)
     skipped_df = pd.DataFrame(skipped, columns=["slide", "fold", group_col, "error"])
-    oof.attrs["skipped"] = skipped_df  # inspect with oof.attrs["skipped"]
+    oof.attrs["skipped"] = skipped_df
+    oof.attrs["configs"] = configs
+    oof.attrs["label_mapping"] = label_mapping
     if len(skipped_df):
         print(f"\nSkipped {len(skipped_df)} unreadable slides. Per {group_col}:")
         print(skipped_df[group_col].value_counts().to_string())
