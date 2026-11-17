@@ -5,7 +5,7 @@ each slide is scored by the fold model that held it out, on exactly the same til
     from oof_group_metrics import collect_oof_predictions, group_metrics
 
     oof = collect_oof_predictions(df, filename_col="filename", label_col="label", group_col="tissue",
-                                  feature_key=FEATURE_KEY, zarr_dir=ZARR_DIR, checkpoint_dir="checkpoints/",
+                                  feature_key=["name_a", "name_b"], zarr_dir=ZARR_DIR, checkpoint_dir="checkpoints/",
                                   patient_col="rekvnr")
     group_metrics(oof, "tissue") 
     # oof.attrs["configs"], oof.attrs["skipped"]: training config per fold, unreadable slides
@@ -25,7 +25,12 @@ from abmil import ZarrSlideDataset, load_checkpoint, _find_fold_checkpoint
 @torch.no_grad()
 def collect_oof_predictions(df, filename_col, label_col, group_col, feature_key, zarr_dir,
                             checkpoint_dir, n_splits=5, patient_col=None):
-    """One row per held-out slide: slide, fold, group, (patient), label (0/1), prob_pos, pred, n_tiles."""
+    """One row per held-out slide: slide, fold, group, (patient), label (0/1), prob_pos, pred, n_tiles, feature_key.
+
+    feature_key: one name, or a list of names for the same features stored under different names
+    (e.g. ["uni_features", "UNI"]); each slide uses the first name it has.
+    """
+    keys = [feature_key] if isinstance(feature_key, str) else list(feature_key)
     meta = df.set_index(filename_col)
     if not meta.index.is_unique:
         raise ValueError(f"Duplicate values in '{filename_col}'; each slide must appear once.")
@@ -47,25 +52,35 @@ def collect_oof_predictions(df, filename_col, label_col, group_col, feature_key,
         if test_df[label_col].isna().any():
             raise ValueError(f"Fold {fold}: labels not in checkpoint mapping {label_mapping}")
 
-        dataset = ZarrSlideDataset(
+        # One dataset per key name; same df, seed and index, so the tile subsample is identical
+        datasets = {key: ZarrSlideDataset(
             df=test_df,
             filename_col=filename_col,
             label_col=label_col,
-            feature_key=feature_key,
+            feature_key=key,
             zarr_dir=zarr_dir,
             max_tiles=config.get("max_tiles"),
             seed=config.get("random_state"),
-        )
+        ) for key in keys}
 
         fold_rows = []
         # Iterate over the full saved list and skip unreadable slides: indices are unchanged,
         # so the remaining slides get exactly the same tile subsample as in training.
-        for i in range(len(dataset)):
-            try:
-                feats, _, label = dataset[i]
-            except Exception as e:
+        for i in range(len(test_df)):
+            feats, used_key, error = None, None, None
+            for key, dataset in datasets.items():
+                try:
+                    feats, _, label = dataset[i]
+                    used_key = key
+                    break
+                except KeyError as e:  # this slide has no table under this key name: try the next one
+                    error = f"no feature table {list(keys)}: {e}"
+                except Exception as e:  # unreadable slide: no point trying another key
+                    error = f"{type(e).__name__}: {e}"
+                    break
+            if feats is None:
                 skipped.append({"slide": test_df[filename_col].iloc[i], "fold": fold,
-                                group_col: test_df[group_col].iloc[i], "error": f"{type(e).__name__}: {e}"})
+                                group_col: test_df[group_col].iloc[i], "error": error})
                 continue
             if feats.shape[0] == 0:
                 continue
@@ -79,6 +94,7 @@ def collect_oof_predictions(df, filename_col, label_col, group_col, feature_key,
                 "prob_pos": float(probs[1].item()),
                 "pred": int(probs.argmax().item()),
                 "n_tiles": int(feats.shape[0]),  # tiles the model saw (capped at max_tiles)
+                "feature_key": used_key,
             })
 
         # Sanity check: equals the AUC in the checkpoint filename when no slides were skipped
@@ -90,6 +106,8 @@ def collect_oof_predictions(df, filename_col, label_col, group_col, feature_key,
         rows.extend(fold_rows)
 
     oof = pd.DataFrame(rows)
+    if len(keys) > 1:
+        print("\nSlides per feature key:", oof["feature_key"].value_counts().to_dict())
     skipped_df = pd.DataFrame(skipped, columns=["slide", "fold", group_col, "error"])
     oof.attrs["skipped"] = skipped_df
     oof.attrs["configs"] = configs
