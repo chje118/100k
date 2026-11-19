@@ -12,7 +12,7 @@ Input: `oof` from oof_group_metrics.collect_oof_predictions
     # Main
     cv.table_cohort(oof, "tissue", "rekvnr")                 # Table 1
     cv.table_per_organ(t, "tissue")                          # Table 2
-    cv.fig_cv_roc(oof, t, "tissue")                          # Fig. 1
+    cv.fig_cv_roc(oof, t, "tissue", groups=["Lymphoma"])     # Fig. 1 (groups: optional extra organ curves)
     cv.fig_forest(t, "tissue")                               # Fig. 2
 
     # Supplement
@@ -20,7 +20,8 @@ Input: `oof` from oof_group_metrics.collect_oof_predictions
     cv.table_organ_by_fold(oof, "tissue")
     cv.fig_roc_per_organ(oof, t, "tissue")
     cv.fig_scores(oof, t, "tissue")
-    cv.fig_confusion(oof, t, "tissue")
+    cv.fig_confusion(oof, "tissue", "Lymphoma")              # one organ per call
+    cv.fig_confusion(oof, "tissue", cv.ALL)                  # all organs pooled
 
     # Numbers + draft Methods / Results / legends
     print(cv.paper_text(oof, t, "tissue", configs=oof.attrs.get("configs"), skipped=oof.attrs.get("skipped")))
@@ -43,8 +44,9 @@ from sklearn.metrics import roc_auc_score, roc_curve
 
 ALL = "All organs"
 MM = 1 / 25.4  # Nature: 89 mm single, 183 mm double column
-INK, INK2, MUTED, GRID = "#0b0b0b", "#52514e", "#898781", "#e4e3df"
+INK, INK2, MUTED = "#0b0b0b", "#52514e", "#898781"
 MAIN_C, POS_C, NEG_C, BASE_C = "#2a78d6", "#eb6834", "#2a78d6", "#eb6834"
+EXTRA_C = ["#1a9e77", "#9b4dca", "#d4a017", "#d6336c", "#5c5c5c"]  # extra organ curves in fig_cv_roc
 plt.rcParams.update({
     "font.size": 7, "axes.titlesize": 7, "axes.labelsize": 7, "xtick.labelsize": 6, "ytick.labelsize": 6,
     "legend.fontsize": 6, "axes.edgecolor": MUTED, "axes.labelcolor": INK, "xtick.color": INK2,
@@ -208,11 +210,6 @@ def _done(fig):
     return fig
 
 
-def _grid(ax, axis="both"):
-    ax.grid(axis=axis, color=GRID, lw=0.5)
-    ax.set_axisbelow(True)
-
-
 def _organs(t, group_col):
     return t[t[group_col] != ALL][group_col].tolist()
 
@@ -226,12 +223,16 @@ def _small_multiples(n, ncols, w_mm, h_mm, **kw):
     return fig, axes, nrows
 
 
-def fig_cv_roc(oof, t, group_col):
-    """Fig. 1: ROC of each test fold (thin), pooled OOF (thick), tile-count baseline (dashed)."""
+def fig_cv_roc(oof, t, group_col, groups=None):
+    """Fig. 1: ROC of each test fold (thin), pooled OOF (thick), tile-count baseline (dashed), random (dotted).
+    groups: optional list of organs to add as their own curve, e.g. ["Lymphoma"]."""
     allr = t[t[group_col] == ALL].iloc[0]
     fa = fold_aucs(oof)
+    groups = [] if groups is None else [groups] if isinstance(groups, str) else list(groups)
+    unknown = set(groups) - set(oof[group_col])
+    if unknown:
+        raise ValueError(f"Not in '{group_col}': {sorted(unknown)}. Options: {sorted(oof[group_col].unique())}")
     fig, ax = plt.subplots(figsize=(89 * MM, 89 * MM))
-    ax.plot([0, 1], [0, 1], color=MUTED, lw=0.6, ls=":")
     for i, (_, f) in enumerate(oof.groupby("fold")):
         fpr, tpr, _ = roc_curve(f["label"], f["prob_pos"])
         ax.plot(fpr, tpr, color=MAIN_C, lw=0.7, alpha=0.35,
@@ -242,9 +243,16 @@ def fig_cv_roc(oof, t, group_col):
     if "base_auc" in t.columns:
         fpr, tpr, _ = roc_curve(oof["label"], oof["n_tiles"])
         ax.plot(fpr, tpr, color=BASE_C, lw=1.2, ls=(0, (4, 2)), label=f"Tile count only, AUC {_ci(allr, 'base_auc')}")
+    for g, c in zip(groups, EXTRA_C):
+        d, r = oof[oof[group_col] == g], t[t[group_col] == g].iloc[0]
+        if d["label"].nunique() < 2:
+            print(f"Skipping '{g}' in the ROC: only one class")
+            continue
+        fpr, tpr, _ = roc_curve(d["label"], d["prob_pos"])
+        ax.plot(fpr, tpr, color=c, lw=1.4, label=f"{g} (n={len(d)}), AUC {_ci(r, 'auc')}")
+    ax.plot([0, 1], [0, 1], color=MUTED, lw=0.8, ls=":", label="Random, AUC 0.500")
     ax.set(xlim=(0, 1), ylim=(0, 1.01), xlabel="1 − Specificity", ylabel="Sensitivity", aspect="equal")
     ax.legend(frameon=False, loc="lower right")
-    _grid(ax)
     return _done(fig)
 
 
@@ -263,16 +271,10 @@ def fig_forest(t, group_col):
                     mec="white", mew=0.6, zorder=3)
         for yi in yy[~ok]:
             ax.text(0.52, yi, "n/a (one class)", va="center", fontsize=5.5, color=MUTED)
-        ax.axvline(allr[m], color=INK2, lw=0.8, ls="--", zorder=1)
-        ax.text(allr[m], len(o) - 0.15, f"all {allr[m]:.2f}", ha="center", va="bottom", fontsize=5.5, color=INK2,
-                bbox=dict(facecolor="white", edgecolor="none", pad=0.6))
-        if m == "auc":
-            ax.axvline(0.5, color=MUTED, lw=0.6, ls=":", zorder=1)
         ax.set_xlim(0.45 if m == "auc" else 0, 1.02)
-        ax.set_title(title, loc="left", fontweight="bold")
-        _grid(ax, "x")
+        ax.set_title(f"{title} (all organs {allr[m]:.2f})", loc="left", fontweight="bold")
     axes[0].set_yticks(yy, labels)
-    axes[0].set_ylim(-0.7, len(o) + 0.3)
+    axes[0].set_ylim(-0.6, len(o) - 0.4)
     return _done(fig)
 
 
@@ -293,7 +295,6 @@ def fig_roc_per_organ(oof, t, group_col, ncols=3):
                 ha="right", va="bottom", fontsize=5.5, color=INK)
         ax.set_title(g, loc="left", fontweight="bold")
         ax.set_aspect("equal")
-        _grid(ax)
     for ax in axes[::ncols]:
         ax.set_ylabel("Sensitivity")
     for ax in axes[(nrows - 1) * ncols:]:
@@ -318,38 +319,40 @@ def fig_scores(oof, t, group_col, pos_name="Non-healthy", neg_name="Healthy"):
             q1, med, q3 = np.percentile(v, [25, 50, 75])
             ax.plot([i + dx] * 2, [q1, q3], color=INK, lw=1.2, zorder=3)
             ax.plot([i + dx - 0.1, i + dx + 0.1], [med] * 2, color=INK, lw=1.5, zorder=3)
-    ax.axhline(0.5, color=MUTED, lw=0.6, ls="--")
     ax.set_xticks(range(len(organs)), organs, rotation=30, ha="right")
     ax.set_ylabel(f"Predicted P({pos_name})")
     ax.set_ylim(-0.02, 1.02)
     ax.scatter([], [], s=12, color=NEG_C, label=f"True {neg_name}")
     ax.scatter([], [], s=12, color=POS_C, label=f"True {pos_name}")
     ax.legend(frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
-    _grid(ax, "y")
     return _done(fig)
 
 
-def fig_confusion(oof, t, group_col, pos_name="Non-healthy", neg_name="Healthy", ncols=3):
-    """Supplementary: confusion matrix per organ and pooled (counts + row %), threshold 0.5."""
-    organs = _organs(t, group_col) + [ALL]
-    fig, axes, _ = _small_multiples(len(organs), ncols, 150, 50, gridspec_kw={"hspace": 0.55, "wspace": 0.45})
-    for ax, g in zip(axes, organs):
-        d = oof if g == ALL else oof[oof[group_col] == g]
-        cm = np.array([[np.sum((d["label"] == a) & (d["pred"] == b)) for b in (0, 1)] for a in (0, 1)])
-        rown = cm / np.maximum(cm.sum(1, keepdims=True), 1)
-        ax.imshow(rown, cmap="Blues", vmin=0, vmax=1)
-        for a in (0, 1):
-            for b in (0, 1):
-                ax.text(b, a, f"{cm[a, b]}\n{rown[a, b]:.0%}", ha="center", va="center", fontsize=6,
-                        color="white" if rown[a, b] > 0.6 else INK)
-        ax.set_xticks([0, 1], [neg_name, pos_name])
-        ax.set_yticks([0, 1], [neg_name, pos_name])
-        ax.set_title(g, loc="left", fontweight="bold")
-        for s in ax.spines.values():
-            s.set_visible(False)
-        ax.tick_params(length=0)
-    fig.supxlabel("Predicted", fontsize=7)
-    fig.supylabel("True", fontsize=7)
+def fig_confusion(oof, group_col, group=ALL, pos_name="Non-healthy", neg_name="Healthy"):
+    """Confusion matrix for one organ (or ALL = pooled), threshold 0.5. Counts + row %.
+    Call once per organ you want to show, e.g. fig_confusion(oof, "tissue", "Lymphoma")."""
+    if group == ALL:
+        d = oof
+    elif group in set(oof[group_col]):
+        d = oof[oof[group_col] == group]
+    else:
+        raise ValueError(f"'{group}' not in '{group_col}'. Options: {[ALL] + sorted(oof[group_col].unique())}")
+    cm = np.array([[np.sum((d["label"] == a) & (d["pred"] == b)) for b in (0, 1)] for a in (0, 1)])
+    rown = cm / np.maximum(cm.sum(1, keepdims=True), 1)
+    names = [["TN", "FP"], ["FN", "TP"]]
+    fig, ax = plt.subplots(figsize=(60 * MM, 55 * MM))
+    ax.imshow(rown, cmap="Blues", vmin=0, vmax=1)
+    for a in (0, 1):
+        for b in (0, 1):
+            ax.text(b, a, f"{names[a][b]}\n{cm[a, b]}\n{rown[a, b]:.0%}", ha="center", va="center", fontsize=7,
+                    color="white" if rown[a, b] > 0.6 else INK)
+    ax.set_xticks([0, 1], ["Predicted negative", "Predicted positive"])
+    ax.set_yticks([0, 1], ["True negative", "True positive"], rotation=90, va="center")
+    ax.set_title(f"{group} (n={len(d)})", loc="left", fontweight="bold")
+    ax.set_xlabel(f"Positive = {pos_name}\nNegative = {neg_name}\n% of true class", fontsize=5.5, color=INK2)
+    for s in ax.spines.values():
+        s.set_visible(False)
+    ax.tick_params(length=0)
     return _done(fig)
 
 
@@ -433,15 +436,15 @@ def paper_text(oof, t, group_col, pos_name="Non-healthy", neg_name="Healthy", n_
         f"patient-level bootstrap ({n_boot} resamples); threshold 0.5 for all organs. Within-organ AUC is the "
         f"slide-weighted mean of per-organ AUCs.\n\n"
         f"**Fig. 1 | Cross-validated ROC.** Thin lines, the {k} held-out test folds; thick line, pooled out-of-fold "
-        f"predictions; dot, operating point at 0.5" + ("; dashed, tile count alone" if has_base else "") + ".\n\n"
+        f"predictions; dot, operating point at 0.5" + ("; dashed, tile count alone" if has_base else "") + "; dotted, random classifier.\n\n"
         f"**Fig. 2 | Performance per organ.** AUC, sensitivity and specificity with 95% CI (patient-level bootstrap). "
-        f"Dashed line, all organs pooled; dotted line, AUC 0.5. n, slides ({pos_name}/{neg_name}).\n\n"
+        f"Pooled value for all organs in each panel title. n, slides ({pos_name}/{neg_name}).\n\n"
         f"**Supplementary Table | Per fold.** Size and performance of each test fold, mean ± SD.\n\n"
         f"**Supplementary Table | Slides per organ and fold.** Every organ is represented in each test fold.\n\n"
         f"**Supplementary Fig. | ROC per organ.** Blue, organ; grey, all organs pooled; dot, threshold 0.5.\n\n"
         f"**Supplementary Fig. | Predicted probabilities.** Out-of-fold P({pos_name}) per organ by true class; lines, "
-        f"median and IQR; dashed, threshold 0.5.\n\n"
-        f"**Supplementary Fig. | Confusion matrices.** Per organ and pooled, threshold 0.5; counts and row percentages.")
+        f"median and IQR.\n\n"
+        f"**Supplementary Fig. | Confusion matrices.** Threshold 0.5; TN, FP, FN, TP counts and percentage of the true class.")
 
     return ("# 5-fold CV across organs — numbers and draft text (check every sentence)\n\n## Key numbers\n"
             + "\n".join(numbers) + "\n\n## Methods\n" + methods + "\n\n## Results\n" + results
