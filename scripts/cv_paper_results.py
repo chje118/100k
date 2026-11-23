@@ -26,6 +26,12 @@ Input: `oof` from oof_group_metrics.collect_oof_predictions
     # Numbers + draft Methods / Results / legends
     print(cv.paper_text(oof, t, "tissue", configs=oof.attrs.get("configs"), skipped=oof.attrs.get("skipped")))
 
+    # External cohort (final model, no folds): same table from the ABMILInference cache, then the same calls
+    ext = cv.from_cache(cache_path, slides, meta, "filename", "label", "tissue", "rekvnr")
+    t = cv.organ_table(ext, "tissue", "rekvnr")
+    cv.table_cohort(ext, "tissue", "rekvnr"); cv.table_per_organ(t, "tissue"); cv.fig_cv_roc(ext, t, "tissue")
+    cv.fig_forest(t, "tissue"); cv.fig_scores(ext, t, "tissue"); cv.fig_confusion(ext, "tissue", cv.ALL)
+
 Statistics
 - Each slide is scored once, by the fold model that never saw it (out-of-fold, OOF).
 - Threshold fixed at 0.5 for every organ (not tuned).
@@ -35,6 +41,9 @@ Statistics
   the pooled AUC comes from organs differing in prevalence/score level, not discrimination within an organ.
 - Tile-count baseline (if `n_tiles` is present): AUC of ranking slides by number of tiles alone.
 """
+
+import os
+import pickle
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -116,6 +125,32 @@ def organ_table(oof, group_col, patient_col, n_boot=2000, seed=0):
     t = pd.DataFrame(rows)
     body = t[t[group_col] != ALL].sort_values("auc", ascending=False)
     return pd.concat([body, t[t[group_col] == ALL]], ignore_index=True)
+
+
+def from_cache(cache_path, slides, meta, filename_col, label_col, group_col, patient_col):
+    """External cohort: predictions from an ABMILInference cache (.pkl), as an OOF-like table without `fold`
+    (slide, group, patient, label, prob_pos, pred, n_tiles). Only slides in `slides` are used; every other cached
+    slide is ignored. Matched by file name (path and extension ignored)."""
+    with open(cache_path, "rb") as f:
+        cache = pickle.load(f)
+    name = lambda p: os.path.splitext(os.path.basename(str(p)))[0]  # "D:/x/a.mrxs", "a.mrxs" and "a" all match
+    cache = {name(k): v for k, v in cache.get("slide_cache", cache).items()}
+    if len(set(map(name, slides))) < len(slides):
+        raise ValueError("Duplicate names in `slides`")
+    print(f"Cache: {len(cache)} slides; using {sum(name(s) in cache for s in slides)} from `slides`, "
+          f"ignoring {len(set(cache) - set(map(name, slides)))}")
+    missing = [s for s in slides if name(s) not in cache]
+    if missing:
+        print(f"Not in cache, left out ({len(missing)}): {missing}")
+    rows = [{"slide": name(s), "prob_pos": cache[name(s)]["prob_1"], "pred": int(cache[name(s)]["pred_idx"]),
+             "n_tiles": len(cache[name(s)]["attention"])} for s in slides if name(s) in cache]
+    m = meta.assign(slide=meta[filename_col].map(name))[["slide", group_col, patient_col, label_col]]
+    d = pd.DataFrame(rows).merge(m.rename(columns={label_col: "label"}), on="slide", how="left")
+    if d["label"].isna().any():
+        raise ValueError(f"No '{label_col}' in meta for: {d.loc[d['label'].isna(), 'slide'].tolist()}")
+    d["label"] = d["label"].astype(int)
+    print(f"{len(d)} slides, {d[patient_col].nunique()} patients, {d['label'].sum()} positive / {(1 - d['label']).sum()} negative")
+    return d
 
 
 def within_organ_auc(t, group_col):
@@ -227,18 +262,19 @@ def fig_cv_roc(oof, t, group_col, groups=None):
     """Fig. 1: ROC of each test fold (thin), pooled OOF (thick), tile-count baseline (dashed), random (dotted).
     groups: optional list of organs to add as their own curve, e.g. ["Lymphoma"]."""
     allr = t[t[group_col] == ALL].iloc[0]
-    fa = fold_aucs(oof)
+    has_folds = "fold" in oof.columns  # external cohort: no folds, single curve
+    fa = fold_aucs(oof) if has_folds else None
     groups = [] if groups is None else [groups] if isinstance(groups, str) else list(groups)
     unknown = set(groups) - set(oof[group_col])
     if unknown:
         raise ValueError(f"Not in '{group_col}': {sorted(unknown)}. Options: {sorted(oof[group_col].unique())}")
     fig, ax = plt.subplots(figsize=(89 * MM, 89 * MM))
-    for i, (_, f) in enumerate(oof.groupby("fold")):
+    for i, (_, f) in enumerate(oof.groupby("fold") if has_folds else []):
         fpr, tpr, _ = roc_curve(f["label"], f["prob_pos"])
         ax.plot(fpr, tpr, color=MAIN_C, lw=0.7, alpha=0.35,
                 label=f"Test folds (k={len(fa)}), AUC {fa.mean():.3f} ± {fa.std(ddof=0):.3f}" if i == 0 else None)
     fpr, tpr, _ = roc_curve(oof["label"], oof["prob_pos"])
-    ax.plot(fpr, tpr, color=MAIN_C, lw=1.8, label=f"Pooled, AUC {_ci(allr, 'auc')}")
+    ax.plot(fpr, tpr, color=MAIN_C, lw=1.8, label=f"{'Pooled' if has_folds else 'All slides'}, AUC {_ci(allr, 'auc')}")
     ax.plot(1 - allr["specificity"], allr["sensitivity"], "o", ms=4, color=MAIN_C, mec="white", mew=0.6)
     if "base_auc" in t.columns:
         fpr, tpr, _ = roc_curve(oof["label"], oof["n_tiles"])
