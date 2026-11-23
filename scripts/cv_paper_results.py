@@ -249,10 +249,12 @@ def fig_cv_roc(oof, t, group_col, groups=None):
             print(f"Skipping '{g}' in the ROC: only one class")
             continue
         fpr, tpr, _ = roc_curve(d["label"], d["prob_pos"])
-        ax.plot(fpr, tpr, color=c, lw=1.4, label=f"{g} (n={len(d)}), AUC {_ci(r, 'auc')}")
+        ax.plot(fpr, tpr, color=c, lw=1.4, label=f"{g}, AUC {_ci(r, 'auc')}")
+        print(f"{g}: n = {len(d)} slides ({int(r['n_pos'])} positive / {int(r['n_neg'])} negative), "
+              f"{int(r['n_patients'])} patients")
     ax.plot([0, 1], [0, 1], color=MUTED, lw=0.8, ls=":", label="Random, AUC 0.500")
     ax.set(xlim=(0, 1), ylim=(0, 1.01), xlabel="1 − Specificity", ylabel="Sensitivity", aspect="equal")
-    ax.legend(frameon=False, loc="lower right")
+    ax.legend(frameon=False, loc="upper left", bbox_to_anchor=(0, -0.14), ncol=1)
     return _done(fig)
 
 
@@ -271,10 +273,15 @@ def fig_forest(t, group_col):
                     mec="white", mew=0.6, zorder=3)
         for yi in yy[~ok]:
             ax.text(0.52, yi, "n/a (one class)", va="center", fontsize=5.5, color=MUTED)
+        ax.axvline(allr[m], color=INK2, lw=0.8, ls="--", zorder=1)
+        ax.text(allr[m], len(o) - 0.15, f"all {allr[m]:.2f}", ha="center", va="bottom", fontsize=5.5, color=INK2,
+                bbox=dict(facecolor="white", edgecolor="none", pad=0.6))
+        if m == "auc":
+            ax.axvline(0.5, color=MUTED, lw=0.6, ls=":", zorder=1)
         ax.set_xlim(0.45 if m == "auc" else 0, 1.02)
-        ax.set_title(f"{title} (all organs {allr[m]:.2f})", loc="left", fontweight="bold")
+        ax.set_title(title, loc="left", fontweight="bold")
     axes[0].set_yticks(yy, labels)
-    axes[0].set_ylim(-0.6, len(o) - 0.4)
+    axes[0].set_ylim(-0.7, len(o) + 0.3)
     return _done(fig)
 
 
@@ -319,6 +326,7 @@ def fig_scores(oof, t, group_col, pos_name="Non-healthy", neg_name="Healthy"):
             q1, med, q3 = np.percentile(v, [25, 50, 75])
             ax.plot([i + dx] * 2, [q1, q3], color=INK, lw=1.2, zorder=3)
             ax.plot([i + dx - 0.1, i + dx + 0.1], [med] * 2, color=INK, lw=1.5, zorder=3)
+    ax.axhline(0.5, color=MUTED, lw=0.6, ls="--")
     ax.set_xticks(range(len(organs)), organs, rotation=30, ha="right")
     ax.set_ylabel(f"Predicted P({pos_name})")
     ax.set_ylim(-0.02, 1.02)
@@ -329,8 +337,8 @@ def fig_scores(oof, t, group_col, pos_name="Non-healthy", neg_name="Healthy"):
 
 
 def fig_confusion(oof, group_col, group=ALL, pos_name="Non-healthy", neg_name="Healthy"):
-    """Confusion matrix for one organ (or ALL = pooled), threshold 0.5. Counts + row %.
-    Call once per organ you want to show, e.g. fig_confusion(oof, "tissue", "Lymphoma")."""
+    """Standard confusion matrix (rows = true label, columns = predicted label, counts) for one organ
+    or ALL (pooled), threshold 0.5. Call once per organ, e.g. fig_confusion(oof, "tissue", "Lymphoma")."""
     if group == ALL:
         d = oof
     elif group in set(oof[group_col]):
@@ -338,18 +346,19 @@ def fig_confusion(oof, group_col, group=ALL, pos_name="Non-healthy", neg_name="H
     else:
         raise ValueError(f"'{group}' not in '{group_col}'. Options: {[ALL] + sorted(oof[group_col].unique())}")
     cm = np.array([[np.sum((d["label"] == a) & (d["pred"] == b)) for b in (0, 1)] for a in (0, 1)])
-    rown = cm / np.maximum(cm.sum(1, keepdims=True), 1)
-    names = [["TN", "FP"], ["FN", "TP"]]
+    classes = [neg_name, pos_name]
     fig, ax = plt.subplots(figsize=(60 * MM, 55 * MM))
-    ax.imshow(rown, cmap="Blues", vmin=0, vmax=1)
+    im = ax.imshow(cm, cmap="Blues", vmin=0)
     for a in (0, 1):
         for b in (0, 1):
-            ax.text(b, a, f"{names[a][b]}\n{cm[a, b]}\n{rown[a, b]:.0%}", ha="center", va="center", fontsize=7,
-                    color="white" if rown[a, b] > 0.6 else INK)
-    ax.set_xticks([0, 1], ["Predicted negative", "Predicted positive"])
-    ax.set_yticks([0, 1], ["True negative", "True positive"], rotation=90, va="center")
-    ax.set_title(f"{group} (n={len(d)})", loc="left", fontweight="bold")
-    ax.set_xlabel(f"Positive = {pos_name}\nNegative = {neg_name}\n% of true class", fontsize=5.5, color=INK2)
+            ax.text(b, a, f"{cm[a, b]}", ha="center", va="center", fontsize=8,
+                    color="white" if cm[a, b] > cm.max() / 2 else INK)
+    ax.set_xticks([0, 1], classes)
+    ax.set_yticks([0, 1], classes, rotation=90, va="center")
+    ax.set_xlabel("Predicted label")
+    ax.set_ylabel("True label")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_title(f"{group} (n={len(d)})", fontsize=6)
     for s in ax.spines.values():
         s.set_visible(False)
     ax.tick_params(length=0)
@@ -438,13 +447,13 @@ def paper_text(oof, t, group_col, pos_name="Non-healthy", neg_name="Healthy", n_
         f"**Fig. 1 | Cross-validated ROC.** Thin lines, the {k} held-out test folds; thick line, pooled out-of-fold "
         f"predictions; dot, operating point at 0.5" + ("; dashed, tile count alone" if has_base else "") + "; dotted, random classifier.\n\n"
         f"**Fig. 2 | Performance per organ.** AUC, sensitivity and specificity with 95% CI (patient-level bootstrap). "
-        f"Pooled value for all organs in each panel title. n, slides ({pos_name}/{neg_name}).\n\n"
+        f"Dashed line, all organs pooled; dotted line, AUC 0.5. n, slides ({pos_name}/{neg_name}).\n\n"
         f"**Supplementary Table | Per fold.** Size and performance of each test fold, mean ± SD.\n\n"
         f"**Supplementary Table | Slides per organ and fold.** Every organ is represented in each test fold.\n\n"
         f"**Supplementary Fig. | ROC per organ.** Blue, organ; grey, all organs pooled; dot, threshold 0.5.\n\n"
         f"**Supplementary Fig. | Predicted probabilities.** Out-of-fold P({pos_name}) per organ by true class; lines, "
-        f"median and IQR.\n\n"
-        f"**Supplementary Fig. | Confusion matrices.** Threshold 0.5; TN, FP, FN, TP counts and percentage of the true class.")
+        f"median and IQR; dashed, threshold 0.5.\n\n"
+        f"**Supplementary Fig. | Confusion matrices.** Rows, true label; columns, predicted label; slide counts at threshold 0.5.")
 
     return ("# 5-fold CV across organs — numbers and draft text (check every sentence)\n\n## Key numbers\n"
             + "\n".join(numbers) + "\n\n## Methods\n" + methods + "\n\n## Results\n" + results
