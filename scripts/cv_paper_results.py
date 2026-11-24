@@ -52,16 +52,7 @@ from scipy.stats import chi2
 from sklearn.metrics import roc_auc_score, roc_curve
 
 ALL = "All organs"
-MM = 1 / 25.4  # Nature: 89 mm single, 183 mm double column
-INK, INK2, MUTED = "#0b0b0b", "#52514e", "#898781"
-MAIN_C, POS_C, NEG_C, BASE_C = "#2a78d6", "#eb6834", "#2a78d6", "#eb6834"
-EXTRA_C = ["#1a9e77", "#9b4dca", "#d4a017", "#d6336c", "#5c5c5c"]  # extra organ curves in fig_cv_roc
-plt.rcParams.update({
-    "font.size": 7, "axes.titlesize": 7, "axes.labelsize": 7, "xtick.labelsize": 6, "ytick.labelsize": 6,
-    "legend.fontsize": 6, "axes.edgecolor": MUTED, "axes.labelcolor": INK, "xtick.color": INK2,
-    "ytick.color": INK2, "axes.spines.top": False, "axes.spines.right": False, "axes.linewidth": 0.6,
-    "pdf.fonttype": 42, "ps.fonttype": 42, "savefig.dpi": 300, "savefig.bbox": "tight", "figure.dpi": 150,
-})
+from paper_style import MM, INK, INK2, MUTED, MAIN_C, POS_C, NEG_C, BASE_C, EXTRA_C  # shared figure style
 
 
 # ----------------------------------------
@@ -404,98 +395,3 @@ def fig_confusion(oof, group_col, group=ALL, pos_name="Non-healthy", neg_name="H
         s.set_visible(False)
     ax.tick_params(length=0)
     return _done(fig)
-
-
-# ----------------------------------------
-# Text
-# ----------------------------------------
-def paper_text(oof, t, group_col, pos_name="Non-healthy", neg_name="Healthy", n_boot=2000,
-               configs=None, skipped=None):
-    """Text (print it): key numbers, draft Methods (statistics), Results and legends. Check every sentence.
-    configs / skipped: oof.attrs['configs'] / oof.attrs['skipped'] (optional; lost if oof was read from CSV)."""
-    allr = t[t[group_col] == ALL].iloc[0]
-    o = t[t[group_col] != ALL]
-    oa = o.dropna(subset=["auc"])
-    best, worst = oa.loc[oa["auc"].idxmax()], oa.loc[oa["auc"].idxmin()]
-    within = within_organ_auc(t, group_col)
-    diff = allr["auc"] - within
-    het = heterogeneity(t, group_col)
-    fa = fold_aucs(oof)
-    k = oof["fold"].nunique()
-    cfg = next(iter((configs or {}).values()), {})
-    skipped = pd.DataFrame() if skipped is None else skipped
-    n_skip = len(skipped)
-    one_class = o[o["auc"].isna()][group_col].tolist()
-    has_base = "base_auc" in t.columns
-
-    numbers = [
-        f"- Cohort: {int(allr['n_slides'])} slides, {int(allr['n_patients'])} patients, {len(o)} organs; "
-        f"{int(allr['n_pos'])} {pos_name} / {int(allr['n_neg'])} {neg_name}.",
-        f"- Unreadable at evaluation, excluded: {n_skip} slides"
-        + (f" ({skipped[group_col].value_counts().to_dict()})." if n_skip else "."),
-        f"- {k}-fold AUC, mean ± SD over folds: {fa.mean():.3f} ± {fa.std(ddof=0):.3f} (range {fa.min():.3f}–{fa.max():.3f}).",
-        f"- Pooled OOF AUC {_ci(allr, 'auc')}; sensitivity {_ci(allr, 'sensitivity')}; "
-        f"specificity {_ci(allr, 'specificity')}; balanced accuracy {_ci(allr, 'balanced_accuracy')}; "
-        f"PPV {allr['ppv']:.3f}; NPV {allr['npv']:.3f} (TP {allr['tp']}, FP {allr['fp']}, TN {allr['tn']}, FN {allr['fn']}).",
-        f"- Per-organ AUC {worst['auc']:.3f} ({worst[group_col]}) to {best['auc']:.3f} ({best[group_col]}); "
-        f"{int((oa['auc'] >= 0.9).sum())}/{len(oa)} organs ≥ 0.90.",
-        f"- Within-organ AUC (slide-weighted): {within:.3f} (pooled − within {diff:+.3f}).",
-        f"- Heterogeneity across organs: Q = {het['Q']:.1f}, df = {het['df']}, p = {het['p']:.2g}, I² = {het['I2']:.0%}.",
-    ]
-    if one_class:
-        numbers.append(f"- AUC undefined (one class only): {', '.join(map(str, one_class))}.")
-    if has_base:
-        numbers.append(f"- Tile count alone: AUC {_ci(allr, 'base_auc')}; classifier − tile count "
-                       f"{_ci(allr, 'auc_diff')}, one-sided bootstrap p {'<' if allr['auc_diff_p'] <= 1 / n_boot else '='} "
-                       f"{allr['auc_diff_p']:.3g}.")
-    numbers += ["", "Per organ:"] + [
-        f"  - {r[group_col]}: AUC {_ci(r, 'auc')}, n = {r['n_slides']} ({r['n_pos']}/{r['n_neg']}), "
-        f"sens {r['sensitivity']:.2f}, spec {r['specificity']:.2f}" for _, r in o.iterrows()]
-
-    methods = (
-        f"**Cross-validation.** Performance was estimated with {k}-fold cross-validation at the patient level "
-        f"(StratifiedGroupKFold, shuffled): all slides of a patient were in the same fold and folds were stratified "
-        f"by label. Within each training split, a patient-level validation subset was used only for early stopping. "
-        f"Every slide was scored once, by the model that had not seen it (out-of-fold predictions). "
-        f"{'Each slide was represented by up to ' + format(int(cfg['max_tiles']), ',') + ' randomly sampled tiles. ' if cfg.get('max_tiles') else ''}\n\n"
-        f"**Statistics.** A fixed threshold of 0.5 on P({pos_name}) was used for all organs. Out-of-fold predictions "
-        f"were pooled to compute AUC, balanced accuracy, sensitivity, specificity, PPV and NPV, overall and per organ. "
-        f"95% CIs are percentile bootstrap intervals ({n_boot} resamples) resampling patients, not slides. We report "
-        f"the mean ± SD of AUC over test folds and a within-organ AUC (slide-weighted mean of per-organ AUCs), which "
-        f"removes differences between organs from the pooled estimate. Heterogeneity across organs was assessed with "
-        f"Cochran's Q and I² using bootstrap standard errors."
-        + (" As a baseline, slides were ranked by tile count alone (amount of tissue)." if has_base else "")
-        + (f" {n_skip} unreadable slides were excluded." if n_skip else ""))
-
-    results = (
-        f"Across {k}-fold cross-validation on {int(allr['n_slides'])} slides from {int(allr['n_patients'])} patients and "
-        f"{len(o)} organs, the classifier reached an AUC of {fa.mean():.3f} ± {fa.std(ddof=0):.3f} (mean ± SD over folds; "
-        f"Fig. 1). Pooled over all out-of-fold predictions, AUC was {_ci(allr, 'auc')}, with sensitivity "
-        f"{allr['sensitivity']:.3f} and specificity {allr['specificity']:.3f} at a threshold of 0.5. Per organ, AUC ranged "
-        f"from {worst['auc']:.3f} ({worst[group_col]}) to {best['auc']:.3f} ({best[group_col]}) (Table 2, Fig. 2). The "
-        f"within-organ AUC was {within:.3f}, "
-        + ("close to the pooled AUC, so the pooled estimate is not driven by differences between organs."
-           if abs(diff) < 0.01 else
-           "below the pooled AUC, so part of the pooled estimate reflects differences between organs."
-           if diff > 0 else "above the pooled AUC.")
-        + (f" Tile count alone reached an AUC of {allr['base_auc']:.3f}." if has_base else ""))
-
-    legends = (
-        f"**Table 1 | Cohort.** Slides and patients per organ, {pos_name} and {neg_name} slides, slides per patient.\n\n"
-        f"**Table 2 | Performance per organ ({k}-fold cross-validation).** Pooled out-of-fold predictions; 95% CI from a "
-        f"patient-level bootstrap ({n_boot} resamples); threshold 0.5 for all organs. Within-organ AUC is the "
-        f"slide-weighted mean of per-organ AUCs.\n\n"
-        f"**Fig. 1 | Cross-validated ROC.** Thin lines, the {k} held-out test folds; thick line, pooled out-of-fold "
-        f"predictions; dot, operating point at 0.5" + ("; dashed, tile count alone" if has_base else "") + "; dotted, random classifier.\n\n"
-        f"**Fig. 2 | Performance per organ.** AUC, sensitivity and specificity with 95% CI (patient-level bootstrap). "
-        f"Dashed line, all organs pooled; dotted line, AUC 0.5. n, slides ({pos_name}/{neg_name}).\n\n"
-        f"**Supplementary Table | Per fold.** Size and performance of each test fold, mean ± SD.\n\n"
-        f"**Supplementary Table | Slides per organ and fold.** Every organ is represented in each test fold.\n\n"
-        f"**Supplementary Fig. | ROC per organ.** Blue, organ; grey, all organs pooled; dot, threshold 0.5.\n\n"
-        f"**Supplementary Fig. | Predicted probabilities.** Out-of-fold P({pos_name}) per organ by true class; lines, "
-        f"median and IQR; dashed, threshold 0.5.\n\n"
-        f"**Supplementary Fig. | Confusion matrices.** Rows, true label; columns, predicted label; slide counts at threshold 0.5.")
-
-    return ("# 5-fold CV across organs — numbers and draft text (check every sentence)\n\n## Key numbers\n"
-            + "\n".join(numbers) + "\n\n## Methods\n" + methods + "\n\n## Results\n" + results
-            + "\n\n## Legends\n" + legends + "\n")

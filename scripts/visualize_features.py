@@ -25,6 +25,7 @@ from tqdm import tqdm
 from wsidata import open_wsi
 
 from helper_functions import subset_df_processed
+from paper_style import MM, PALETTE  # shared figure style
 
 
 class FeatureVisualizer:
@@ -191,19 +192,20 @@ class FeatureVisualizer:
             raise ValueError("method must be 'pca' or 'tsne'")
 
         unique_labels = pd.unique(labels)
-        cmap = plt.get_cmap("tab10" if shade_by_slide else "tab20")  # tab20 has paired similar hues
+        color_of = lambda i: PALETTE[i % len(PALETTE)]
+        size = 1 if mode == "tile" else 10
 
-        plt.figure(figsize=(8, 8))
+        plt.figure(figsize=(89 * MM, 89 * MM))
 
         if shade_by_slide:
             slides = meta["slide_path"].to_numpy()
             for i, lbl in enumerate(unique_labels):
                 lbl_slides = pd.unique(slides[labels == lbl])
-                for slide, color in zip(lbl_slides, _shades(cmap(i % cmap.N), len(lbl_slides))):
+                for slide, color in zip(lbl_slides, _shades(color_of(i), len(lbl_slides))):
                     idx = slides == slide
-                    plt.scatter(reduced[idx, 0], reduced[idx, 1], s=3 if mode == "tile" else 20, alpha=0.8,
+                    plt.scatter(reduced[idx, 0], reduced[idx, 1], s=size, alpha=0.8,
                                 color=color, lw=0, rasterized=(mode == "tile"))
-                plt.scatter([], [], s=30, color=cmap(i % cmap.N), label=f"{lbl} ({len(lbl_slides)} slides)")
+                plt.scatter([], [], s=12, color=color_of(i), label=f"{lbl} ({len(lbl_slides)} slides)")
             unique_labels = []
 
         for i, lbl in enumerate(unique_labels):
@@ -211,9 +213,10 @@ class FeatureVisualizer:
             plt.scatter(
                 reduced[idx, 0],
                 reduced[idx, 1],
-                s=20,
+                s=size,
                 alpha=0.8,
-                color=cmap(i % cmap.N),
+                lw=0,
+                color=color_of(i),
                 label=str(lbl),
                 rasterized=(mode == "tile"),
             )
@@ -222,7 +225,7 @@ class FeatureVisualizer:
         plt.xlabel(xlab)
         plt.ylabel(ylab)
         # Legend under the plot; no tight_layout, so the plot area keeps its size
-        plt.legend(title=self.label_col, bbox_to_anchor=(0.5, -0.08), loc="upper center", frameon=False)
+        plt.legend(title=self.label_col, bbox_to_anchor=(0.5, -0.14), loc="upper center", frameon=False)
         plt.show()
 
 
