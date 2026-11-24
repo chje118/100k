@@ -1,5 +1,6 @@
 import os
 import gc
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -152,7 +153,9 @@ class FeatureVisualizer:
 
         return sil
 
-    def plot_embeddings(self, method: str = "pca", mode: str = "aggregated", every_nth: int = 1):
+    def plot_embeddings(self, method: str = "pca", mode: str = "aggregated", every_nth: int = 1,
+                        shade_by_slide: bool = False):
+        """shade_by_slide: one hue per label, a different shade of it per slide (legend shows labels only)."""
         emb, meta = self.build_embedding_table(mode=mode, every_nth=every_nth)
         labels = meta[self.label_col].to_numpy()
 
@@ -172,9 +175,20 @@ class FeatureVisualizer:
             raise ValueError("method must be 'pca' or 'tsne'")
 
         unique_labels = pd.unique(labels)
-        cmap = plt.get_cmap("tab20")
+        cmap = plt.get_cmap("tab10" if shade_by_slide else "tab20")  # tab20 has paired similar hues
 
         plt.figure(figsize=(8, 8))
+
+        if shade_by_slide:
+            slides = meta["slide_path"].to_numpy()
+            for i, lbl in enumerate(unique_labels):
+                lbl_slides = pd.unique(slides[labels == lbl])
+                for slide, color in zip(lbl_slides, _shades(cmap(i % cmap.N), len(lbl_slides))):
+                    idx = slides == slide
+                    plt.scatter(reduced[idx, 0], reduced[idx, 1], s=3 if mode == "tile" else 20, alpha=0.8,
+                                color=color, lw=0, rasterized=(mode == "tile"))
+                plt.scatter([], [], s=30, color=cmap(i % cmap.N), label=f"{lbl} ({len(lbl_slides)} slides)")
+            unique_labels = []
 
         for i, lbl in enumerate(unique_labels):
             idx = labels == lbl
@@ -194,3 +208,12 @@ class FeatureVisualizer:
         plt.legend(title=self.label_col, bbox_to_anchor=(1.04, 1), loc="upper left")
         plt.tight_layout()
         plt.show()
+
+
+def _shades(base, n, spread=0.55):
+    """n shades of one color, from darker to lighter (base color in the middle)."""
+    rgb = np.array(mcolors.to_rgb(base))
+    if n == 1:
+        return [rgb]
+    return [np.clip(rgb * (1 + f) if f < 0 else rgb + (1 - rgb) * f, 0, 1)
+            for f in np.linspace(-spread, spread, n)]
