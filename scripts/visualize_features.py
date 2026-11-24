@@ -267,15 +267,18 @@ class FeatureVisualizer:
                 plt.scatter(xy[m, 0], xy[m, 1], s=size(info.loc[m, "attention_pct"].to_numpy()),
                             facecolors=c if filled else "none", edgecolors=c, lw=0.6, alpha=0.85, zorder=2)
 
-        # Legend like the other figures: color = diagnosis, filled/open = arm, size = attention
+        # One legend with bold headings: diagnosis (color), tile (filled/open), attention (size)
         h = lambda **kw: plt.scatter([], [], **kw)
-        handles = [h(s=12, color=PALETTE[i % len(PALETTE)], lw=0) for i in range(len(unique_labels))]
-        names = [str(l) for l in unique_labels]
-        handles += [h(s=12, color="#52514e", lw=0), h(s=12, facecolors="none", edgecolors="#52514e", lw=0.6)]
-        names += ["Disease arm", "Healthy arm"]
-        handles += [h(s=size(q), color="#52514e", lw=0) for q in (0.25, 0.5, 0.75, 1.0)]
-        names += [f"Attention {q}th pct. in slide" for q in (25, 50, 75, 100)]
-        plt.legend(handles, names, title=self.label_col, bbox_to_anchor=(0.5, -0.14), loc="upper center", frameon=False)
+        bold = lambda t: r"$\bf{" + t.replace(" ", r"\ ") + "}$"
+        blank = h(s=0, color="none")
+        n_slides = info.groupby("label")["slide"].nunique()
+        handles = [blank] + [h(s=12, color=PALETTE[i % len(PALETTE)], lw=0) for i in range(len(unique_labels))]
+        names = [bold(self.label_col)] + [f"{l} ({n_slides[l]} slides)" for l in unique_labels]
+        handles += [blank, h(s=12, color="#52514e", lw=0), h(s=12, facecolors="none", edgecolors="#52514e", lw=0.6)]
+        names += [bold("Tiles"), "Disease arm", "Healthy arm"]
+        handles += [blank] + [h(s=size(q), color="#52514e", lw=0) for q in (0.25, 0.5, 0.75, 1.0)]
+        names += [bold("Attention (percentile in slide)"), "25th", "50th", "75th", "100th"]
+        plt.legend(handles, names, bbox_to_anchor=(0.5, -0.14), loc="upper center", frameon=False)
 
         sil = self.silhouette_score(emb, info["label"].to_numpy())
         plt.title(f"t-SNE (selected tiles, silhouette score: {sil:.3f})")
