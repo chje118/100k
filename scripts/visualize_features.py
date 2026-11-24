@@ -10,9 +10,9 @@ viz = FeatureVisualizer(
     label_col="diagnose", 
     filename_col="path",
 )"""
-
 import os
 import gc
+import pickle
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
@@ -229,10 +229,65 @@ class FeatureVisualizer:
         plt.show()
 
 
-def _shades(base, n, spread=0.55):
-    """n shades of one color, from darker to lighter (base color in the middle)."""
+
+    def tsne_selected_tiles(self, selected: pd.DataFrame, inference_cache: str):
+        """t-SNE of the selected (LMD) tiles. Color = diagnose, filled = non-healthy-like (disease arm),
+        open = healthy-like (healthy arm), size = attention percentile within the slide.
+
+        selected: well assignment sheet(s) as one DataFrame (slide_path, tile_id, arm, diagnose).
+        inference_cache: ABMILInference cache (.pkl), for the attention percentile within each slide
+        """
+        sel = selected.dropna(subset=["tile_id"]).copy()  # wells without a tile
+        sel["tile_id"] = sel["tile_id"].astype(float).astype(int)
+        with open(inference_cache, "rb") as f:
+            cache = pickle.load(f)["slide_cache"]
+
+        feats, rows = [], []
+        for slide, s in tqdm(sel.groupby("slide_path", sort=False), desc="Loading tiles..."):
+            adata = self._load_adata(slide)
+            row_of = pd.Series(np.arange(len(adata.obs)), index=adata.obs["tile_id"].astype(int).to_numpy())
+            feats.append(np.asarray(adata.X[row_of[s["tile_id"]].to_numpy()], dtype=np.float32))
+            tt = cache[slide]["tile_table"]
+            pct = pd.Series(tt["attention"].rank(pct=True).to_numpy(), index=tt["tile_id"].astype(int).to_numpy())
+            rows.append(pd.DataFrame({"slide": slide, "label": s["diagnose"].to_numpy(), "arm": s["arm"].to_numpy(),
+                                      "attention_pct": pct[s["tile_id"]].to_numpy()}))
+
+        emb, info = np.concatenate(feats), pd.concat(rows, ignore_index=True)
+        print(f"{len(emb):,} selected tiles ({info['arm'].value_counts().to_dict()}) from {info['slide'].nunique()} slides")
+
+        xy, _ = self._reduce_tsne(emb, n_components=2)
+
+        size = lambda pct: 2 + 22 * pct ** 2  # area grows with attention percentile
+        unique_labels = pd.unique(info["label"])
+        plt.figure(figsize=(89 * MM, 89 * MM))
+        for i, lbl in enumerate(unique_labels):
+            c = PALETTE[i % len(PALETTE)]
+            for arm, filled in [("healthy", False), ("disease", True)]:
+                m = ((info["label"] == lbl) & (info["arm"] == arm)).to_numpy()
+                plt.scatter(xy[m, 0], xy[m, 1], s=size(info.loc[m, "attention_pct"].to_numpy()),
+                            facecolors=c if filled else "none", edgecolors=c, lw=0.6, alpha=0.85, zorder=2)
+
+        # One legend: diagnosis (color), tile type (marker), attention (size)
+        h = lambda **kw: plt.scatter([], [], **kw)
+        blank = h(s=0, color="none")
+        handles = [blank] + [h(s=12, color=PALETTE[i % len(PALETTE)]) for i in range(len(unique_labels))]
+        names = [r"$\bf{Diagnosis}$"] + [str(l) for l in unique_labels]
+        handles += [blank, h(s=12, color="#52514e"), h(s=12, facecolors="none", edgecolors="#52514e", lw=0.6)]
+        names += [r"$\bf{Tile}$", "Non-healthy-like (disease arm)", "Healthy-like (healthy arm)"]
+        handles += [blank] + [h(s=size(q), color="#52514e") for q in (0.25, 0.5, 0.75, 1.0)]
+        names += [r"$\bf{Attention\ (percentile\ in\ slide)}$"] + ["25th", "50th", "75th", "100th"]
+        plt.legend(handles, names, bbox_to_anchor=(0.5, -0.14), loc="upper center", frameon=False)
+
+        plt.title(f"t-SNE, selected tiles (n={len(emb):,}, {info['slide'].nunique()} slides)")
+        plt.xlabel("Dim 1")
+        plt.ylabel("Dim 2")
+        plt.show()
+        return info.assign(x=xy[:, 0], y=xy[:, 1])
+
+def _shades(base, n, darker=0.15, lighter=0.5):
+    """n shades of one color: from a bit darker (mixed with black) to lighter (mixed with white).
+    Only a little black, so e.g. orange does not turn brown."""
     rgb = np.array(mcolors.to_rgb(base))
     if n == 1:
         return [rgb]
-    return [np.clip(rgb * (1 + f) if f < 0 else rgb + (1 - rgb) * f, 0, 1)
-            for f in np.linspace(-spread, spread, n)]
+    return [rgb * (1 + f) if f < 0 else rgb + (1 - rgb) * f for f in np.linspace(-darker, lighter, n)]

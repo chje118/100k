@@ -11,8 +11,8 @@ import matplotlib.pyplot as plt
 MM = 1 / 25.4  # Nature: 89 mm single, 183 mm double column
 INK, INK2, MUTED = "#0b0b0b", "#52514e", "#898781"
 MAIN_C, POS_C, NEG_C, BASE_C = "#2a78d6", "#eb6834", "#2a78d6", "#eb6834"
-EXTRA_C = ["#1a9e77", "#9b4dca", "#d4a017", "#d6336c", "#5c5c5c"]  # extra curves / categories
-PALETTE = [MAIN_C, POS_C] + EXTRA_C  # categorical colors, in this order
+PALETTE = [MAIN_C, POS_C, "#1a9e77", "#9b4dca", "#d6336c", "#1a9fb8", "#6b6b6b"]
+EXTRA_C = PALETTE[2:]  # extra curves in fig_cv_roc
 
 plt.rcParams.update({
     "font.size": 7, "axes.titlesize": 7, "axes.labelsize": 7, "xtick.labelsize": 6, "ytick.labelsize": 6,
