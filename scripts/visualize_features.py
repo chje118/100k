@@ -33,7 +33,7 @@ class FeatureVisualizer:
         self.zarr_dir = zarr_dir
         self.cache_path = cache_path
         self.model = str(model)
-        self.feature_key = f"features_{self.model}"
+        self.feature_key = f"features_{self.model}_mpp0.5"
         self.label_col = label_col
         self.aggregated = aggregated
         self.filename_col = filename_col
@@ -60,10 +60,8 @@ class FeatureVisualizer:
         return emb
 
     def _get_tile_embeddings(self, adata, every_nth: int = 1) -> np.ndarray:
-        X = np.asarray(adata.X, dtype=np.float32)
-        if every_nth > 1:
-            X = X[::every_nth]
-        return X
+        X = adata.X[::every_nth] if every_nth > 1 else adata.X  # slice first: only these tiles are copied
+        return np.asarray(X, dtype=np.float32)
 
     def build_embedding_table(self, mode: str = "aggregated", every_nth: int = 1):
         df_proc = self.processed_entries()
@@ -145,13 +143,17 @@ class FeatureVisualizer:
         if perplexity is None:
             perplexity = max(5, min(30, len(emb_scaled) // 3))
 
+        # PCA to 50 dims first (standard for t-SNE): much less memory/time on many tiles
+        n_pca = min(50, *emb_scaled.shape)
+        emb_pca = PCA(n_components=n_pca, svd_solver="randomized", random_state=42).fit_transform(emb_scaled)
+
         reduced = TSNE(
             n_components=n_components,
             perplexity=perplexity,
             learning_rate="auto",
             init="pca",
             random_state=42,
-        ).fit_transform(emb_scaled)
+        ).fit_transform(emb_pca)
 
         return reduced, emb_scaled
 
@@ -160,7 +162,7 @@ class FeatureVisualizer:
         labels_encoded = self._encode_labels(labels)
 
         if len(np.unique(labels_encoded)) > 1:
-            sil = silhouette_score(emb_scaled, labels_encoded)
+            sil = silhouette_score(emb_scaled, labels_encoded)  # exact; sklearn computes distances in chunks
         else:
             sil = np.nan
 
@@ -171,6 +173,7 @@ class FeatureVisualizer:
         """shade_by_slide: one hue per label, a different shade of it per slide (legend shows labels only)."""
         emb, meta = self.build_embedding_table(mode=mode, every_nth=every_nth)
         labels = meta[self.label_col].to_numpy()
+        print(f"{len(emb):,} points x {emb.shape[1]} features ({emb.nbytes / 1e9:.1f} GB)")
 
         sil = self.silhouette_score(emb, labels)
 
@@ -218,8 +221,8 @@ class FeatureVisualizer:
         plt.title(title)
         plt.xlabel(xlab)
         plt.ylabel(ylab)
-        plt.legend(title=self.label_col, bbox_to_anchor=(1.04, 1), loc="upper left")
-        plt.tight_layout()
+        # Legend under the plot; no tight_layout, so the plot area keeps its size
+        plt.legend(title=self.label_col, bbox_to_anchor=(0.5, -0.08), loc="upper center", frameon=False)
         plt.show()
 
 
