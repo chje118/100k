@@ -267,18 +267,18 @@ class FeatureVisualizer:
                 plt.scatter(xy[m, 0], xy[m, 1], s=size(info.loc[m, "attention_pct"].to_numpy()),
                             facecolors=c if filled else "none", edgecolors=c, lw=0.6, alpha=0.85, zorder=2)
 
-        # One legend: diagnosis (color), tile type (marker), attention (size)
+        # Legend like the other figures: color = diagnosis, filled/open = arm, size = attention
         h = lambda **kw: plt.scatter([], [], **kw)
-        blank = h(s=0, color="none")
-        handles = [blank] + [h(s=12, color=PALETTE[i % len(PALETTE)]) for i in range(len(unique_labels))]
-        names = [r"$\bf{Diagnosis}$"] + [str(l) for l in unique_labels]
-        handles += [blank, h(s=12, color="#52514e"), h(s=12, facecolors="none", edgecolors="#52514e", lw=0.6)]
-        names += [r"$\bf{Tile}$", "Non-healthy-like (disease arm)", "Healthy-like (healthy arm)"]
-        handles += [blank] + [h(s=size(q), color="#52514e") for q in (0.25, 0.5, 0.75, 1.0)]
-        names += [r"$\bf{Attention\ (percentile\ in\ slide)}$"] + ["25th", "50th", "75th", "100th"]
-        plt.legend(handles, names, bbox_to_anchor=(0.5, -0.14), loc="upper center", frameon=False)
+        handles = [h(s=12, color=PALETTE[i % len(PALETTE)], lw=0) for i in range(len(unique_labels))]
+        names = [str(l) for l in unique_labels]
+        handles += [h(s=12, color="#52514e", lw=0), h(s=12, facecolors="none", edgecolors="#52514e", lw=0.6)]
+        names += ["Disease arm", "Healthy arm"]
+        handles += [h(s=size(q), color="#52514e", lw=0) for q in (0.25, 0.5, 0.75, 1.0)]
+        names += [f"Attention {q}th pct. in slide" for q in (25, 50, 75, 100)]
+        plt.legend(handles, names, title=self.label_col, bbox_to_anchor=(0.5, -0.14), loc="upper center", frameon=False)
 
-        plt.title(f"t-SNE, selected tiles (n={len(emb):,}, {info['slide'].nunique()} slides)")
+        sil = self.silhouette_score(emb, info["label"].to_numpy())
+        plt.title(f"t-SNE (selected tiles, silhouette score: {sil:.3f})")
         plt.xlabel("Dim 1")
         plt.ylabel("Dim 2")
         plt.show()
