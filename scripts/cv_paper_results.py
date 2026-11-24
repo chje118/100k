@@ -27,7 +27,7 @@ Input: `oof` from oof_group_metrics.collect_oof_predictions
     print(cv.paper_text(oof, t, "tissue", configs=oof.attrs.get("configs"), skipped=oof.attrs.get("skipped")))
 
     # External cohort (final model, no folds): same table from the ABMILInference cache, then the same calls
-    ext = cv.from_cache(cache_path, slides, meta, "filename", "label", "tissue", "rekvnr")
+    ext = cv.from_cache(cache_path, slides, meta, "filename", "label", "rekvnr", "tissue")  # group optional
     t = cv.organ_table(ext, "tissue", "rekvnr")
     cv.table_cohort(ext, "tissue", "rekvnr"); cv.table_per_organ(t, "tissue"); cv.fig_cv_roc(ext, t, "tissue")
     cv.fig_forest(t, "tissue"); cv.fig_scores(ext, t, "tissue"); cv.fig_confusion(ext, "tissue", cv.ALL)
@@ -127,10 +127,11 @@ def organ_table(oof, group_col, patient_col, n_boot=2000, seed=0):
     return pd.concat([body, t[t[group_col] == ALL]], ignore_index=True)
 
 
-def from_cache(cache_path, slides, meta, filename_col, label_col, group_col, patient_col):
+def from_cache(cache_path, slides, meta, filename_col, label_col, patient_col, group_col=None):
     """External cohort: predictions from an ABMILInference cache (.pkl), as an OOF-like table without `fold`
     (slide, group, patient, label, prob_pos, pred, n_tiles). Only slides in `slides` are used; every other cached
-    slide is ignored. Matched by file name (path and extension ignored)."""
+    slide is ignored. Matched on meta[filename_col] by file name (path and extension ignored), so it can also be
+    an id the scans are named by, e.g. table_id. group_col=None: one group, column "group" = "All slides"."""
     with open(cache_path, "rb") as f:
         cache = pickle.load(f)
     name = lambda p: os.path.splitext(os.path.basename(str(p)))[0]  # "D:/x/a.mrxs", "a.mrxs" and "a" all match
@@ -144,7 +145,11 @@ def from_cache(cache_path, slides, meta, filename_col, label_col, group_col, pat
         print(f"Not in cache, left out ({len(missing)}): {missing}")
     rows = [{"slide": name(s), "prob_pos": cache[name(s)]["prob_1"], "pred": int(cache[name(s)]["pred_idx"]),
              "n_tiles": len(cache[name(s)]["attention"])} for s in slides if name(s) in cache]
+    if group_col is None:
+        meta, group_col = meta.assign(group="All slides"), "group"
     m = meta.assign(slide=meta[filename_col].map(name))[["slide", group_col, patient_col, label_col]]
+    if m["slide"].duplicated().any():
+        raise ValueError(f"Duplicate '{filename_col}' in meta: {m.loc[m['slide'].duplicated(), 'slide'].tolist()[:5]}")
     d = pd.DataFrame(rows).merge(m.rename(columns={label_col: "label"}), on="slide", how="left")
     if d["label"].isna().any():
         raise ValueError(f"No '{label_col}' in meta for: {d.loc[d['label'].isna(), 'slide'].tolist()}")
