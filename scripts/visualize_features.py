@@ -1,3 +1,16 @@
+"""
+Example usage:
+from visualize_features import FeatureVisualizer
+
+viz = FeatureVisualizer(
+    meta,                      
+    zarr_dir=zarr_dir,
+    cache_path=wsi_cache,
+    model="h-optimus-0",
+    label_col="diagnose", 
+    filename_col="path",
+)"""
+
 import os
 import gc
 import matplotlib.colors as mcolors
