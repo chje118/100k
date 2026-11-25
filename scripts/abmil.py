@@ -1753,6 +1753,40 @@ def plot_deletion_curves(results_df, title=None):
     plt.show()
     return fig
 
+def plot_deletion_curves_comparison(results_attention, results_contribution, title=None):
+    """
+    Plot mean ± SEM deletion curves for attention-guided, contribution-guided
+    and random deletion in the same plot.
+    """
+    fig, ax = plt.subplots(figsize=(7, 5))
+
+    curves = [
+        (results_attention, "importance_prob", "Attention-guided deletion", "#2a78d6", "-"),
+        (results_contribution, "importance_prob", "Contribution-guided deletion", "#eb6834", "-"),
+        (results_attention, "random_prob", "Random deletion", "#555555", "--"),
+    ]
+    for df, col, label, color, ls in curves:
+        summary = df.groupby("frac_deleted")[col].agg(
+            mean="mean", sem=lambda x: x.std(ddof=1) / np.sqrt(len(x))
+        ).reset_index()
+        ax.plot(summary["frac_deleted"], summary["mean"], color=color, label=label, marker="o", linestyle=ls)
+        ax.fill_between(
+            summary["frac_deleted"],
+            summary["mean"] - summary["sem"],
+            summary["mean"] + summary["sem"],
+            color=color,
+            alpha=0.2,
+        )
+
+    ax.set_xlabel("Fraction of tiles deleted")
+    ax.set_ylabel("Probability of original predicted class")
+    ax.set_ylim(0, 1.02)
+    ax.set_title(title or "Deletion curve: attention vs. contribution")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+    return fig
+
 
 # ----------------------------------------
 # Five-slide overfit check
