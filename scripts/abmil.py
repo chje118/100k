@@ -1393,7 +1393,7 @@ class ABMILInference:
             vmin=0,
             vmax=1,
             show_image=True,
-            show_contours=True,
+            show_contours=False,
             ax=ax,
         )
         ax.set_title(
@@ -1454,11 +1454,69 @@ class ABMILInference:
             vmin=-limit,
             vmax=limit,
             show_image=True,
-            show_contours=True,
+            show_contours=False,
             ax=ax,
         )
         ax.set_title(
             f"Contribution overlay (blue=supports healthy, red=supports disease): {os.path.basename(slide_path)}, "
+            f"Predicted: {slide_data['pred_label']} (Conf: {slide_data['confidence']:.2f})"
+        )
+        ax.axis("off")
+
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+            fig.tight_layout()
+            fig.savefig(save_path, format="jpg", dpi=300, bbox_inches="tight")
+            plt.close(fig)
+            return save_path
+
+        plt.show()
+        return fig
+
+    def contrast_overlay(self, slide_path: str, save_path: str = None, max_alpha: float = 0.7):
+        """
+        Plot contrast_score (not attention-weighted) as a semi-transparent overlay on the tissue image.
+        Near-zero tiles are transparent; strongly healthy-like (blue) or disease-like (red) tiles
+        are opaque up to max_alpha.
+        """
+        slide_data = self._slide_cache.get(slide_path)
+        if not slide_data:
+            print(f"No cached data found for slide: {slide_path}")
+            return None
+
+        tile_table = slide_data.get("tile_table")
+        if tile_table is None or "contrast_score" not in tile_table.columns:
+            print(f"No contrast_score found for slide: {slide_path}. Re-run inference to populate it.")
+            return None
+
+        wsi = open_wsi(slide_path, slide_data["zarr_path"])
+        contrast = tile_table.set_index("tile_id")["contrast_score"]
+
+        # Same scaling as contrast_heatmap: centred at 0, limit = max |contrast|
+        limit = float(np.abs(contrast).max()) if len(contrast) else 1.0
+        limit = limit if limit > 0 else 1.0
+
+        adata = wsi.tables[slide_data["feature_key"]]
+        adata.obs["contrast_display"] = contrast.reindex(adata.obs["tile_id"]).to_numpy()
+
+        cmap = self._overlay_cmap("coolwarm", max_alpha, diverging=True)
+
+        fig, ax = plt.subplots(figsize=(10, 10))
+        zs.pl.tiles(
+            wsi,
+            tile_key=slide_data["tile_key"],
+            feature_key=slide_data["feature_key"],
+            color="contrast_display",
+            cmap=cmap,
+            alpha=None,
+            vmin=-limit,
+            vmax=limit,
+            show_image=True,
+            show_contours=False,
+            ax=ax,
+        )
+        ax.set_title(
+            f"Contrast overlay (blue=healthy-like, red=disease-like): {os.path.basename(slide_path)}, "
             f"Predicted: {slide_data['pred_label']} (Conf: {slide_data['confidence']:.2f})"
         )
         ax.axis("off")
