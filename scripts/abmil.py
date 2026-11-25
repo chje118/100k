@@ -1336,6 +1336,143 @@ class ABMILInference:
         plt.show()
         return fig
 
+    @staticmethod
+    def _overlay_cmap(base_cmap: str, max_alpha: float, diverging: bool, lo: float = 0.0, hi: float = 1.0, n: int = 256):
+        """
+        Colormap with per-value transparency so tissue shows through uninformative tiles.
+        Sequential: alpha ramps 0 -> max_alpha. Diverging: alpha is 0 at the centre, max_alpha at both ends.
+        """
+        from matplotlib.colors import ListedColormap
+
+        x = np.linspace(0.0, 1.0, n)
+        colors = plt.get_cmap(base_cmap)(lo + (hi - lo) * x)
+        colors[:, 3] = max_alpha * (np.abs(2 * x - 1) if diverging else x)
+        cmap = ListedColormap(colors)
+        cmap.set_bad((0, 0, 0, 0))
+        return cmap
+
+    def attention_overlay(self, slide_path: str, save_path: str = None, max_alpha: float = 0.7):
+        """
+        Plot attention as a semi-transparent overlay on the tissue image.
+        Low-attention tiles are transparent; high-attention tiles are opaque up to max_alpha.
+        """
+        slide_data = self._slide_cache.get(slide_path)
+        if not slide_data:
+            print(f"No cached data found for slide: {slide_path}")
+            return None
+
+        wsi = open_wsi(slide_path, slide_data["zarr_path"])
+        attention = np.asarray(slide_data["attention"], dtype=float)
+
+        if attention.ndim > 1:
+            attention = attention.mean(axis=1)
+
+        # Same p5-p99 scaling as attention_heatmap
+        if attention.size:
+            low, high = np.percentile(attention, [5, 99])
+            if high > low:
+                attention_display = np.clip((attention - low) / (high - low + 1e-8), 0.0, 1.0)
+            else:
+                attention_display = attention.copy()
+        else:
+            attention_display = attention
+
+        wsi.tables[slide_data["feature_key"]].obs["attention_display"] = attention_display
+
+        # Skip the black and white ends of "hot" so the overlay stays visible on tissue
+        cmap = self._overlay_cmap("hot", max_alpha, diverging=False, lo=0.25, hi=0.85)
+
+        fig, ax = plt.subplots(figsize=(10, 10))
+        zs.pl.tiles(
+            wsi,
+            tile_key=slide_data["tile_key"],
+            feature_key=slide_data["feature_key"],
+            color="attention_display",
+            cmap=cmap,
+            alpha=None,  # use the colormap's own alpha channel
+            vmin=0,
+            vmax=1,
+            show_image=True,
+            show_contours=True,
+            ax=ax,
+        )
+        ax.set_title(
+            f"Attention overlay: {os.path.basename(slide_path)}, "
+            f"Predicted: {slide_data['pred_label']} "
+            f"(Conf: {slide_data['confidence']:.2f})"
+        )
+        ax.axis("off")
+
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+            fig.tight_layout()
+            fig.savefig(save_path, format="jpg", dpi=300, bbox_inches="tight")
+            plt.close(fig)
+            return save_path
+
+        plt.show()
+        return fig
+
+    def contribution_overlay(self, slide_path: str, save_path: str = None, max_alpha: float = 0.7):
+        """
+        Plot contribution_score as a semi-transparent overlay on the tissue image.
+        Near-zero tiles are transparent; strongly supporting tiles are opaque up to max_alpha
+        (blue=supports healthy, red=supports disease).
+        """
+        slide_data = self._slide_cache.get(slide_path)
+        if not slide_data:
+            print(f"No cached data found for slide: {slide_path}")
+            return None
+
+        tile_table = slide_data.get("tile_table")
+        if tile_table is None or "contribution_score" not in tile_table.columns:
+            print(f"No contribution_score found for slide: {slide_path}. Re-run inference to populate it.")
+            return None
+
+        wsi = open_wsi(slide_path, slide_data["zarr_path"])
+        contribution = tile_table.set_index("tile_id")["contribution_score"]
+
+        # Same scaling as contribution_heatmap: centred at 0, clipped at p99 of |contribution|
+        limit = float(np.percentile(np.abs(contribution), 99)) if len(contribution) else 1.0
+        limit = limit if limit > 0 else 1.0
+
+        adata = wsi.tables[slide_data["feature_key"]]
+        adata.obs["contribution_display"] = np.clip(
+            contribution.reindex(adata.obs["tile_id"]).to_numpy(), -limit, limit
+        )
+
+        cmap = self._overlay_cmap("coolwarm", max_alpha, diverging=True)
+
+        fig, ax = plt.subplots(figsize=(10, 10))
+        zs.pl.tiles(
+            wsi,
+            tile_key=slide_data["tile_key"],
+            feature_key=slide_data["feature_key"],
+            color="contribution_display",
+            cmap=cmap,
+            alpha=None,  # use the colormap's own alpha channel
+            vmin=-limit,
+            vmax=limit,
+            show_image=True,
+            show_contours=True,
+            ax=ax,
+        )
+        ax.set_title(
+            f"Contribution overlay (blue=supports healthy, red=supports disease): {os.path.basename(slide_path)}, "
+            f"Predicted: {slide_data['pred_label']} (Conf: {slide_data['confidence']:.2f})"
+        )
+        ax.axis("off")
+
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+            fig.tight_layout()
+            fig.savefig(save_path, format="jpg", dpi=300, bbox_inches="tight")
+            plt.close(fig)
+            return save_path
+
+        plt.show()
+        return fig
+
     def results_dataframe(self):
         """Return one row per cached slide with predictions and class probabilities."""
         if not self._slide_cache:
