@@ -1337,19 +1337,34 @@ class ABMILInference:
         return fig
 
     @staticmethod
-    def _overlay_cmap(base_cmap: str, max_alpha: float, diverging: bool, lo: float = 0.0, hi: float = 1.0, n: int = 256):
+    def _overlay_cmap(base_cmap, max_alpha: float, diverging: bool, lo: float = 0.0, hi: float = 1.0, n: int = 256, gamma: float = 1.0):
         """
         Colormap with per-value transparency so tissue shows through uninformative tiles.
         Sequential: alpha ramps 0 -> max_alpha. Diverging: alpha is 0 at the centre, max_alpha at both ends.
+        gamma < 1 makes moderate values more opaque (alpha = max_alpha * ramp**gamma).
         """
         from matplotlib.colors import ListedColormap
 
         x = np.linspace(0.0, 1.0, n)
         colors = plt.get_cmap(base_cmap)(lo + (hi - lo) * x)
-        colors[:, 3] = max_alpha * (np.abs(2 * x - 1) if diverging else x)
+        ramp = np.abs(2 * x - 1) if diverging else x
+        colors[:, 3] = max_alpha * ramp ** gamma
         cmap = ListedColormap(colors)
         cmap.set_bad((0, 0, 0, 0))
         return cmap
+
+    @staticmethod
+    def _healthy_disease_cmap(healthy_color: str, disease_color: str):
+        """
+        Two-colour diverging colormap: solid healthy_color below 0, solid disease_color above 0.
+        Strength is shown via transparency (see _overlay_cmap), so colours stay saturated on H&E.
+        """
+        from matplotlib.colors import LinearSegmentedColormap
+
+        return LinearSegmentedColormap.from_list(
+            "healthy_disease",
+            [(0.0, healthy_color), (0.5, healthy_color), (0.5, disease_color), (1.0, disease_color)],
+        )
 
     def attention_overlay(self, slide_path: str, save_path: str = None, max_alpha: float = 0.7):
         """
@@ -1394,6 +1409,7 @@ class ABMILInference:
             vmax=1,
             show_image=True,
             show_contours=False,
+            tissue_id=0,
             ax=ax,
         )
         ax.set_title(
@@ -1413,11 +1429,12 @@ class ABMILInference:
         plt.show()
         return fig
 
-    def contribution_overlay(self, slide_path: str, save_path: str = None, max_alpha: float = 0.7):
+    def contribution_overlay(self, slide_path: str, save_path: str = None, max_alpha: float = 0.8,
+                             gamma: float = 0.5, healthy_color: str = "#00c853", disease_color: str = "#e60000"):
         """
         Plot contribution_score as a semi-transparent overlay on the tissue image.
         Near-zero tiles are transparent; strongly supporting tiles are opaque up to max_alpha
-        (blue=supports healthy, red=supports disease).
+        (green=supports healthy, red=supports disease).
         """
         slide_data = self._slide_cache.get(slide_path)
         if not slide_data:
@@ -1441,7 +1458,9 @@ class ABMILInference:
             contribution.reindex(adata.obs["tile_id"]).to_numpy(), -limit, limit
         )
 
-        cmap = self._overlay_cmap("coolwarm", max_alpha, diverging=True)
+        cmap = self._overlay_cmap(
+            self._healthy_disease_cmap(healthy_color, disease_color), max_alpha, diverging=True, gamma=gamma
+        )
 
         fig, ax = plt.subplots(figsize=(10, 10))
         zs.pl.tiles(
@@ -1455,10 +1474,11 @@ class ABMILInference:
             vmax=limit,
             show_image=True,
             show_contours=False,
+            tissue_id=0,
             ax=ax,
         )
         ax.set_title(
-            f"Contribution overlay (blue=supports healthy, red=supports disease): {os.path.basename(slide_path)}, "
+            f"Contribution overlay (green=supports healthy, red=supports disease): {os.path.basename(slide_path)}, "
             f"Predicted: {slide_data['pred_label']} (Conf: {slide_data['confidence']:.2f})"
         )
         ax.axis("off")
@@ -1473,10 +1493,11 @@ class ABMILInference:
         plt.show()
         return fig
 
-    def contrast_overlay(self, slide_path: str, save_path: str = None, max_alpha: float = 0.7):
+    def contrast_overlay(self, slide_path: str, save_path: str = None, max_alpha: float = 0.8,
+                         gamma: float = 0.5, healthy_color: str = "#00c853", disease_color: str = "#e60000"):
         """
         Plot contrast_score (not attention-weighted) as a semi-transparent overlay on the tissue image.
-        Near-zero tiles are transparent; strongly healthy-like (blue) or disease-like (red) tiles
+        Near-zero tiles are transparent; strongly healthy-like (green) or disease-like (red) tiles
         are opaque up to max_alpha.
         """
         slide_data = self._slide_cache.get(slide_path)
@@ -1499,7 +1520,9 @@ class ABMILInference:
         adata = wsi.tables[slide_data["feature_key"]]
         adata.obs["contrast_display"] = contrast.reindex(adata.obs["tile_id"]).to_numpy()
 
-        cmap = self._overlay_cmap("coolwarm", max_alpha, diverging=True)
+        cmap = self._overlay_cmap(
+            self._healthy_disease_cmap(healthy_color, disease_color), max_alpha, diverging=True, gamma=gamma
+        )
 
         fig, ax = plt.subplots(figsize=(10, 10))
         zs.pl.tiles(
@@ -1513,10 +1536,11 @@ class ABMILInference:
             vmax=limit,
             show_image=True,
             show_contours=False,
+            tissue_id=0,
             ax=ax,
         )
         ax.set_title(
-            f"Contrast overlay (blue=healthy-like, red=disease-like): {os.path.basename(slide_path)}, "
+            f"Contrast overlay (green=healthy-like, red=disease-like): {os.path.basename(slide_path)}, "
             f"Predicted: {slide_data['pred_label']} (Conf: {slide_data['confidence']:.2f})"
         )
         ax.axis("off")
