@@ -1276,6 +1276,66 @@ class ABMILInference:
         plt.show()
         return fig
 
+    def contribution_heatmap(self, slide_path: str, save_path: str = None):
+        """
+        Plot the contribution_score (attention * contrast_score) heatmap for one cached slide.
+        """
+        slide_data = self._slide_cache.get(slide_path)
+        if not slide_data:
+            print(f"No cached data found for slide: {slide_path}")
+            return None
+
+        tile_table = slide_data.get("tile_table")
+        if tile_table is None or "contribution_score" not in tile_table.columns:
+            print(f"No contribution_score found for slide: {slide_path}. Re-run inference to populate it.")
+            return None
+
+        wsi = open_wsi(slide_path, slide_data["zarr_path"])
+        contribution = tile_table.set_index("tile_id")["contribution_score"]
+
+        # Center the colormap at 0; scale to p99 of |contribution| (heavy-tailed via attention)
+        limit = float(np.percentile(np.abs(contribution), 99)) if len(contribution) else 1.0
+        limit = limit if limit > 0 else 1.0
+
+        print(
+            f"Contribution stats for {os.path.basename(slide_path)}: "
+            f"min={contribution.min():.4f}, median={contribution.median():.4f}, "
+            f"max={contribution.max():.4f}, sum={contribution.sum():.4f}, |p99|={limit:.4f}"
+        )
+
+        adata = wsi.tables[slide_data["feature_key"]]
+        adata.obs["contribution_display"] = np.clip(
+            contribution.reindex(adata.obs["tile_id"]).to_numpy(), -limit, limit
+        )
+
+        fig, ax = plt.subplots(figsize=(10, 10))
+        zs.pl.tiles(
+            wsi,
+            tile_key=slide_data["tile_key"],
+            feature_key=slide_data["feature_key"],
+            color="contribution_display",
+            cmap="coolwarm",
+            vmin=-limit,
+            vmax=limit,
+            show_contours=True,
+            ax=ax,
+        )
+        ax.set_title(
+            f"Contribution score (blue=supports healthy, red=supports disease): {os.path.basename(slide_path)}, "
+            f"Predicted: {slide_data['pred_label']} (Conf: {slide_data['confidence']:.2f})"
+        )
+        ax.axis("off")
+
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+            fig.tight_layout()
+            fig.savefig(save_path, format="jpg", dpi=300, bbox_inches="tight")
+            plt.close(fig)
+            return save_path
+
+        plt.show()
+        return fig
+
     def results_dataframe(self):
         """Return one row per cached slide with predictions and class probabilities."""
         if not self._slide_cache:
