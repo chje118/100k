@@ -1753,23 +1753,34 @@ def plot_deletion_curves(results_df, title=None):
     plt.show()
     return fig
 
-def plot_deletion_curves_comparison(results_attention, results_contribution, title=None):
+def plot_deletion_curves_comparison(results, title=None):
     """
     Plot mean ± SEM deletion curves for attention-guided, contribution-guided
-    and random deletion in the same plot.
+    and random deletion in the same plot, for one or more settings (e.g. MPPs).
+
+    results: {setting_name: (results_attention, results_contribution)}, e.g.
+        {"MPP 0.5": (att_05, contrib_05), "MPP 0.12": (att_012, contrib_012)}
+
+    Colour = deletion method, line style = setting.
     """
     fig, ax = plt.subplots(figsize=(7, 5))
 
-    curves = [
-        (results_attention, "importance_prob", "Attention-guided deletion", "#2a78d6", "-"),
-        (results_contribution, "importance_prob", "Contribution-guided deletion", "#eb6834", "-"),
-        (results_attention, "random_prob", "Random deletion", "#555555", "--"),
-    ]
-    for df, col, label, color, ls in curves:
+    linestyles = ["-", "--", ":", "-."]
+    markers = ["o", "s", "^", "D"]
+    curves = []
+    for i, (name, (results_attention, results_contribution)) in enumerate(results.items()):
+        ls, mk = linestyles[i % len(linestyles)], markers[i % len(markers)]
+        curves += [
+            (results_attention, "importance_prob", f"Attention ({name})", "#2a78d6", ls, mk),
+            (results_contribution, "importance_prob", f"Contribution ({name})", "#eb6834", ls, mk),
+            (results_attention, "random_prob", f"Random ({name})", "#555555", ls, mk),
+        ]
+
+    for df, col, label, color, ls, mk in curves:
         summary = df.groupby("frac_deleted")[col].agg(
             mean="mean", sem=lambda x: x.std(ddof=1) / np.sqrt(len(x))
         ).reset_index()
-        ax.plot(summary["frac_deleted"], summary["mean"], color=color, label=label, marker="o", linestyle=ls)
+        ax.plot(summary["frac_deleted"], summary["mean"], color=color, label=label, marker=mk, linestyle=ls)
         ax.fill_between(
             summary["frac_deleted"],
             summary["mean"] - summary["sem"],
