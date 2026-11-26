@@ -206,7 +206,7 @@ def fig_deletion_curves(dele):
         ax.fill_between(x, s["lo"], s["hi"], color=color, alpha=0.2, lw=0)
     ax.set_xlabel("Tiles deleted (%)")
     ax.set_ylabel("P(non-healthy), mean ± 95% CI")
-    ax.set_ylim(0.2, 1.02)
+    ax.set_ylim(0.4, 1.02)
     ax.set_xlim(0, 100 * dele["frac_deleted"].max())
     ax.legend(frameon=False, loc="lower left")
     plt.tight_layout()
@@ -283,11 +283,28 @@ EVIDENCE_SHORT = {
 }
 
 
+# Paper abbreviations, matched case-insensitively on keywords in the diagnosis name (English or
+# Danish spelling); first match wins, so a nodular Hodgkin is not labelled classical Hodgkin.
+DIAGNOSIS_SHORT = [
+    (("hyperplas",), "NLH"),             # nodular lymphatic hyperplasia
+    (("nodul", "hodgkin"), "NLPHL"),     # not expected; kept apart from cHL
+    (("hodgkin",), "cHL"),               # classical Hodgkin lymphoma
+    (("follic",), "FL"),
+    (("follik",), "FL"),
+    (("diffus",), "DLBCL"),
+    (("large b",), "DLBCL"),
+]
+
+
 def _short(label, short_names):
-    """Short diagnosis label: short_names[label] if given, else the initials of a long name
-    ("Diffuse large B-cell lymphoma" -> "DLBCL", "Follicular lymphoma" -> "FL")."""
+    """Short diagnosis label: short_names[label] if given, else DIAGNOSIS_SHORT by keyword,
+    else the label itself if short, else its initials."""
     if label in short_names:
         return short_names[label]
+    low = label.lower()
+    for keys, short in DIAGNOSIS_SHORT:
+        if all(k in low for k in keys):
+            return short
     if len(label) <= 6 or label == "Other":
         return label
     return "".join(w[0].upper() for w in re.split(r"[\s\-/,]+", label) if w)
