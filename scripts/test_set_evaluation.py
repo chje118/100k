@@ -22,6 +22,7 @@ using the saved ABMILInference cache where possible.
 
 import os
 import pickle
+import re
 from functools import lru_cache
 
 import numpy as np
@@ -203,10 +204,9 @@ def fig_deletion_curves(dele):
         ax.plot(x, s["m"], color=color, lw=1.2, marker="o", ms=2.5, label=label,
                 ls="--" if k == "random" else "-")
         ax.fill_between(x, s["lo"], s["hi"], color=color, alpha=0.2, lw=0)
-    ax.axhline(0.5, color=MUTED, lw=0.6, ls=":")
     ax.set_xlabel("Tiles deleted (%)")
     ax.set_ylabel("P(non-healthy), mean ± 95% CI")
-    ax.set_ylim(0, 1.02)
+    ax.set_ylim(0.2, 1.02)
     ax.set_xlim(0, 100 * dele["frac_deleted"].max())
     ax.legend(frameon=False, loc="lower left")
     plt.tight_layout()
@@ -276,19 +276,43 @@ def table_evidence_by_diagnosis(evid, group_col, min_n=5):
     return pd.DataFrame(rows)
 
 
-def fig_evidence_by_diagnosis(evid, group_col, min_n=5):
-    """One panel per evidence measure, box + points per diagnosis."""
+EVIDENCE_SHORT = {
+    "prob_pos": "P(non-healthy)",
+    "frac_disease_like": "Disease-like tiles",
+    "frac_tiles_half_contribution": "Tiles for 50% of contribution",
+}
+
+
+def _short(label, short_names):
+    """Short diagnosis label: short_names[label] if given, else the initials of a long name
+    ("Diffuse large B-cell lymphoma" -> "DLBCL", "Follicular lymphoma" -> "FL")."""
+    if label in short_names:
+        return short_names[label]
+    if len(label) <= 6 or label == "Other":
+        return label
+    return "".join(w[0].upper() for w in re.split(r"[\s\-/,]+", label) if w)
+
+
+def fig_evidence_by_diagnosis(evid, group_col, min_n=5, short_names=None):
+    """
+    One panel per evidence measure, box + points per diagnosis. Diagnoses are shown by
+    short names (initials unless given in short_names={full: short}); the mapping is
+    printed for the figure legend.
+    """
     g, order = _groups(evid, group_col, min_n)
+    short = {grp: _short(str(grp), short_names or {}) for grp in order}
+    if len(set(short.values())) < len(short):
+        raise ValueError(f"Short names collide: {short}. Pass short_names to resolve.")
+    print("; ".join(f"{s}, {grp}" for grp, s in short.items() if s != grp))
     rng = np.random.RandomState(0)
-    fig, axes = plt.subplots(1, len(EVIDENCE), figsize=(183 * MM, 65 * MM))
-    for ax, (col, label) in zip(axes, EVIDENCE.items()):
+    fig, axes = plt.subplots(1, len(EVIDENCE), figsize=(183 * MM, 55 * MM))
+    for ax, (col, label) in zip(axes, EVIDENCE_SHORT.items()):
         data = [evid.loc[g == grp, col].values for grp in order]
         ax.boxplot(data, positions=range(len(order)), widths=0.5, showfliers=False, medianprops={"color": INK})
         for i, v in enumerate(data):
             ax.scatter(i + rng.uniform(-0.15, 0.15, len(v)), v, s=4, alpha=0.6, color=PALETTE[0], lw=0)
-        ax.set_xticks(range(len(order)), [f"{grp} (n={len(v)})" for grp, v in zip(order, data)],
-                      rotation=30, ha="right")
-        ax.set_ylabel(label)
+        ax.set_xticks(range(len(order)), [f"{short[grp]}\nn={len(v)}" for grp, v in zip(order, data)])
+        ax.set_title(label)
         if col != "frac_tiles_half_contribution":  # that one is often near 0; let it autoscale
             ax.set_ylim(-0.02, 1.02)
     axes[0].axhline(0.5, color=MUTED, lw=0.6, ls="--")
