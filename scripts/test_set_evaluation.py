@@ -1,25 +1,21 @@
 """
 Paper evaluation of an external test set: one tissue type, one slide per patient,
-all slides non-healthy (e.g. lymphoma, endometrium). Scored by one trained ABMIL
-checkpoint; uses the saved ABMILInference cache where possible.
+all slides non-healthy (e.g. lymphoma). Scored by one trained ABMIL checkpoint,
+using the saved ABMILInference cache where possible.
 
     import test_set_evaluation as ev
 
-    # 1. Detection: how many slides are called non-healthy, per diagnosis
+    # 1. Detection: share of slides called non-healthy, per diagnosis
     ext = ev.load_predictions(inference_cache, slides, meta, "path", "M_idx", "rekvnr", "diagnose")
     ev.table_detection(ext, "diagnose")
-    ev.fig_scores(ext, "diagnose")
 
-    # 2. Faithfulness: deletion curves (attention vs contribution vs random)
-    att, con, audc = ev.run_deletion_curves(slides, abmil_path, zarr_dir)
-    ev.fig_deletion_curves(att, con, "Lymphoma")
+    # 2. Faithfulness of the two ROI arms: deletion curves on P(non-healthy)
+    dele = ev.run_deletion_curves(slides, abmil_path, zarr_dir)
+    ev.table_deletion(dele)
+    ev.fig_deletion_curves(dele)
 
-    # 3. Selected tiles: where the cut tiles sit within their slide
-    sel = ev.selected_tile_percentiles(inference_cache, slides)   # pass the ROISelector settings used for cutting
-    ev.fig_selected_tile_percentiles(sel)
-
-    # 4. Model evidence per diagnosis
-    evid = ev.evidence_per_slide(inference_cache, ext)
+    # 3. Model evidence per diagnosis: P(non-healthy), disease-like tiles, concentration
+    evid = ev.evidence_per_slide(inference_cache, ext, abmil_path)
     ev.table_evidence_by_diagnosis(evid, "diagnose")
     ev.fig_evidence_by_diagnosis(evid, "diagnose")
 """
@@ -31,21 +27,27 @@ from functools import lru_cache
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.stats import binomtest, kruskal, wilcoxon
+import torch
+from scipy import stats
 from tqdm import tqdm
 
 import cv_paper_results as cv
 from paper_style import MM, PALETTE, INK, MUTED
-from abmil import (load_checkpoint, _load_slide_feats, _slide_deletion_curve,
-                   deletion_auc_summary, plot_deletion_curves_comparison)
-from roi_selection import ROISelector
+from abmil import load_checkpoint, _load_slide_feats, get_tile_contributions
 
-SCORES = ["attention", "contrast_score", "contribution_score"]
 EVIDENCE = {
     "prob_pos": "P(non-healthy)",
     "frac_disease_like": "Fraction of disease-like tiles",
     "frac_tiles_half_contribution": "Fraction of tiles giving\n50% of contribution",
 }
+# Deletion rankings, matching ROISelector's defaults: the disease arm takes the highest
+# contribution_score, the healthy arm the lowest contrast_score.
+DELETION = {
+    "disease": ("Most disease-driving first (disease arm)", PALETTE[1]),
+    "healthy": ("Most healthy-like first (healthy arm)", PALETTE[2]),
+    "random": ("Random", MUTED),
+}
+DEFAULT_FRAC_GRID = np.array([0, 0.01, 0.02, 0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50])
 
 
 @lru_cache(maxsize=1)
@@ -68,6 +70,17 @@ def _groups(df, group_col, min_n):
     return g, order
 
 
+def _mean_ci(x):
+    """Mean and t-based 95% CI of the mean."""
+    x = np.asarray(x, float)
+    x = x[~np.isnan(x)]
+    m = x.mean()
+    if len(x) < 2:
+        return m, np.nan, np.nan
+    h = stats.t.ppf(0.975, len(x) - 1) * x.std(ddof=1) / np.sqrt(len(x))
+    return m, m - h, m + h
+
+
 # ----------------------------------------
 # 1. Detection
 # ----------------------------------------
@@ -77,171 +90,169 @@ def load_predictions(cache_path, slides, meta, filename_col, label_col, patient_
     return cv.from_cache(cache_path, slides, meta, filename_col, label_col, patient_col, group_col)
 
 
-def table_detection(ext, group_col):
+def table_detection(ext, group_col, min_n=5):
     """
-    Slides called non-healthy (threshold 0.5) per diagnosis and overall, with
-    exact (Clopper-Pearson) 95% CI. All slides are non-healthy, so this is the
-    sensitivity; AUC/specificity are undefined without healthy slides.
+    Slides called non-healthy (P(non-healthy) >= 0.5) per diagnosis and overall.
+
+    All slides are truly non-healthy, so this proportion is the sensitivity; AUC and
+    specificity are undefined without healthy slides. The 95% CI is the exact
+    (Clopper-Pearson) binomial interval for that proportion: the range of true
+    detection rates compatible with k of n slides called non-healthy. It describes
+    uncertainty in the detection rate, not in any single slide's P(non-healthy).
+    Slides count as independent trials because there is one slide per patient.
+    Diagnoses with fewer than min_n slides are merged into 'Other'.
     """
+    g, order = _groups(ext, group_col, min_n)
     rows = []
-    for g, d in list(ext.groupby(group_col)) + [("All", ext)]:
+    for grp in order + ["All"]:
+        d = ext if grp == "All" else ext[g == grp]
         k, n = int(d["pred"].sum()), len(d)
-        ci = binomtest(k, n).proportion_ci(confidence_level=0.95, method="exact")
-        rows.append({group_col: g, "Slides": n, "Called non-healthy": k,
-                     "Sensitivity (95% CI)": f"{k / n:.3f} ({ci.low:.3f}–{ci.high:.3f})",
-                     "Median P(non-healthy)": f"{d['prob_pos'].median():.3f}"})
+        ci = stats.binomtest(k, n).proportion_ci(confidence_level=0.95, method="exact")
+        rows.append({group_col: grp, "Slides": n, "Called non-healthy": k,
+                     "Sensitivity, % (95% CI)": f"{100 * k / n:.1f} ({100 * ci.low:.1f}–{100 * ci.high:.1f})"})
+    print("Sensitivity = share of slides with P(non-healthy) >= 0.5; 95% CI: exact binomial (Clopper-Pearson), "
+          "one slide per patient.")
     return pd.DataFrame(rows)
-
-
-def fig_scores(ext, group_col):
-    """Predicted P(non-healthy) per diagnosis. Reuses cv.fig_scores."""
-    order = ext[group_col].value_counts().index.tolist()
-    return cv.fig_scores(ext, pd.DataFrame({group_col: order}), group_col)
 
 
 # ----------------------------------------
 # 2. Deletion curves
 # ----------------------------------------
 
-def run_deletion_curves(slides, checkpoint_path, zarr_dir, frac_grid=None, n_random=5, seed=0):
-    """
-    Deletion curves with one checkpoint, ranked by attention and by contribution
-    score, each vs. random deletion. Reuses abmil._slide_deletion_curve, so the
-    output has the same columns as run_deletion_curve_evaluation.
+@torch.no_grad()
+def _slide_deletion(model, feats, frac_grid, n_random, rng):
+    """P(non-healthy) after deleting the top fraction of tiles per ranking (see DELETION)."""
+    n = feats.shape[0]
+    c = get_tile_contributions(model, feats)
+    orders = {"disease": np.argsort(-c["contribution_score"].numpy()),
+              "healthy": np.argsort(c["contrast_score"].numpy())}
 
-    Returns (results_attention, results_contribution, audc_table). audc_table has
-    the mean AUDC per ranking and a paired Wilcoxon test of AUDC_random - AUDC_ranking.
+    def p_keep(keep):
+        keep = torch.as_tensor(np.sort(keep), device=feats.device)
+        return float(torch.softmax(model(feats[keep])["logits"].float(), dim=0)[1])
+
+    rows = []
+    for frac in frac_grid:
+        n_del = min(int(round(frac * n)), n - 1)  # always keep at least one tile
+        probs = {k: p_keep(o[n_del:]) for k, o in orders.items()}
+        probs["random"] = float(np.mean([p_keep(rng.permutation(n)[n_del:]) for _ in range(n_random)]))
+        rows += [{"frac_deleted": frac, "ranking": k, "prob_pos": p} for k, p in probs.items()]
+    return rows
+
+
+def run_deletion_curves(slides, checkpoint_path, zarr_dir, frac_grid=DEFAULT_FRAC_GRID, n_random=5, seed=0):
     """
-    if frac_grid is None:
-        frac_grid = np.linspace(0.0, 1.0, 11)
+    Delete tiles in three orders and track P(non-healthy) after each step:
+      disease: highest contribution_score first (what the disease arm cuts) -> P should drop.
+      healthy: lowest contrast_score first (what the healthy arm cuts)      -> P should rise or stay.
+      random:  baseline, mean of n_random permutations.
+    Returns a long table (slide, frac_deleted, ranking, prob_pos).
+    """
     model, config, _ = load_checkpoint(checkpoint_path)
     device = next(model.parameters()).device
-    feature_key = config["feature_key"]
-
-    results = {}
-    for rank_by in ["attention", "contribution_score"]:
-        rng = np.random.RandomState(seed)
-        rows = []
-        for slide_path in tqdm(slides, desc=f"Deletion curves ({rank_by})"):
-            try:
-                feats = _load_slide_feats(slide_path, zarr_dir, feature_key)
-            except Exception as e:
-                print(f"Skipping {slide_path}: {type(e).__name__}: {e}")
-                continue
-            r = _slide_deletion_curve(model, feats, frac_grid, device, n_random=n_random, rng=rng, rank_by=rank_by)
-            for frac, imp_prob, rand_prob in zip(frac_grid, r["importance_curve"], r["random_curve"]):
-                rows.append({"slide_path": slide_path, "pred_idx": r["pred_idx"], "rank_by": rank_by,
-                             "baseline_prob": r["baseline_prob"], "frac_deleted": frac,
-                             "importance_prob": imp_prob, "random_prob": rand_prob})
-        results[rank_by] = pd.DataFrame(rows)
-
-    audc_rows = []
-    for rank_by, df in results.items():
-        audc = deletion_auc_summary(df)
-        audc_rows.append({"Ranking": rank_by, "Slides": len(audc),
-                          "AUDC ranking": f"{audc['audc_importance'].mean():.3f} ± {audc['audc_importance'].std():.3f}",
-                          "AUDC random": f"{audc['audc_random'].mean():.3f} ± {audc['audc_random'].std():.3f}",
-                          "Gap (random - ranking)": f"{audc['audc_gap'].mean():.3f} ± {audc['audc_gap'].std():.3f}",
-                          "Wilcoxon p": f"{wilcoxon(audc['audc_gap']).pvalue:.1e}"})
-    return results["attention"], results["contribution_score"], pd.DataFrame(audc_rows)
-
-
-def fig_deletion_curves(results_attention, results_contribution, name):
-    """Attention, contribution and random deletion in one plot. Reuses plot_deletion_curves_comparison."""
-    return plot_deletion_curves_comparison({name: (results_attention, results_contribution)},
-                                           title=f"Deletion curves - {name}")
-
-
-# ----------------------------------------
-# 3. Selected tiles
-# ----------------------------------------
-
-def selected_tile_percentiles(cache_path, slides, **selector_kwargs):
-    """
-    Run ROISelector on every slide (pass the settings used for cutting) and return
-    one row per selected tile with its scores and within-slide percentile
-    (0 = lowest tile in the slide, 100 = highest). Prints a median [IQR] summary
-    and the number of tiles that could not be selected.
-    """
-    slide_cache = _slide_cache(cache_path)
-
-    class _Selector(ROISelector):  # reuse the loaded cache instead of re-reading it per slide
-        @staticmethod
-        def load_cache(_):
-            return slide_cache
-
-    rows, shortfall = [], []
-    for slide_path in tqdm(slides, desc="Selecting tiles"):
-        if slide_path not in slide_cache:
-            print(f"Skipping {slide_path}: not in inference cache")
+    rng = np.random.RandomState(seed)
+    rows = []
+    for slide_path in tqdm(slides, desc="Deletion curves"):
+        try:
+            feats = _load_slide_feats(slide_path, zarr_dir, config["feature_key"]).to(device)
+        except Exception as e:
+            print(f"Skipping {slide_path}: {type(e).__name__}: {e}")
             continue
-        selector = _Selector(cache_path=cache_path, slide_path=slide_path, **selector_kwargs)
-        disease_tiles, healthy_tiles = selector.select_tiles()
-
-        tiles = slide_cache[slide_path]["tile_table"].dropna(subset=SCORES)
-        pct = tiles[SCORES].rank(pct=True).mul(100).add_suffix("_pct")
-        tiles = pd.concat([tiles[["tile_id"] + SCORES], pct], axis=1)
-
-        for arm, selected, k in [("disease", disease_tiles, selector.disease_k),
-                                 ("healthy", healthy_tiles, selector.healthy_k)]:
-            rows.append(tiles[tiles["tile_id"].isin(selected["tile_id"])].assign(slide_path=slide_path, arm=arm))
-            shortfall.append({"arm": arm, "missing": k - len(selected)})
-
-    sel_df = pd.concat(rows, ignore_index=True)
-    missing = pd.DataFrame(shortfall).groupby("arm")["missing"].agg(total="sum", slides=lambda x: (x > 0).sum())
-    print(f"{sel_df['slide_path'].nunique()} slides")
-    for arm, m in missing.iterrows():
-        print(f"  {arm} arm: {(sel_df['arm'] == arm).sum()} tiles selected, "
-              f"{m['total']} not assigned (in {m['slides']} slides)")
-    for c in SCORES:
-        for arm, v in sel_df.groupby("arm")[f"{c}_pct"]:
-            q1, med, q3 = v.quantile([0.25, 0.5, 0.75])
-            print(f"  {c:<20} {arm:<8} median percentile {med:.1f} [IQR {q1:.1f}-{q3:.1f}]")
-    return sel_df
+        rows += [dict(r, slide=_name(slide_path)) for r in _slide_deletion(model, feats, frac_grid, n_random, rng)]
+    return pd.DataFrame(rows)
 
 
-def fig_selected_tile_percentiles(sel_df):
-    """One panel per score: within-slide percentile of the selected tiles, per arm."""
-    labels = {"attention": "Attention", "contrast_score": "Contrast score", "contribution_score": "Contribution score"}
-    colors = {"disease": PALETTE[1], "healthy": PALETTE[2]}
-    arms = ["disease", "healthy"]
-    rng = np.random.RandomState(0)
-    fig, axes = plt.subplots(1, len(SCORES), figsize=(183 * MM, 60 * MM), sharey=True)
-    for ax, score in zip(axes, SCORES):
-        data = [sel_df.loc[sel_df["arm"] == arm, f"{score}_pct"].values for arm in arms]
-        ax.boxplot(data, positions=range(len(arms)), widths=0.5, showfliers=False, medianprops={"color": INK})
-        for i, (arm, v) in enumerate(zip(arms, data)):
-            ax.scatter(i + rng.uniform(-0.15, 0.15, len(v)), v, s=3, alpha=0.4, color=colors[arm], lw=0)
-        ax.axhline(50, color=MUTED, lw=0.6, ls="--")
-        ax.set_xticks(range(len(arms)), [f"{a.capitalize()} arm" for a in arms])
-        ax.set_title(labels[score])
-        ax.set_ylim(0, 100)
-    axes[0].set_ylabel("Within-slide percentile")
+def _area(dele):
+    """Per slide and ranking: mean P(non-healthy) over the deleted range (area under curve / range)."""
+    wide = dele.pivot_table(index=["slide", "ranking"], columns="frac_deleted", values="prob_pos").sort_index(axis=1)
+    x, y = wide.columns.to_numpy(float), wide.to_numpy()
+    area = (np.diff(x) * (y[:, 1:] + y[:, :-1]) / 2).sum(axis=1) / (x[-1] - x[0])
+    return pd.Series(area, index=wide.index).unstack("ranking")
+
+
+def table_deletion(dele):
+    """
+    Per ranking: mean P(non-healthy) over the deleted range (normalised area under the
+    curve), its difference from random deletion (paired per slide), and a Wilcoxon
+    signed-rank test of that difference. Mean (95% CI) throughout.
+    """
+    a = _area(dele)
+    rows = []
+    for k in ["disease", "healthy", "random"]:
+        m, lo, hi = _mean_ci(a[k])
+        r = {"Deletion order": DELETION[k][0], "Slides": int(a[k].notna().sum()),
+             "Mean P(non-healthy), (95% CI)": f"{m:.3f} ({lo:.3f}–{hi:.3f})"}
+        if k != "random":
+            diff = a[k] - a["random"]
+            m, lo, hi = _mean_ci(diff)
+            r["Difference vs random (95% CI)"] = f"{m:+.3f} ({lo:+.3f}–{hi:+.3f})"
+            r["Wilcoxon p"] = f"{stats.wilcoxon(diff.dropna()).pvalue:.1e}"
+        rows.append(r)
+    frac = dele["frac_deleted"]
+    print(f"Area under P(non-healthy) over {frac.min():.0%}–{frac.max():.0%} of tiles deleted, divided by that range.")
+    return pd.DataFrame(rows).fillna("")
+
+
+def fig_deletion_curves(dele):
+    """One panel: mean P(non-healthy) ± 95% CI vs. fraction of tiles deleted, one line per ranking."""
+    fig, ax = plt.subplots(figsize=(89 * MM, 65 * MM))
+    for k, (label, color) in DELETION.items():
+        s = (dele[dele["ranking"] == k].groupby("frac_deleted")["prob_pos"]
+             .apply(lambda x: pd.Series(_mean_ci(x), index=["m", "lo", "hi"])).unstack())
+        x = 100 * s.index.to_numpy()
+        ax.plot(x, s["m"], color=color, lw=1.2, marker="o", ms=2.5, label=label,
+                ls="--" if k == "random" else "-")
+        ax.fill_between(x, s["lo"], s["hi"], color=color, alpha=0.2, lw=0)
+    ax.axhline(0.5, color=MUTED, lw=0.6, ls=":")
+    ax.set_xlabel("Tiles deleted (%)")
+    ax.set_ylabel("P(non-healthy), mean ± 95% CI")
+    ax.set_ylim(0, 1.02)
+    ax.set_xlim(0, 100 * dele["frac_deleted"].max())
+    ax.legend(frameon=False, loc="lower left")
     plt.tight_layout()
     return cv._done(fig)
 
 
 # ----------------------------------------
-# 4. Model evidence per diagnosis
+# 3. Model evidence per diagnosis
 # ----------------------------------------
 
-def evidence_per_slide(cache_path, ext):
+def _bias_diff(checkpoint_path):
+    """b_non-healthy - b_healthy of the classifier, read without moving the model to GPU."""
+    b = torch.load(checkpoint_path, map_location="cpu", weights_only=False)["model_state_dict"]["classifier.bias"]
+    return float(b[1] - b[0])
+
+
+def evidence_per_slide(cache_path, ext, checkpoint_path):
     """
-    Add per-slide evidence measures from the cache to `ext` (from load_predictions):
-      frac_disease_like:            fraction of tiles with contrast_score > 0.
-      frac_tiles_half_contribution: smallest fraction of tiles whose positive
-                                    contributions add up to 50% of the slide's total
-                                    positive contribution (low = evidence concentrated
-                                    in few tiles).
+    Add per-slide evidence measures from the cache to `ext` (from load_predictions).
+
+    With attention a_i summing to 1, the slide logit difference is exactly
+        logit_non-healthy - logit_healthy = sum_i a_i * (contrast_i + db),   db = b1 - b0,
+    so a tile pushes towards non-healthy when contrast_i + db > 0 (not contrast_i > 0),
+    and a_i * (contrast_i + db) are per-tile contributions that sum to the slide logit.
+
+      frac_disease_like:            fraction of tiles with contrast_i + db > 0.
+      frac_tiles_half_contribution: smallest fraction of tiles whose positive contributions
+                                    a_i * (contrast_i + db) add up to 50% of the slide's total
+                                    positive contribution (low = evidence in few tiles).
     """
+    db = _bias_diff(checkpoint_path)
     slide_cache = {_name(k): v for k, v in _slide_cache(cache_path).items()}
-    rows = []
+    rows, err, med_abs = [], [], []
     for slide in ext["slide"]:
         t = slide_cache[slide]["tile_table"]
-        pos = np.sort(t["contribution_score"].clip(lower=0).to_numpy())[::-1]
+        shifted = t["contrast_score"].to_numpy() + db
+        contrib = t["attention"].to_numpy() * shifted
+        err.append(abs(1 / (1 + np.exp(-contrib.sum())) - slide_cache[slide]["prob_1"]))
+        med_abs.append(np.median(np.abs(t["contrast_score"])))
+        pos = np.sort(contrib.clip(min=0))[::-1]
         n_half = int(np.searchsorted(np.cumsum(pos), 0.5 * pos.sum()) + 1)
-        rows.append({"slide": slide, "frac_disease_like": float((t["contrast_score"] > 0).mean()),
+        rows.append({"slide": slide, "frac_disease_like": float((shifted > 0).mean()),
                      "frac_tiles_half_contribution": n_half / len(t)})
+    print(f"Classifier bias difference db = {db:+.3f} (median |contrast| across slides: {np.median(med_abs):.3f})")
+    print(f"Check: |sigmoid(sum of contributions) - P(non-healthy)| max = {max(err):.1e} "
+          "(non-zero only if tiles were dropped from the tile table)")
     return ext.merge(pd.DataFrame(rows), on="slide")
 
 
@@ -259,7 +270,7 @@ def table_evidence_by_diagnosis(evid, group_col, min_n=5):
     tested = [grp for grp in order if grp != "Other"]  # 'Other' mixes diagnoses, so it is left out of the test
     p_row = {group_col: "Kruskal–Wallis p (excl. Other)", "Slides": ""}
     for col, label in EVIDENCE.items():
-        p_row[label.replace("\n", " ")] = (f"{kruskal(*[evid.loc[g == grp, col] for grp in tested]).pvalue:.1e}"
+        p_row[label.replace("\n", " ")] = (f"{stats.kruskal(*[evid.loc[g == grp, col] for grp in tested]).pvalue:.1e}"
                                            if len(tested) > 1 else "")
     rows.append(p_row)
     return pd.DataFrame(rows)
@@ -278,5 +289,8 @@ def fig_evidence_by_diagnosis(evid, group_col, min_n=5):
         ax.set_xticks(range(len(order)), [f"{grp} (n={len(v)})" for grp, v in zip(order, data)],
                       rotation=30, ha="right")
         ax.set_ylabel(label)
+        if col != "frac_tiles_half_contribution":  # that one is often near 0; let it autoscale
+            ax.set_ylim(-0.02, 1.02)
+    axes[0].axhline(0.5, color=MUTED, lw=0.6, ls="--")
     plt.tight_layout()
     return cv._done(fig)
